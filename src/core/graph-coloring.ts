@@ -8,6 +8,7 @@
  */
 
 import type { ColorGroup } from './types.js';
+export type { ColorGroup } from './types.js';
 
 /**
  * Build an adjacency list from constraint pairs.

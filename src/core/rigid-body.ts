@@ -3,7 +3,8 @@
  * Manages bodies as flat arrays (struct-of-arrays) for GPU-friendly layout.
  */
 
-import type { Vec2, Vec3, MaterialProperties, RigidBodyHandle, AABB2D } from './types.js';
+import type { Vec2, Vec3, MaterialProperties, RigidBodyHandle } from './types.js';
+import type { AABB2D } from './math.js';
 import { RigidBodyType, DEFAULT_MATERIAL } from './types.js';
 import { vec2Rotate, vec2Add } from './math.js';
 

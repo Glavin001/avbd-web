@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AVBD GPU Test Harness</title>
+</head>
+<body>
+  <div id="status">Loading...</div>
+  <div id="results"></div>
+  <script type="module">
+    import AVBD from '../../src/2d/index.ts';
+
+    window.AVBD = AVBD;
+    window.testResults = {};
+
+    // Helper to run a test scenario and store results
+    window.runTest = async function(name, fn) {
+      try {
+        const result = await fn();
+        window.testResults[name] = { success: true, ...result };
+      } catch (e) {
+        window.testResults[name] = { success: false, error: e.message };
+      }
+    };
+
+    // Initialize
+    try {
+      await AVBD.init();
+      window.testResults.init = {
+        success: true,
+        gpuAvailable: AVBD.isGPUAvailable,
+      };
+      document.getElementById('status').textContent =
+        `AVBD initialized. GPU: ${AVBD.isGPUAvailable ? 'YES' : 'NO'}`;
+    } catch (e) {
+      window.testResults.init = { success: false, error: e.message };
+      document.getElementById('status').textContent = `Init failed: ${e.message}`;
+    }
+
+    // Auto-run core tests
+    await window.runTest('freeFall', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 });
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 10)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+
+      for (let i = 0; i < 60; i++) {
+        await world.stepAsync();
+      }
+
+      const pos = body.translation();
+      // After 1 second of free fall: y ≈ 10 - 0.5 * 9.81 * 1² ≈ 5.1
+      return { y: pos.y, expected: 10 - 0.5 * 9.81, isGPU: world.isGPU };
+    });
+
+    await window.runTest('boxOnGround', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
+
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+
+      for (let i = 0; i < 120; i++) {
+        await world.stepAsync();
+      }
+
+      const y = body.translation().y;
+      return { y, aboveGround: y > 0.3, isGPU: world.isGPU };
+    });
+
+    await window.runTest('manyBodies', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 5 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5));
+
+      const bodies = [];
+      for (let i = 0; i < 50; i++) {
+        const x = (i % 10) * 1.2 - 5;
+        const y = 2 + Math.floor(i / 10) * 1.2;
+        const b = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+        );
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), b);
+        bodies.push(b);
+      }
+
+      const start = performance.now();
+      for (let i = 0; i < 30; i++) {
+        await world.stepAsync();
+      }
+      const elapsed = performance.now() - start;
+
+      // Check all positions are finite
+      let allFinite = true;
+      for (const b of bodies) {
+        const pos = b.translation();
+        if (!isFinite(pos.x) || !isFinite(pos.y)) allFinite = false;
+      }
+
+      return { elapsed, allFinite, bodyCount: 50, isGPU: world.isGPU };
+    });
+
+    // Signal completion
+    window.testResults._complete = true;
+    document.getElementById('status').textContent = 'Tests complete';
+    document.getElementById('results').textContent = JSON.stringify(window.testResults, null, 2);
+  </script>
+</body>
+</html>

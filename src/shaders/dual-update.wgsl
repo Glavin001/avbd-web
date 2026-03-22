@@ -1,6 +1,7 @@
 // ─── AVBD Dual Update Compute Shader ────────────────────────────────────────
 // Updates lambda (Lagrange multiplier) and ramps penalty for each constraint.
-// Shared between 2D and 3D modes.
+// Each thread handles one constraint row.
+// Includes friction coupling: normal contact rows update adjacent friction rows.
 
 struct SolverParams {
   dt: f32,
@@ -8,9 +9,11 @@ struct SolverParams {
   gravity_y: f32,
   penalty_min: f32,
   penalty_max: f32,
+  beta: f32,
   num_bodies: u32,
   num_constraints: u32,
-  beta: f32,   // penalty growth rate
+  num_bodies_in_group: u32,
+  is_stabilization: u32,
 }
 
 struct ConstraintRow {
@@ -49,22 +52,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var c_eval = cr.c0;
   if (cr.body_a >= 0) {
     let ba_base = u32(cr.body_a) * 8u;
-    let ba_prev_base = u32(cr.body_a) * 8u;
-    c_eval += cr.jacobian_a.x * (body_state[ba_base + 0u] - body_prev[ba_prev_base + 0u])
-           + cr.jacobian_a.y * (body_state[ba_base + 1u] - body_prev[ba_prev_base + 1u])
-           + cr.jacobian_a.z * (body_state[ba_base + 2u] - body_prev[ba_prev_base + 2u]);
+    c_eval += cr.jacobian_a.x * (body_state[ba_base + 0u] - body_prev[ba_base + 0u])
+           + cr.jacobian_a.y * (body_state[ba_base + 1u] - body_prev[ba_base + 1u])
+           + cr.jacobian_a.z * (body_state[ba_base + 2u] - body_prev[ba_base + 2u]);
   }
   if (cr.body_b >= 0) {
     let bb_base = u32(cr.body_b) * 8u;
-    let bb_prev_base = u32(cr.body_b) * 8u;
-    c_eval += cr.jacobian_b.x * (body_state[bb_base + 0u] - body_prev[bb_prev_base + 0u])
-           + cr.jacobian_b.y * (body_state[bb_base + 1u] - body_prev[bb_prev_base + 1u])
-           + cr.jacobian_b.z * (body_state[bb_base + 2u] - body_prev[bb_prev_base + 2u]);
+    c_eval += cr.jacobian_b.x * (body_state[bb_base + 0u] - body_prev[bb_base + 0u])
+           + cr.jacobian_b.y * (body_state[bb_base + 1u] - body_prev[bb_base + 1u])
+           + cr.jacobian_b.z * (body_state[bb_base + 2u] - body_prev[bb_base + 2u]);
   }
 
-  // For soft constraints (finite stiffness), zero lambda before accumulation
+  // Stiffness guard: soft constraints zero lambda before accumulation
   var prev_lambda = cr.lambda;
-  if (cr.stiffness < 1e30) { // Not infinite
+  if (cr.stiffness < 1e30) {
     prev_lambda = 0.0;
   }
 
@@ -73,11 +74,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   new_lambda = clamp(new_lambda, cr.fmin, cr.fmax);
   cr.lambda = new_lambda;
 
-  // Fracture check (if threshold > 0)
-  // Note: GPU can't easily disable, so we set active = 0
-  // (CPU side handles actual removal)
-
-  // Conditional penalty ramp: only when constraint is interior (not at bounds)
+  // Conditional penalty ramp: only when constraint is interior
   if (cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
     cr.penalty += params.beta * abs(c_eval);
   }
@@ -86,6 +83,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     cr.penalty = cr.stiffness;
   }
 
-  // Write back
+  // Write back this row
   constraints[idx] = cr;
+
+  // Friction coupling: if this is a normal contact row (even index, force_type==0),
+  // update the next row's friction bounds based on current normal lambda.
+  // Contact rows come in pairs: [normal, friction, normal, friction, ...]
+  if (cr.force_type == 0u && (idx % 2u) == 0u) {
+    let fric_idx = idx + 1u;
+    if (fric_idx < params.num_constraints) {
+      var fric = constraints[fric_idx];
+      if (fric.active != 0u && fric.force_type == 0u) {
+        // Coulomb friction: |f_tangent| <= mu * |f_normal|
+        // We use a default mu=0.5 here; ideally mu would be stored per constraint
+        let mu = 0.5;
+        let normal_force = abs(cr.lambda);
+        fric.fmin = -mu * normal_force;
+        fric.fmax = mu * normal_force;
+        constraints[fric_idx] = fric;
+      }
+    }
+  }
 }

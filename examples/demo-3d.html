@@ -39,6 +39,9 @@
     const ctx = canvas.getContext('2d');
     const stats = document.getElementById('stats');
 
+    await AVBD3D.init();
+    const gpuStatus = 'CPU'; // 3D GPU solver coming soon
+
     function resize() {
       canvas.width = canvas.clientWidth;
       canvas.height = canvas.clientHeight;

@@ -16,19 +16,26 @@
     }
   },
   "scripts": {
+    "embed-shaders": "tsx scripts/embed-shaders.ts",
+    "prebuild": "npm run embed-shaders",
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:gpu": "playwright test",
+    "test:all": "vitest run && playwright test",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint src/ tests/",
     "dev": "vite examples/"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/node": "^22.0.0",
     "@webgpu/types": "^0.1.52",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0",
-    "vite": "^6.0.0"
+    "vite": "^6.0.0",
+    "vitest": "^3.0.0"
   },
   "license": "MIT",
   "keywords": [

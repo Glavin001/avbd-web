@@ -41,6 +41,10 @@
     const ctx = canvas.getContext('2d');
     const stats = document.getElementById('stats');
 
+    // Initialize WebGPU (falls back to CPU if unavailable)
+    await AVBD.init();
+    const gpuStatus = AVBD.isGPUAvailable ? 'GPU' : 'CPU';
+
     // Scale: 1 meter = 50 pixels
     const SCALE = 50;
     const ORIGIN_X = canvas.width / 2;
@@ -204,8 +208,8 @@
     let frameCount = 0;
     let fps = 0;
 
-    function gameLoop() {
-      world.step();
+    async function gameLoop() {
+      await world.stepAsync();
       render();
 
       frameCount++;
@@ -215,7 +219,7 @@
         frameCount = 0;
         lastTime = now;
       }
-      stats.textContent = `FPS: ${fps} | Bodies: ${bodies.length}`;
+      stats.textContent = `${gpuStatus} | FPS: ${fps} | Bodies: ${bodies.length}`;
 
       requestAnimationFrame(gameLoop);
     }

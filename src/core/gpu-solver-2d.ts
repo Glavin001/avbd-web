@@ -1,17 +1,17 @@
 /**
  * GPU-accelerated AVBD 2D solver.
  *
- * This is the actual WebGPU execution path that dispatches WGSL compute
- * shaders to perform the primal and dual updates on the GPU.
+ * Dispatches WGSL compute shaders via WebGPU for the primal and dual updates.
+ * This is the primary solver path — the CPU solver exists as a fallback.
  *
  * Data flow per step:
- * 1. CPU: broadphase + narrowphase collision detection
- * 2. CPU: graph coloring for parallel dispatch
- * 3. CPU→GPU: upload body state, prev state, constraints, color groups
+ * 1. CPU: broadphase + narrowphase collision detection (hard to parallelize)
+ * 2. CPU: graph coloring for conflict-free parallel dispatch
+ * 3. CPU→GPU: upload body state, prev state, sorted constraints, color groups
  * 4. GPU: for each solver iteration:
- *    a. For each color group: dispatch primal update shader
- *    b. Dispatch dual update shader (all constraints)
- * 5. GPU→CPU: read back body positions
+ *    a. For each color group: dispatch primal update shader (one pass per color)
+ *    b. Dispatch dual update shader (all constraints in one pass)
+ * 5. GPU→CPU: async readback of body positions + constraint lambdas
  * 6. CPU: velocity recovery, contact caching
  */
 
@@ -27,22 +27,7 @@ import { collide2D } from '../2d/collision-sat.js';
 import { aabb2DOverlap, vec2Scale, vec2Length } from './math.js';
 import { computeGraphColoring } from './graph-coloring.js';
 import { GPUContext } from './gpu-context.js';
-
-// Shader source is provided via setShaderSource() or loaded by the bundler.
-// This avoids hard dependency on fs (browser) or ?raw imports (bundler-specific).
-
-/** Shader source storage — populated by setShaderSource() or bundler plugin */
-const shaderSources: { primal: string; dual: string } = { primal: '', dual: '' };
-
-/**
- * Set WGSL shader source code. Call this before creating a GPUSolver2D.
- * In a Vite/bundler environment, import with ?raw and pass here.
- * In a standalone environment, fetch the .wgsl files and pass the text.
- */
-export function setShaderSource(primal: string, dual: string): void {
-  shaderSources.primal = primal;
-  shaderSources.dual = dual;
-}
+import { PRIMAL_UPDATE_2D_WGSL, DUAL_UPDATE_WGSL } from '../shaders/embedded.js';
 
 // ─── GPU Buffer Layout Constants ────────────────────────────────────────────
 
@@ -50,11 +35,28 @@ export function setShaderSource(primal: string, dual: string): void {
 const BODY_STRIDE = 8;
 /** Body prev: [prev_x, prev_y, prev_angle, inertial_x, inertial_y, inertial_angle, 0, 0] = 8 floats */
 const BODY_PREV_STRIDE = 8;
-/** Constraint row GPU struct size in bytes (must match WGSL struct) */
-const CONSTRAINT_ROW_BYTES = 96; // 24 floats * 4 bytes (padded to 16-byte alignment)
-/** Solver params uniform size */
-const SOLVER_PARAMS_BYTES = 32; // 8 fields * 4 bytes
+/**
+ * Constraint row: matches WGSL ConstraintRow struct exactly = 28 floats (112 bytes)
+ * [body_a(i32), body_b(i32), force_type(u32), _pad(u32),   // 4 fields = 16 bytes
+ *  jacobian_a(vec4), jacobian_b(vec4),                       // 2 vec4  = 32 bytes
+ *  hessian_diag_a(vec4), hessian_diag_b(vec4),              // 2 vec4  = 32 bytes
+ *  c, c0, lambda, penalty, stiffness, fmin, fmax, active]   // 8 fields = 32 bytes
+ * Total: 112 bytes = 28 floats
+ */
+const CONSTRAINT_STRIDE = 28;
+/**
+ * SolverParams uniform: matches WGSL struct = 10 fields = 40 bytes
+ * [dt, gravity_x, gravity_y, penalty_min, penalty_max, beta,
+ *  num_bodies(u32), num_constraints(u32), num_bodies_in_group(u32), is_stabilization(u32)]
+ */
+const SOLVER_PARAMS_FLOATS = 10;
+const SOLVER_PARAMS_BYTES = SOLVER_PARAMS_FLOATS * 4;
 const WORKGROUP_SIZE = 64;
+
+/** Helper to write typed arrays to GPU buffers (works around strict @webgpu/types) */
+function gpuWrite(queue: GPUQueue, buffer: GPUBuffer, offset: number, data: { buffer: ArrayBufferLike; byteOffset: number; byteLength: number }): void {
+  (queue as any).writeBuffer(buffer, offset, data);
+}
 
 // ─── GPU Solver ─────────────────────────────────────────────────────────────
 
@@ -76,14 +78,12 @@ export class GPUSolver2D {
   private solverParamsBuffer!: GPUBuffer;
   private colorIndicesBuffer!: GPUBuffer;
   private bodyConstraintRangesBuffer!: GPUBuffer;
-  private readbackBuffer!: GPUBuffer;
 
   private primalPipeline!: GPUComputePipeline;
   private dualPipeline!: GPUComputePipeline;
   private primalBindGroupLayout!: GPUBindGroupLayout;
   private dualBindGroupLayout!: GPUBindGroupLayout;
 
-  // Tracks max allocated sizes to avoid reallocation
   private maxBodies = 0;
   private maxConstraints = 0;
 
@@ -94,57 +94,46 @@ export class GPUSolver2D {
     this.constraintStore = new ConstraintStore();
   }
 
-  /** Initialize GPU pipelines. Must be called once before stepping. */
+  /** Initialize GPU pipelines. Called automatically on first step. */
   init(): void {
     if (this.initialized) return;
     const device = this.gpu.device;
 
-    // ─── Primal pipeline layout ───────────────────────────────────
+    // Primal pipeline: 6 bindings
     this.primalBindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // body_state (read_write)
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // body_prev
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // constraints
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // color_body_indices
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // body_constraint_ranges
       ],
     });
 
-    if (!shaderSources.primal || !shaderSources.dual) {
-      throw new Error(
-        'WGSL shader source not set. Call setShaderSource(primalWGSL, dualWGSL) before init(). ' +
-        'In Vite: import primal from "./shaders/primal-update-2d.wgsl?raw"'
-      );
-    }
-
-    const primalModule = device.createShaderModule({ code: shaderSources.primal });
+    const primalModule = device.createShaderModule({ code: PRIMAL_UPDATE_2D_WGSL });
     this.primalPipeline = device.createComputePipeline({
-      layout: device.createPipelineLayout({
-        bindGroupLayouts: [this.primalBindGroupLayout],
-      }),
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.primalBindGroupLayout] }),
       compute: { module: primalModule, entryPoint: 'main' },
     });
 
-    // ─── Dual pipeline layout ─────────────────────────────────────
+    // Dual pipeline: 4 bindings
     this.dualBindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // body_state (read)
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // body_prev
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // constraints (read_write)
       ],
     });
 
-    const dualModule = device.createShaderModule({ code: shaderSources.dual });
+    const dualModule = device.createShaderModule({ code: DUAL_UPDATE_WGSL });
     this.dualPipeline = device.createComputePipeline({
-      layout: device.createPipelineLayout({
-        bindGroupLayouts: [this.dualBindGroupLayout],
-      }),
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.dualBindGroupLayout] }),
       compute: { module: dualModule, entryPoint: 'main' },
     });
 
-    // ─── Solver params uniform (fixed size) ───────────────────────
+    // Solver params uniform (fixed size)
     this.solverParamsBuffer = device.createBuffer({
       size: SOLVER_PARAMS_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -154,11 +143,7 @@ export class GPUSolver2D {
   }
 
   /**
-   * Perform one physics timestep using GPU compute shaders.
-   *
-   * CPU handles: broadphase, narrowphase, graph coloring, buffer upload.
-   * GPU handles: primal updates (per color group), dual updates.
-   * CPU handles: velocity recovery from readback data.
+   * Run one physics timestep on the GPU.
    */
   async step(): Promise<void> {
     if (!this.initialized) this.init();
@@ -210,23 +195,16 @@ export class GPUSolver2D {
     }
     this.colorGroups = computeGraphColoring(bodies.length, constraintPairs, fixedBodies);
 
-    // Initialize bodies (save prev, compute inertial targets)
+    // Initialize bodies
     for (const body of bodies) {
       if (body.type !== RigidBodyType.Dynamic) continue;
       body.angularVelocity = Math.max(-50, Math.min(50, body.angularVelocity));
       body.prevPosition = { ...body.position };
       body.prevAngle = body.angle;
 
-      let vx = body.velocity.x;
-      let vy = body.velocity.y;
-      let omega = body.angularVelocity;
-      if (body.linearDamping > 0) {
-        const f = 1 / (1 + body.linearDamping * dt);
-        vx *= f; vy *= f;
-      }
-      if (body.angularDamping > 0) {
-        omega *= 1 / (1 + body.angularDamping * dt);
-      }
+      let vx = body.velocity.x, vy = body.velocity.y, omega = body.angularVelocity;
+      if (body.linearDamping > 0) { const f = 1 / (1 + body.linearDamping * dt); vx *= f; vy *= f; }
+      if (body.angularDamping > 0) { omega *= 1 / (1 + body.angularDamping * dt); }
 
       body.inertialPosition = {
         x: body.position.x + vx * dt + gravity.x * body.gravityScale * dt * dt,
@@ -240,9 +218,9 @@ export class GPUSolver2D {
     const numBodies = bodies.length;
     const numConstraints = constraintStore.rows.length;
 
-    this.ensureBuffers(numBodies, numConstraints);
+    this.ensureBuffers(numBodies, Math.max(numConstraints, 1));
 
-    // Upload body state: [x, y, angle, vx, vy, omega, mass, inertia]
+    // Upload body state
     const bodyData = new Float32Array(numBodies * BODY_STRIDE);
     for (let i = 0; i < numBodies; i++) {
       const b = bodies[i];
@@ -256,7 +234,7 @@ export class GPUSolver2D {
       bodyData[off + 6] = b.mass;
       bodyData[off + 7] = b.inertia;
     }
-    device.queue.writeBuffer(this.bodyStateBuffer, 0, bodyData);
+    gpuWrite(device.queue, this.bodyStateBuffer, 0, bodyData);
 
     // Upload prev/inertial state
     const prevData = new Float32Array(numBodies * BODY_PREV_STRIDE);
@@ -269,69 +247,60 @@ export class GPUSolver2D {
       prevData[off + 3] = b.inertialPosition.x;
       prevData[off + 4] = b.inertialPosition.y;
       prevData[off + 5] = b.inertialAngle;
+      prevData[off + 6] = 0;
+      prevData[off + 7] = 0;
     }
-    device.queue.writeBuffer(this.bodyPrevBuffer, 0, prevData);
+    gpuWrite(device.queue, this.bodyPrevBuffer, 0, prevData);
 
-    // Upload constraints
+    // Sort constraints per body and build ranges
+    const { sortedRows, bodyRanges } = this.sortConstraintsPerBody(numBodies, numConstraints);
+
+    // Upload sorted constraints (28 floats = 112 bytes per row)
     if (numConstraints > 0) {
-      const crData = new Float32Array(numConstraints * 24); // 24 floats per constraint
+      const crData = new ArrayBuffer(numConstraints * CONSTRAINT_STRIDE * 4);
+      const crView = new DataView(crData);
       for (let i = 0; i < numConstraints; i++) {
-        const row = constraintStore.rows[i];
-        const off = i * 24;
-        // Match the WGSL ConstraintRow struct layout
-        const view = new DataView(crData.buffer, off * 4, 24 * 4);
-        view.setInt32(0, row.bodyA, true);
-        view.setInt32(4, row.bodyB, true);
-        view.setUint32(8, row.type, true);
-        view.setUint32(12, 0, true); // padding
+        const row = sortedRows[i];
+        const byteOff = i * CONSTRAINT_STRIDE * 4;
+        crView.setInt32(byteOff + 0, row.bodyA, true);
+        crView.setInt32(byteOff + 4, row.bodyB, true);
+        crView.setUint32(byteOff + 8, row.type, true);
+        crView.setUint32(byteOff + 12, 0, true); // padding
         // jacobian_a (vec4)
-        view.setFloat32(16, row.jacobianA[0], true);
-        view.setFloat32(20, row.jacobianA[1], true);
-        view.setFloat32(24, row.jacobianA[2], true);
-        view.setFloat32(28, 0, true);
+        crView.setFloat32(byteOff + 16, row.jacobianA[0], true);
+        crView.setFloat32(byteOff + 20, row.jacobianA[1], true);
+        crView.setFloat32(byteOff + 24, row.jacobianA[2], true);
+        crView.setFloat32(byteOff + 28, 0, true);
         // jacobian_b (vec4)
-        view.setFloat32(32, row.jacobianB[0], true);
-        view.setFloat32(36, row.jacobianB[1], true);
-        view.setFloat32(40, row.jacobianB[2], true);
-        view.setFloat32(44, 0, true);
+        crView.setFloat32(byteOff + 32, row.jacobianB[0], true);
+        crView.setFloat32(byteOff + 36, row.jacobianB[1], true);
+        crView.setFloat32(byteOff + 40, row.jacobianB[2], true);
+        crView.setFloat32(byteOff + 44, 0, true);
         // hessian_diag_a (vec4)
-        view.setFloat32(48, row.hessianDiagA[0], true);
-        view.setFloat32(52, row.hessianDiagA[1], true);
-        view.setFloat32(56, row.hessianDiagA[2], true);
-        view.setFloat32(60, 0, true);
+        crView.setFloat32(byteOff + 48, row.hessianDiagA[0], true);
+        crView.setFloat32(byteOff + 52, row.hessianDiagA[1], true);
+        crView.setFloat32(byteOff + 56, row.hessianDiagA[2], true);
+        crView.setFloat32(byteOff + 60, 0, true);
         // hessian_diag_b (vec4)
-        view.setFloat32(64, row.hessianDiagB[0], true);
-        view.setFloat32(68, row.hessianDiagB[1], true);
-        view.setFloat32(72, row.hessianDiagB[2], true);
-        view.setFloat32(76, 0, true);
-        // scalars
-        view.setFloat32(80, row.c, true);
-        view.setFloat32(84, row.c0, true);
-        view.setFloat32(88, row.lambda, true);
-        view.setFloat32(92, row.penalty, true);
+        crView.setFloat32(byteOff + 64, row.hessianDiagB[0], true);
+        crView.setFloat32(byteOff + 68, row.hessianDiagB[1], true);
+        crView.setFloat32(byteOff + 72, row.hessianDiagB[2], true);
+        crView.setFloat32(byteOff + 76, 0, true);
+        // scalar fields (8 fields)
+        crView.setFloat32(byteOff + 80, row.c, true);
+        crView.setFloat32(byteOff + 84, row.c0, true);
+        crView.setFloat32(byteOff + 88, row.lambda, true);
+        crView.setFloat32(byteOff + 92, row.penalty, true);
+        crView.setFloat32(byteOff + 96, isFinite(row.stiffness) ? row.stiffness : 1e30, true);
+        crView.setFloat32(byteOff + 100, isFinite(row.fmin) ? row.fmin : -1e30, true);
+        crView.setFloat32(byteOff + 104, isFinite(row.fmax) ? row.fmax : 1e30, true);
+        crView.setUint32(byteOff + 108, row.active ? 1 : 0, true);
       }
-      device.queue.writeBuffer(this.constraintBuffer, 0, crData);
+      gpuWrite(device.queue, this.constraintBuffer, 0, new Uint8Array(crData));
     }
 
-    // Build body→constraint index ranges
-    const bodyConstraintRanges = new Uint32Array(numBodies * 2);
-    // Simple approach: for each body, find all constraint rows involving it
-    // This is O(N*K) but fine for CPU-side prep
-    const constraintIndicesPerBody: number[][] = Array.from({ length: numBodies }, () => []);
-    for (let ci = 0; ci < numConstraints; ci++) {
-      const row = constraintStore.rows[ci];
-      if (!row.active) continue;
-      if (row.bodyA >= 0 && row.bodyA < numBodies) constraintIndicesPerBody[row.bodyA].push(ci);
-      if (row.bodyB >= 0 && row.bodyB < numBodies) constraintIndicesPerBody[row.bodyB].push(ci);
-    }
-    // Flatten into a global index array + ranges
-    const flatConstraintIndices: number[] = [];
-    for (let i = 0; i < numBodies; i++) {
-      bodyConstraintRanges[i * 2 + 0] = flatConstraintIndices.length;
-      bodyConstraintRanges[i * 2 + 1] = constraintIndicesPerBody[i].length;
-      flatConstraintIndices.push(...constraintIndicesPerBody[i]);
-    }
-    device.queue.writeBuffer(this.bodyConstraintRangesBuffer, 0, bodyConstraintRanges);
+    // Upload body constraint ranges
+    gpuWrite(device.queue, this.bodyConstraintRangesBuffer, 0, bodyRanges);
 
     // ─── 4. GPU: Solver Iterations ────────────────────────────────
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
@@ -339,30 +308,20 @@ export class GPUSolver2D {
     for (let iter = 0; iter < totalIterations; iter++) {
       const isStabilization = config.postStabilize && iter === totalIterations - 1;
 
-      // Upload solver params for this iteration
-      const paramsData = new Float32Array(8);
-      paramsData[0] = dt;
-      paramsData[1] = (gravity as Vec2).x;
-      paramsData[2] = (gravity as Vec2).y;
-      paramsData[3] = config.penaltyMin;
-      paramsData[4] = config.penaltyMax;
-      const paramsView = new DataView(paramsData.buffer);
-      paramsView.setUint32(20, numBodies, true);
-      paramsView.setUint32(24, numConstraints, true);
-      paramsView.setUint32(28, isStabilization ? 1 : 0, true);
-      device.queue.writeBuffer(this.solverParamsBuffer, 0, paramsData);
-
       const encoder = device.createCommandEncoder();
 
       // ─── 4a. Primal update: dispatch per color group ──────────
       for (const colorGroup of this.colorGroups) {
         if (colorGroup.bodyIndices.length === 0) continue;
 
-        // Upload color group body indices
-        const colorData = new Uint32Array(colorGroup.bodyIndices);
-        device.queue.writeBuffer(this.colorIndicesBuffer, 0, colorData);
+        // Write solver params with this group's size
+        this.writeParams(dt, gravity, config, numBodies, numConstraints,
+          colorGroup.bodyIndices.length, isStabilization);
 
-        // Create bind group for this dispatch
+        // Upload color group indices
+        const colorData = new Uint32Array(colorGroup.bodyIndices);
+        gpuWrite(device.queue, this.colorIndicesBuffer, 0, colorData);
+
         const bindGroup = device.createBindGroup({
           layout: this.primalBindGroupLayout,
           entries: [
@@ -384,18 +343,7 @@ export class GPUSolver2D {
 
       // ─── 4b. Dual update: all constraints ─────────────────────
       if (!isStabilization && numConstraints > 0) {
-        // Dual params need beta
-        const dualParams = new Float32Array(8);
-        dualParams[0] = dt;
-        dualParams[1] = (gravity as Vec2).x;
-        dualParams[2] = (gravity as Vec2).y;
-        dualParams[3] = config.penaltyMin;
-        dualParams[4] = config.penaltyMax;
-        const dualView = new DataView(dualParams.buffer);
-        dualView.setUint32(20, numBodies, true);
-        dualView.setUint32(24, numConstraints, true);
-        dualParams[7] = config.beta;
-        device.queue.writeBuffer(this.solverParamsBuffer, 0, dualParams);
+        this.writeParams(dt, gravity, config, numBodies, numConstraints, 0, false);
 
         const dualBindGroup = device.createBindGroup({
           layout: this.dualBindGroupLayout,
@@ -417,31 +365,44 @@ export class GPUSolver2D {
       device.queue.submit([encoder.finish()]);
     }
 
-    // ─── 5. GPU→CPU: Read Back Body Positions ─────────────────────
-    const readbackSize = numBodies * BODY_STRIDE * 4;
-    const stagingBuffer = device.createBuffer({
-      size: readbackSize,
+    // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
+    // Readback body state
+    const bodyReadbackSize = numBodies * BODY_STRIDE * 4;
+    const bodyStagingBuffer = device.createBuffer({
+      size: bodyReadbackSize,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
-
     const copyEncoder = device.createCommandEncoder();
-    copyEncoder.copyBufferToBuffer(this.bodyStateBuffer, 0, stagingBuffer, 0, readbackSize);
+    copyEncoder.copyBufferToBuffer(this.bodyStateBuffer, 0, bodyStagingBuffer, 0, bodyReadbackSize);
+
+    // Readback constraints (for lambda/penalty warmstarting)
+    let crStagingBuffer: GPUBuffer | null = null;
+    if (numConstraints > 0) {
+      const crReadbackSize = numConstraints * CONSTRAINT_STRIDE * 4;
+      crStagingBuffer = device.createBuffer({
+        size: crReadbackSize,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      copyEncoder.copyBufferToBuffer(this.constraintBuffer, 0, crStagingBuffer, 0, crReadbackSize);
+    }
+
     device.queue.submit([copyEncoder.finish()]);
 
-    await stagingBuffer.mapAsync(GPUMapMode.READ);
-    const resultData = new Float32Array(stagingBuffer.getMappedRange().slice(0));
-    stagingBuffer.unmap();
-    stagingBuffer.destroy();
+    // Map and read body positions
+    await bodyStagingBuffer.mapAsync(GPUMapMode.READ);
+    const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange().slice(0));
+    bodyStagingBuffer.unmap();
+    bodyStagingBuffer.destroy();
 
-    // ─── 6. CPU: Apply Results & Velocity Recovery ────────────────
+    // ─── 6. CPU: Apply Results ────────────────────────────────────
     for (let i = 0; i < numBodies; i++) {
       const body = bodies[i];
       if (body.type !== RigidBodyType.Dynamic) continue;
 
       const off = i * BODY_STRIDE;
-      body.position.x = resultData[off + 0];
-      body.position.y = resultData[off + 1];
-      body.angle = resultData[off + 2];
+      body.position.x = bodyResult[off + 0];
+      body.position.y = bodyResult[off + 1];
+      body.angle = bodyResult[off + 2];
 
       // BDF1 velocity recovery
       body.velocity = {
@@ -451,34 +412,78 @@ export class GPUSolver2D {
       body.angularVelocity = (body.angle - body.prevAngle) / dt;
     }
 
-    // Also read back constraint data for warmstarting next frame
-    if (numConstraints > 0) {
-      const crReadbackSize = numConstraints * 24 * 4;
-      const crStaging = device.createBuffer({
-        size: crReadbackSize,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-      });
-      const crEncoder = device.createCommandEncoder();
-      crEncoder.copyBufferToBuffer(this.constraintBuffer, 0, crStaging, 0, crReadbackSize);
-      device.queue.submit([crEncoder.finish()]);
+    // Readback constraint lambdas for warmstarting
+    if (crStagingBuffer && numConstraints > 0) {
+      await crStagingBuffer.mapAsync(GPUMapMode.READ);
+      const crResult = new DataView(crStagingBuffer.getMappedRange().slice(0));
+      crStagingBuffer.unmap();
+      crStagingBuffer.destroy();
 
-      await crStaging.mapAsync(GPUMapMode.READ);
-      const crResult = new DataView(crStaging.getMappedRange().slice(0));
-      crStaging.unmap();
-      crStaging.destroy();
-
-      // Update CPU-side constraint lambdas and penalties from GPU results
       for (let i = 0; i < numConstraints; i++) {
-        const off = i * 24 * 4;
-        constraintStore.rows[i].lambda = crResult.getFloat32(off + 88, true);
-        constraintStore.rows[i].penalty = crResult.getFloat32(off + 92, true);
+        const byteOff = i * CONSTRAINT_STRIDE * 4;
+        sortedRows[i].lambda = crResult.getFloat32(byteOff + 88, true);
+        sortedRows[i].penalty = crResult.getFloat32(byteOff + 92, true);
       }
     }
   }
 
-  /** Ensure GPU buffers are large enough for current body/constraint count */
+  /** Sort constraints so each body's constraints are contiguous */
+  private sortConstraintsPerBody(numBodies: number, numConstraints: number): {
+    sortedRows: ConstraintRow[];
+    bodyRanges: Uint32Array;
+  } {
+    const rows = this.constraintStore.rows;
+
+    // Build per-body constraint lists
+    const perBody: number[][] = Array.from({ length: numBodies }, () => []);
+    for (let ci = 0; ci < numConstraints; ci++) {
+      const row = rows[ci];
+      if (!row.active) continue;
+      if (row.bodyA >= 0 && row.bodyA < numBodies) perBody[row.bodyA].push(ci);
+      if (row.bodyB >= 0 && row.bodyB < numBodies) perBody[row.bodyB].push(ci);
+    }
+
+    // Flatten into sorted order + build ranges
+    const sortedIndices: number[] = [];
+    const bodyRanges = new Uint32Array(numBodies * 2);
+    for (let i = 0; i < numBodies; i++) {
+      bodyRanges[i * 2 + 0] = sortedIndices.length;
+      bodyRanges[i * 2 + 1] = perBody[i].length;
+      sortedIndices.push(...perBody[i]);
+    }
+
+    // Create sorted constraint rows array (rows may appear multiple times for different bodies)
+    const sortedRows = sortedIndices.map(ci => rows[ci]);
+
+    return { sortedRows, bodyRanges };
+  }
+
+  /** Write solver params uniform */
+  private writeParams(
+    dt: number, gravity: Vec2, config: SolverConfig,
+    numBodies: number, numConstraints: number,
+    numBodiesInGroup: number, isStabilization: boolean,
+  ): void {
+    const data = new ArrayBuffer(SOLVER_PARAMS_BYTES);
+    const fv = new Float32Array(data);
+    const uv = new Uint32Array(data);
+    fv[0] = dt;
+    fv[1] = gravity.x;
+    fv[2] = gravity.y;
+    fv[3] = config.penaltyMin;
+    fv[4] = config.penaltyMax;
+    fv[5] = config.beta;
+    uv[6] = numBodies;
+    uv[7] = numConstraints;
+    uv[8] = numBodiesInGroup;
+    uv[9] = isStabilization ? 1 : 0;
+    gpuWrite(this.gpu.device.queue, this.solverParamsBuffer, 0, new Uint8Array(data));
+  }
+
+  /** Ensure GPU buffers are large enough */
   private ensureBuffers(numBodies: number, numConstraints: number): void {
     const device = this.gpu.device;
+    const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
 
     if (numBodies > this.maxBodies) {
       this.maxBodies = Math.max(numBodies, this.maxBodies * 2, 64);
@@ -487,43 +492,23 @@ export class GPUSolver2D {
       if (this.bodyConstraintRangesBuffer) this.bodyConstraintRangesBuffer.destroy();
       if (this.colorIndicesBuffer) this.colorIndicesBuffer.destroy();
 
-      const bodyBytes = this.maxBodies * BODY_STRIDE * 4;
-      this.bodyStateBuffer = device.createBuffer({
-        size: bodyBytes,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-      });
-      this.bodyPrevBuffer = device.createBuffer({
-        size: bodyBytes,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-      this.bodyConstraintRangesBuffer = device.createBuffer({
-        size: this.maxBodies * 2 * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
-      this.colorIndicesBuffer = device.createBuffer({
-        size: this.maxBodies * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
+      this.bodyStateBuffer = device.createBuffer({ size: this.maxBodies * BODY_STRIDE * 4, usage: STORAGE });
+      this.bodyPrevBuffer = device.createBuffer({ size: this.maxBodies * BODY_PREV_STRIDE * 4, usage: STORAGE });
+      this.bodyConstraintRangesBuffer = device.createBuffer({ size: this.maxBodies * 2 * 4, usage: STORAGE });
+      this.colorIndicesBuffer = device.createBuffer({ size: this.maxBodies * 4, usage: STORAGE });
     }
 
-    const neededConstraints = Math.max(numConstraints, 1);
-    if (neededConstraints > this.maxConstraints) {
-      this.maxConstraints = Math.max(neededConstraints, this.maxConstraints * 2, 64);
+    if (numConstraints > this.maxConstraints) {
+      this.maxConstraints = Math.max(numConstraints, this.maxConstraints * 2, 64);
       if (this.constraintBuffer) this.constraintBuffer.destroy();
-      this.constraintBuffer = device.createBuffer({
-        size: this.maxConstraints * 24 * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-      });
+      this.constraintBuffer = device.createBuffer({ size: this.maxConstraints * CONSTRAINT_STRIDE * 4, usage: STORAGE });
     }
   }
 
-  /** Destroy all GPU resources */
   destroy(): void {
-    if (this.bodyStateBuffer) this.bodyStateBuffer.destroy();
-    if (this.bodyPrevBuffer) this.bodyPrevBuffer.destroy();
-    if (this.constraintBuffer) this.constraintBuffer.destroy();
-    if (this.solverParamsBuffer) this.solverParamsBuffer.destroy();
-    if (this.colorIndicesBuffer) this.colorIndicesBuffer.destroy();
-    if (this.bodyConstraintRangesBuffer) this.bodyConstraintRangesBuffer.destroy();
+    for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
+      this.solverParamsBuffer, this.colorIndicesBuffer, this.bodyConstraintRangesBuffer]) {
+      if (buf) buf.destroy();
+    }
   }
 }

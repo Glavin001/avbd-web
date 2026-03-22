@@ -73,7 +73,7 @@ export class GPUContext {
   }
 
   /** Upload data to a GPU buffer */
-  writeBuffer(buffer: GPUBuffer, data: ArrayBufferView, offset: number = 0): void {
+  writeBuffer(buffer: GPUBuffer, data: Float32Array<ArrayBuffer> | Uint32Array<ArrayBuffer> | Int32Array<ArrayBuffer>, offset: number = 0): void {
     this.device.queue.writeBuffer(buffer, offset, data);
   }
 
