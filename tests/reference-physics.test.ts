@@ -14,7 +14,7 @@ function createWorldWithGround(config: any = {}): World {
 
 function simulate(world: World, seconds: number): void {
   const steps = Math.round(seconds * 60);
-  for (let i = 0; i < steps; i++) world.step();
+  for (let i = 0; i < steps; i++) world.stepCPU();
 }
 
 // ─── 1. Restitution Sweep (Rapier pattern) ──────────────────────────────────
@@ -38,7 +38,7 @@ describe('Restitution sweep', () => {
       let hitGround = false;
 
       for (let i = 0; i < 180; i++) {
-        world.step();
+        world.stepCPU();
         const y = body.translation().y;
         if (y < 1.5 && !hitGround) hitGround = true;
         if (hitGround && y > 1.0) {
@@ -95,7 +95,7 @@ describe('Force and torque correctness', () => {
     // Apply force each step for 1 second
     for (let i = 0; i < 60; i++) {
       body.applyForce({ x: force, y: 0 });
-      world.step();
+      world.stepCPU();
     }
 
     // v = F/m * t = 100/mass * 1
@@ -380,7 +380,7 @@ describe('Numerical robustness', () => {
 
     // Should not crash or produce NaN
     for (let i = 0; i < 120; i++) {
-      world.step();
+      world.stepCPU();
       expect(isFinite(body.translation().y)).toBe(true);
     }
   });
@@ -431,7 +431,7 @@ describe('World lifecycle', () => {
         world.removeRigidBody(bodies.shift()!);
       }
 
-      world.step();
+      world.stepCPU();
     }
 
     // Remaining bodies should be finite
@@ -447,8 +447,8 @@ describe('World lifecycle', () => {
         RigidBodyDesc2D.dynamic().setTranslation(0, 3)
       );
       world.createCollider(ColliderDesc2D.cuboid(0.5, 0.5), body);
-      world.step();
-      world.step();
+      world.stepCPU();
+      world.stepCPU();
       expect(isFinite(body.translation().y)).toBe(true);
     }
   });
@@ -491,7 +491,7 @@ describe('Contact constraint count', () => {
     );
     world.createCollider(ColliderDesc2D.cuboid(0.5, 0.5), body);
 
-    world.step();
+    world.stepCPU();
 
     expect(world.numConstraints).toBeGreaterThan(0);
   });
@@ -509,7 +509,7 @@ describe('Contact constraint count', () => {
     );
     world.createCollider(ColliderDesc2D.cuboid(0.5, 0.5), b);
 
-    world.step();
+    world.stepCPU();
 
     // No contacts between widely separated bodies
     // (numConstraints may include joints, so check solver directly)

@@ -4,7 +4,7 @@ import AVBD3D, { World3D, RigidBodyDesc3D, ColliderDesc3D } from '../src/3d/inde
 describe('AVBD 3D Public API', () => {
   describe('World creation', () => {
     it('should create a 3D world with gravity', () => {
-      const world = new World3D({ x: 0, y: -9.81, z: 0 });
+      const world = new World3D({ x: 0, y: -9.81, z: 0 }, { useCPU: true });
       expect(world).toBeDefined();
     });
   });
@@ -12,7 +12,7 @@ describe('AVBD 3D Public API', () => {
   describe('Free fall', () => {
     it('should accelerate a body under gravity', () => {
       const world = new World3D({ x: 0, y: -9.81, z: 0 }, {
-        iterations: 10,
+        iterations: 10, useCPU: true,
       });
 
       const body = world.createRigidBody(
@@ -35,7 +35,7 @@ describe('AVBD 3D Public API', () => {
 
     it('should match analytical free fall approximately', () => {
       const dt = 1 / 60;
-      const world = new World3D({ x: 0, y: -9.81, z: 0 }, { dt });
+      const world = new World3D({ x: 0, y: -9.81, z: 0 }, { dt, useCPU: true });
 
       const body = world.createRigidBody(
         RigidBodyDesc3D.dynamic().setTranslation(0, 100, 0)
@@ -52,7 +52,7 @@ describe('AVBD 3D Public API', () => {
 
   describe('Fixed bodies', () => {
     it('should not move fixed bodies', () => {
-      const world = new World3D({ x: 0, y: -9.81, z: 0 });
+      const world = new World3D({ x: 0, y: -9.81, z: 0 }, { useCPU: true });
 
       const body = world.createRigidBody(
         RigidBodyDesc3D.fixed().setTranslation(1, 2, 3)
@@ -68,7 +68,7 @@ describe('AVBD 3D Public API', () => {
   describe('Box on ground (3D)', () => {
     it('should prevent a cube from falling through a ground plane', () => {
       const world = new World3D({ x: 0, y: -9.81, z: 0 }, {
-        iterations: 10,
+        iterations: 10, useCPU: true,
       });
 
       // Ground
@@ -91,7 +91,7 @@ describe('AVBD 3D Public API', () => {
   describe('Sphere collision', () => {
     it('should handle sphere-sphere collision', () => {
       const world = new World3D({ x: 0, y: 0, z: 0 }, {
-        iterations: 10,
+        iterations: 10, useCPU: true,
       });
 
       const a = world.createRigidBody(
@@ -117,7 +117,7 @@ describe('AVBD 3D Public API', () => {
 
   describe('Body operations', () => {
     it('should read/write body properties', () => {
-      const world = new World3D({ x: 0, y: 0, z: 0 });
+      const world = new World3D({ x: 0, y: 0, z: 0 }, { useCPU: true });
       const body = world.createRigidBody(
         RigidBodyDesc3D.dynamic().setTranslation(1, 2, 3)
       );
@@ -135,7 +135,7 @@ describe('AVBD 3D Public API', () => {
     });
 
     it('should apply impulse', () => {
-      const world = new World3D({ x: 0, y: 0, z: 0 });
+      const world = new World3D({ x: 0, y: 0, z: 0 }, { useCPU: true });
       const body = world.createRigidBody(RigidBodyDesc3D.dynamic());
       world.createCollider(ColliderDesc3D.cuboid(0.5, 0.5, 0.5).setDensity(1), body);
 
@@ -145,7 +145,7 @@ describe('AVBD 3D Public API', () => {
     });
 
     it('should return quaternion rotation', () => {
-      const world = new World3D({ x: 0, y: 0, z: 0 });
+      const world = new World3D({ x: 0, y: 0, z: 0 }, { useCPU: true });
       const body = world.createRigidBody(RigidBodyDesc3D.dynamic());
       world.createCollider(ColliderDesc3D.cuboid(1, 1, 1), body);
 
@@ -159,7 +159,7 @@ describe('AVBD 3D Public API', () => {
 
   describe('Bulk readback', () => {
     it('should return body states as Float32Array', () => {
-      const world = new World3D({ x: 0, y: 0, z: 0 });
+      const world = new World3D({ x: 0, y: 0, z: 0 }, { useCPU: true });
       const body = world.createRigidBody(
         RigidBodyDesc3D.dynamic().setTranslation(1, 2, 3)
       );
@@ -176,24 +176,27 @@ describe('AVBD 3D Public API', () => {
   });
 
   describe('Rapier-style API', () => {
-    it('should work with AVBD3D namespace', async () => {
-      await AVBD3D.init();
-      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 });
-      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10));
+    it('should work with AVBD3D namespace (CPU mode for testing)', () => {
+      const world = new World3D({ x: 0, y: -9.81, z: 0 }, { useCPU: true });
+      world.createCollider(ColliderDesc3D.cuboid(10, 0.5, 10));
 
       const body = world.createRigidBody(
-        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 5, 0)
+        RigidBodyDesc3D.dynamic().setTranslation(0, 5, 0)
       );
-      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5), body);
+      world.createCollider(ColliderDesc3D.cuboid(0.5, 0.5, 0.5), body);
 
       world.step();
       expect(body.translation().y).toBeLessThan(5);
+    });
+
+    it('should require AVBD3D.init() for GPU mode', () => {
+      expect(() => new World3D({ x: 0, y: -9.81, z: 0 })).toThrow(/AVBD3D.init/);
     });
   });
 
   describe('Gravity scale', () => {
     it('should respect gravity scale', () => {
-      const world = new World3D({ x: 0, y: -9.81, z: 0 });
+      const world = new World3D({ x: 0, y: -9.81, z: 0 }, { useCPU: true });
 
       const a = world.createRigidBody(
         RigidBodyDesc3D.dynamic().setTranslation(-5, 10, 0)
@@ -215,7 +218,7 @@ describe('AVBD 3D Public API', () => {
   describe('Box stacking 3D', () => {
     it('should support stacking 3 cubes', () => {
       const world = new World3D({ x: 0, y: -9.81, z: 0 }, {
-        iterations: 15,
+        iterations: 15, useCPU: true,
       });
 
       world.createCollider(ColliderDesc3D.cuboid(10, 0.5, 10));

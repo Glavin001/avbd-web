@@ -1,13 +1,26 @@
 /**
  * AVBD 3D Physics Engine — Public API
- * Rapier-compatible API for 3D rigid body simulation.
+ * GPU-first WebGPU-accelerated 6-DOF rigid body simulation.
+ *
+ * Usage:
+ *   import AVBD3D from '@avbd/3d';
+ *   await AVBD3D.init();  // Required: initializes WebGPU
+ *   const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 });
+ *   await world.step();   // GPU compute dispatch
  */
 
 import type { Vec3, Quat, SolverConfig, RigidBodyHandle } from '../core/types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D } from '../core/types.js';
+import { GPUSolver3D } from '../core/gpu-solver-3d.js';
 import { AVBDSolver3D } from '../core/solver-3d.js';
+import { GPUContext } from '../core/gpu-context.js';
 import { RigidBodyDesc3D, ColliderDesc3D, type Body3D } from '../core/rigid-body-3d.js';
 import { quatIdentity } from '../core/math.js';
+
+// ─── Module-level GPU state ─────────────────────────────────────────────────
+
+let gpuContext: GPUContext | null = null;
+let gpuAvailable = false;
 
 export interface WorldConfig3D {
   iterations?: number;
@@ -16,14 +29,17 @@ export interface WorldConfig3D {
   gamma?: number;
   postStabilize?: boolean;
   dt?: number;
+  /** Opt-in: use CPU solver instead of GPU. Default: false (GPU). */
+  useCPU?: boolean;
 }
 
 export class World3D {
-  private solver: AVBDSolver3D;
+  private gpuSolver: GPUSolver3D | null = null;
+  private cpuSolver: AVBDSolver3D | null = null;
   private bodyHandleMap: Map<number, RigidBody3D> = new Map();
 
   constructor(gravity: Vec3, config: WorldConfig3D = {}) {
-    this.solver = new AVBDSolver3D({
+    const solverConfig = {
       gravity,
       iterations: config.iterations ?? DEFAULT_SOLVER_CONFIG_3D.iterations,
       beta: config.beta ?? DEFAULT_SOLVER_CONFIG_3D.beta,
@@ -31,36 +47,69 @@ export class World3D {
       gamma: config.gamma ?? DEFAULT_SOLVER_CONFIG_3D.gamma,
       postStabilize: config.postStabilize ?? DEFAULT_SOLVER_CONFIG_3D.postStabilize,
       dt: config.dt ?? DEFAULT_SOLVER_CONFIG_3D.dt,
-    });
+    };
+
+    if (config.useCPU) {
+      this.cpuSolver = new AVBDSolver3D(solverConfig);
+    } else {
+      if (!gpuAvailable || !gpuContext) {
+        throw new Error(
+          'AVBD3D.init() must be called before creating a World3D. ' +
+          'WebGPU is required. Pass { useCPU: true } for CPU-only mode.'
+        );
+      }
+      this.gpuSolver = new GPUSolver3D(gpuContext, solverConfig);
+    }
+  }
+
+  private get bodyStore() {
+    return this.gpuSolver?.bodyStore ?? this.cpuSolver!.bodyStore;
+  }
+
+  private get activeSolver(): GPUSolver3D | AVBDSolver3D {
+    return (this.gpuSolver ?? this.cpuSolver)!;
   }
 
   createRigidBody(desc: RigidBodyDesc3D): RigidBody3D {
-    const handle = this.solver.bodyStore.addBody(desc);
-    const rb = new RigidBody3D(handle, this.solver);
+    const handle = this.bodyStore.addBody(desc);
+    const rb = new RigidBody3D(handle, this.activeSolver);
     this.bodyHandleMap.set(handle.index, rb);
     return rb;
   }
 
   createCollider(desc: ColliderDesc3D, body?: RigidBody3D): void {
     if (body) {
-      this.solver.bodyStore.attachCollider(body.handle.index, desc);
+      this.bodyStore.attachCollider(body.handle.index, desc);
     } else {
       const groundDesc = RigidBodyDesc3D.fixed().setTranslation(0, 0, 0);
-      const handle = this.solver.bodyStore.addBody(groundDesc);
-      this.solver.bodyStore.attachCollider(handle.index, desc);
+      const handle = this.bodyStore.addBody(groundDesc);
+      this.bodyStore.attachCollider(handle.index, desc);
     }
   }
 
-  step(): void {
-    this.solver.step();
+  /**
+   * Step the physics simulation.
+   * Uses GPU compute shaders when available, CPU when useCPU was set.
+   */
+  step(): void | Promise<void> {
+    if (this.gpuSolver) {
+      return this.gpuSolver.step();
+    }
+    this.cpuSolver!.step();
   }
 
+  /** @deprecated Use step() instead. */
   async stepAsync(): Promise<void> {
-    this.step();
+    await this.step();
+  }
+
+  /** Check if this world is using the GPU solver */
+  get isGPU(): boolean {
+    return this.gpuSolver !== null;
   }
 
   getBodyStates(): Float32Array {
-    const bodies = this.solver.bodyStore.bodies;
+    const bodies = this.bodyStore.bodies;
     // 7 floats per body: x, y, z, qw, qx, qy, qz
     const data = new Float32Array(bodies.length * 7);
     for (let i = 0; i < bodies.length; i++) {
@@ -77,7 +126,7 @@ export class World3D {
   }
 
   removeRigidBody(body: RigidBody3D): void {
-    const b = this.solver.bodyStore.bodies[body.handle.index];
+    const b = this.bodyStore.bodies[body.handle.index];
     b.type = RigidBodyType.Fixed;
     b.mass = 0; b.invMass = 0;
     b.inertia = { x: 0, y: 0, z: 0 };
@@ -89,17 +138,17 @@ export class World3D {
   }
 
   get numBodies(): number {
-    return this.solver.bodyStore.bodies.filter(b => b.type === RigidBodyType.Dynamic).length;
+    return this.bodyStore.bodies.filter(b => b.type === RigidBodyType.Dynamic).length;
   }
 
-  get rawSolver(): AVBDSolver3D { return this.solver; }
+  get rawSolver(): GPUSolver3D | AVBDSolver3D { return this.activeSolver; }
 }
 
 export class RigidBody3D {
   readonly handle: RigidBodyHandle;
-  private solver: AVBDSolver3D;
+  private solver: GPUSolver3D | AVBDSolver3D;
 
-  constructor(handle: RigidBodyHandle, solver: AVBDSolver3D) {
+  constructor(handle: RigidBodyHandle, solver: GPUSolver3D | AVBDSolver3D) {
     this.handle = handle;
     this.solver = solver;
   }
@@ -143,7 +192,27 @@ export class RigidBody3D {
 // ─── Static AVBD3D namespace ────────────────────────────────────────────────
 
 const AVBD3D = {
-  async init(): Promise<void> {},
+  /**
+   * Initialize the AVBD 3D engine with WebGPU.
+   * Must be called before creating a World3D.
+   * Throws if WebGPU is not available.
+   */
+  async init(): Promise<void> {
+    if (typeof navigator === 'undefined' || !navigator.gpu) {
+      throw new Error(
+        'WebGPU is not available. AVBD3D requires a WebGPU-capable browser ' +
+        '(Chrome 113+, Firefox Nightly, Safari 18+).'
+      );
+    }
+    gpuContext = await GPUContext.create({ powerPreference: 'high-performance' });
+    gpuAvailable = true;
+  },
+
+  /** Whether WebGPU GPU acceleration is available */
+  get isGPUAvailable(): boolean {
+    return gpuAvailable;
+  },
+
   World: World3D,
   RigidBodyDesc: RigidBodyDesc3D,
   ColliderDesc: ColliderDesc3D,

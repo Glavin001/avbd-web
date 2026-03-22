@@ -18,7 +18,7 @@ function createWorldWithGround(config: any = {}): World {
 
 function simulate(world: World, seconds: number, dt: number = 1 / 60): void {
   const steps = Math.round(seconds / dt);
-  for (let i = 0; i < steps; i++) world.step();
+  for (let i = 0; i < steps; i++) world.stepCPU();
 }
 
 // ─── Restitution (Bounciness) ───────────────────────────────────────────────
@@ -204,7 +204,7 @@ describe('Extreme mass ratios', () => {
 
     // Should not explode
     for (let i = 0; i < 300; i++) {
-      world.step();
+      world.stepCPU();
       expect(isFinite(light.translation().y)).toBe(true);
       expect(isFinite(heavy.translation().y)).toBe(true);
     }
@@ -373,7 +373,7 @@ describe('Kinematic bodies', () => {
 
     // Move kinematic body manually
     body.setTranslation({ x: 3, y: 5 });
-    world.step();
+    world.stepCPU();
     expect(body.translation().x).toBeCloseTo(3, 0);
   });
 });
@@ -432,7 +432,7 @@ describe('Collision pair scenarios', () => {
 
     // Should not crash or produce NaN
     for (let i = 0; i < 120; i++) {
-      world.step();
+      world.stepCPU();
     }
 
     const states = world.getBodyStates();

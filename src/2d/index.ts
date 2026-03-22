@@ -125,24 +125,16 @@ export class World {
   }
 
   /**
-   * Step the physics simulation using the CPU solver (synchronous).
-   * Use stepAsync() for GPU-accelerated stepping.
-   */
-  step(): void {
-    this.regenerateJointConstraints();
-    this.solver.step();
-  }
-
-  /**
-   * Step the physics simulation using the GPU solver if available.
-   * Falls back to CPU solver if WebGPU was not initialized.
-   *
-   * The GPU path dispatches WGSL compute shaders:
+   * Step the physics simulation on the GPU.
+   * Dispatches WGSL compute shaders:
    * - Primal update: one dispatch per graph color group (parallel bodies)
    * - Dual update: one dispatch over all constraints
    * - Readback: async GPU→CPU transfer of body positions
+   *
+   * Requires AVBD.init() to have been called first.
+   * Throws if GPU solver is not available.
    */
-  async stepAsync(): Promise<void> {
+  async step(): Promise<void> {
     if (this.gpuSolver) {
       // Sync body/constraint stores from CPU World to GPU solver
       this.gpuSolver.bodyStore = this.solver.bodyStore;
@@ -151,8 +143,25 @@ export class World {
       this.regenerateJointConstraints();
       await this.gpuSolver.step();
     } else {
-      this.step();
+      throw new Error(
+        'GPU solver not available. Call AVBD.init() before creating a World, ' +
+        'or use stepCPU() for explicit CPU fallback.'
+      );
     }
+  }
+
+  /** @deprecated Use step() instead. */
+  async stepAsync(): Promise<void> {
+    await this.step();
+  }
+
+  /**
+   * Step the physics simulation using the CPU solver (synchronous).
+   * Opt-in only — use step() for GPU-accelerated physics.
+   */
+  stepCPU(): void {
+    this.regenerateJointConstraints();
+    this.solver.step();
   }
 
   /** Check if this world is using the GPU solver */
@@ -341,24 +350,19 @@ export class JointHandle {
 
 const AVBD = {
   /**
-   * Initialize the AVBD engine.
-   * Attempts to acquire a WebGPU adapter and device.
-   * If WebGPU is not available, falls back to CPU solver silently.
-   *
-   * Must be called before creating a World if you want GPU acceleration.
-   * Worlds created after init() will use GPU when available.
+   * Initialize the AVBD engine with WebGPU.
+   * Must be called before creating a World.
+   * Throws if WebGPU is not available.
    */
   async init(): Promise<void> {
-    try {
-      if (typeof navigator !== 'undefined' && navigator.gpu) {
-        gpuContext = await GPUContext.create({ powerPreference: 'high-performance' });
-        gpuAvailable = true;
-      }
-    } catch {
-      // WebGPU not available — fall back to CPU solver
-      gpuAvailable = false;
-      gpuContext = null;
+    if (typeof navigator === 'undefined' || !navigator.gpu) {
+      throw new Error(
+        'WebGPU is not available. AVBD requires a WebGPU-capable browser ' +
+        '(Chrome 113+, Firefox Nightly, Safari 18+).'
+      );
     }
+    gpuContext = await GPUContext.create({ powerPreference: 'high-performance' });
+    gpuAvailable = true;
   },
 
   /** Whether WebGPU GPU acceleration is available */

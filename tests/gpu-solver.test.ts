@@ -4,14 +4,14 @@
  * Tests in Node.js (no WebGPU) validate:
  * 1. Embedded WGSL shaders are loaded and contain valid code
  * 2. Buffer layouts match WGSL struct definitions exactly
- * 3. GPU fallback to CPU works correctly
+ * 3. GPU-first behavior (throws without WebGPU, stepCPU opt-in)
  * 4. Constraint sorting produces correct per-body ranges
  *
  * Actual GPU execution is tested via Playwright in tests/browser/
  */
 import { describe, it, expect } from 'vitest';
 import AVBD, { World, RigidBodyDesc2D, ColliderDesc2D } from '../src/2d/index.js';
-import { PRIMAL_UPDATE_2D_WGSL, DUAL_UPDATE_WGSL, PRIMAL_UPDATE_3D_WGSL, MATH_UTILS_WGSL } from '../src/shaders/embedded.js';
+import { PRIMAL_UPDATE_2D_WGSL, DUAL_UPDATE_WGSL, DUAL_UPDATE_3D_WGSL, PRIMAL_UPDATE_3D_WGSL, MATH_UTILS_WGSL } from '../src/shaders/embedded.js';
 
 // ─── Embedded Shader Validation ─────────────────────────────────────────────
 
@@ -77,35 +77,55 @@ describe('Embedded WGSL shaders', () => {
     expect(PRIMAL_UPDATE_3D_WGSL).not.toContain('Simplified');
     // Should have body_state reads for constraint eval
     expect(PRIMAL_UPDATE_3D_WGSL).toContain('jacobian_a_lin');
+    // Should have angular displacement via quaternion diff
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('jacobian_a_ang');
+    expect(PRIMAL_UPDATE_3D_WGSL).not.toContain('TODO');
+  });
+
+  it('should have non-empty 3D dual update shader', () => {
+    expect(DUAL_UPDATE_3D_WGSL.length).toBeGreaterThan(100);
+    expect(DUAL_UPDATE_3D_WGSL).toContain('@compute @workgroup_size(64)');
+    expect(DUAL_UPDATE_3D_WGSL).toContain('struct ConstraintRow3D');
+    // Should have 6-DOF constraint evaluation (quaternion angular displacement)
+    expect(DUAL_UPDATE_3D_WGSL).toContain('jacobian_a_ang');
+    expect(DUAL_UPDATE_3D_WGSL).toContain('jacobian_b_ang');
+    // Should have friction coupling for triplets (normal + 2 tangent)
+    expect(DUAL_UPDATE_3D_WGSL).toContain('idx % 3u');
+    // Body state stride should be 20
+    expect(DUAL_UPDATE_3D_WGSL).toContain('* 20u');
+    // Body prev stride should be 14
+    expect(DUAL_UPDATE_3D_WGSL).toContain('* 14u');
   });
 });
 
 // ─── GPU Fallback ───────────────────────────────────────────────────────────
 
-describe('GPU fallback in Node.js', () => {
-  it('should report GPU unavailable in Node', async () => {
-    await AVBD.init();
+describe('GPU-first behavior in Node.js', () => {
+  it('should throw on init() when WebGPU is unavailable', async () => {
+    await expect(AVBD.init()).rejects.toThrow(/WebGPU/);
+  });
+
+  it('should report GPU unavailable before init', () => {
     expect(AVBD.isGPUAvailable).toBe(false);
   });
 
-  it('should create a working world without GPU', async () => {
-    await AVBD.init();
-    const world = new AVBD.World({ x: 0, y: -9.81 });
+  it('should throw on step() when GPU solver not initialized', async () => {
+    const world = new World({ x: 0, y: -9.81 });
     world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
     const body = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 5));
     world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
 
-    world.step();
-    expect(body.translation().y).toBeLessThan(5);
-
-    await world.stepAsync();
-    expect(body.translation().y).toBeLessThan(5);
+    await expect(world.step()).rejects.toThrow(/GPU solver/);
   });
 
-  it('should report isGPU as false', async () => {
-    await AVBD.init();
-    const world = new AVBD.World({ x: 0, y: -9.81 });
-    expect(world.isGPU).toBe(false);
+  it('should work with stepCPU() as explicit opt-in', () => {
+    const world = new World({ x: 0, y: -9.81 });
+    world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
+    const body = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 5));
+    world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+
+    world.stepCPU();
+    expect(body.translation().y).toBeLessThan(5);
   });
 });
 

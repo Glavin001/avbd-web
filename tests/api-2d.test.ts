@@ -21,30 +21,28 @@ describe('AVBD 2D Public API', () => {
   });
 
   describe('Rapier-style API pattern', () => {
-    it('should match Rapier API usage pattern', async () => {
-      await AVBD.init();
-
+    it('should match Rapier API usage pattern', () => {
       const gravity = { x: 0, y: -9.81 };
-      const world = new AVBD.World(gravity);
+      const world = new World(gravity);
 
       // Create ground
-      const groundColliderDesc = AVBD.ColliderDesc.cuboid(10, 0.5);
+      const groundColliderDesc = ColliderDesc2D.cuboid(10, 0.5);
       world.createCollider(groundColliderDesc);
 
       // Create dynamic body
-      const rigidBodyDesc = AVBD.RigidBodyDesc.dynamic()
+      const rigidBodyDesc = RigidBodyDesc2D.dynamic()
         .setTranslation(0, 5)
         .setLinearDamping(0.1);
       const rigidBody = world.createRigidBody(rigidBodyDesc);
 
-      const colliderDesc = AVBD.ColliderDesc.cuboid(0.5, 0.5)
+      const colliderDesc = ColliderDesc2D.cuboid(0.5, 0.5)
         .setRestitution(0.3)
         .setFriction(0.5)
         .setDensity(1.0);
       world.createCollider(colliderDesc, rigidBody);
 
-      // Step
-      world.step();
+      // Step (CPU opt-in for testing)
+      world.stepCPU();
 
       const pos = rigidBody.translation();
       expect(pos.x).toBeCloseTo(0);
@@ -54,13 +52,17 @@ describe('AVBD 2D Public API', () => {
       expect(typeof rot).toBe('number');
     });
 
-    it('should support async step', async () => {
-      const world = new AVBD.World({ x: 0, y: -9.81 });
-      const desc = AVBD.RigidBodyDesc.dynamic().setTranslation(0, 5);
+    it('should require GPU init for step()', async () => {
+      const world = new World({ x: 0, y: -9.81 });
+      const desc = RigidBodyDesc2D.dynamic().setTranslation(0, 5);
       const body = world.createRigidBody(desc);
-      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+      world.createCollider(ColliderDesc2D.cuboid(0.5, 0.5), body);
 
-      await world.stepAsync();
+      // step() should throw without GPU init
+      await expect(world.step()).rejects.toThrow(/GPU solver/);
+
+      // stepCPU() should work
+      world.stepCPU();
       expect(body.translation().y).toBeLessThan(5);
     });
   });
@@ -141,7 +143,7 @@ describe('AVBD 2D Public API', () => {
 
       // Simulate 2 seconds
       for (let i = 0; i < 120; i++) {
-        world.step();
+        world.stepCPU();
       }
 
       // Box should rest on ground (y ≈ 1.0 = ground_top(0.5) + box_half_height(0.5))
@@ -162,7 +164,7 @@ describe('AVBD 2D Public API', () => {
       world.createCollider(ColliderDesc2D.ball(0.5), body);
 
       for (let i = 0; i < 120; i++) {
-        world.step();
+        world.stepCPU();
       }
 
       // Ball should rest on ground (y ≈ 1.0 = ground_top(0.5) + ball_radius(0.5))
@@ -190,7 +192,7 @@ describe('AVBD 2D Public API', () => {
 
       // Simulate 3 seconds
       for (let i = 0; i < 180; i++) {
-        world.step();
+        world.stepCPU();
       }
 
       // All boxes should be above ground
@@ -228,7 +230,7 @@ describe('AVBD 2D Public API', () => {
 
       // Simulate
       for (let i = 0; i < 60; i++) {
-        world.step();
+        world.stepCPU();
       }
 
       // Body B should stay connected to body A via the joint
@@ -303,7 +305,7 @@ describe('AVBD 2D Public API', () => {
       world.createCollider(ColliderDesc2D.ball(0.5), ball);
 
       for (let i = 0; i < 120; i++) {
-        world.step();
+        world.stepCPU();
       }
 
       // Both should rest on ground

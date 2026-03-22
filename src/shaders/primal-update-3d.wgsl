@@ -168,8 +168,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let dpy = body_state[ba + 1u] - body_prev[bap + 1u];
       let dpz = body_state[ba + 2u] - body_prev[bap + 2u];
       c_eval += cr.jacobian_a_lin.x * dpx + cr.jacobian_a_lin.y * dpy + cr.jacobian_a_lin.z * dpz;
-      // Angular contribution (simplified: small angle approximation)
-      // TODO: full quaternion diff for angular displacement
+      // Angular displacement via quaternion difference: dq = q * conj(q_prev)
+      let qw_a = body_state[ba + 3u]; let qx_a = body_state[ba + 4u];
+      let qy_a = body_state[ba + 5u]; let qz_a = body_state[ba + 6u];
+      let pqw_a = body_prev[bap + 3u]; let pqx_a = body_prev[bap + 4u];
+      let pqy_a = body_prev[bap + 5u]; let pqz_a = body_prev[bap + 6u];
+      let dqx_a = pqw_a * qx_a - pqx_a * qw_a - pqy_a * qz_a + pqz_a * qy_a;
+      let dqy_a = pqw_a * qy_a + pqx_a * qz_a - pqy_a * qw_a - pqz_a * qx_a;
+      let dqz_a = pqw_a * qz_a - pqx_a * qy_a + pqy_a * qx_a - pqz_a * qw_a;
+      c_eval += cr.jacobian_a_ang.x * 2.0 * dqx_a
+             + cr.jacobian_a_ang.y * 2.0 * dqy_a
+             + cr.jacobian_a_ang.z * 2.0 * dqz_a;
     }
     if (cr.body_b >= 0) {
       let bb = u32(cr.body_b) * 20u;
@@ -178,6 +187,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let dpy = body_state[bb + 1u] - body_prev[bbp + 1u];
       let dpz = body_state[bb + 2u] - body_prev[bbp + 2u];
       c_eval += cr.jacobian_b_lin.x * dpx + cr.jacobian_b_lin.y * dpy + cr.jacobian_b_lin.z * dpz;
+      let qw_b = body_state[bb + 3u]; let qx_b = body_state[bb + 4u];
+      let qy_b = body_state[bb + 5u]; let qz_b = body_state[bb + 6u];
+      let pqw_b = body_prev[bbp + 3u]; let pqx_b = body_prev[bbp + 4u];
+      let pqy_b = body_prev[bbp + 5u]; let pqz_b = body_prev[bbp + 6u];
+      let dqx_b = pqw_b * qx_b - pqx_b * qw_b - pqy_b * qz_b + pqz_b * qy_b;
+      let dqy_b = pqw_b * qy_b + pqx_b * qz_b - pqy_b * qw_b - pqz_b * qx_b;
+      let dqz_b = pqw_b * qz_b - pqx_b * qy_b + pqy_b * qx_b - pqz_b * qw_b;
+      c_eval += cr.jacobian_b_ang.x * 2.0 * dqx_b
+             + cr.jacobian_b_ang.y * 2.0 * dqy_b
+             + cr.jacobian_b_ang.z * 2.0 * dqz_b;
     }
 
     // Stiffness guard
