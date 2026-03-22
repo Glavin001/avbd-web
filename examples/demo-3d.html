@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AVBD 3D Physics Demo</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; color: #eee; font-family: 'Segoe UI', sans-serif; }
+    canvas { display: block; width: 100%; height: calc(100vh - 120px); }
+    .controls { text-align: center; padding: 10px; }
+    .controls button {
+      background: #16213e; color: #eee; border: 1px solid #0f3460;
+      padding: 8px 16px; margin: 4px; cursor: pointer; border-radius: 4px;
+    }
+    .controls button:hover { background: #0f3460; }
+    h1 { text-align: center; padding: 15px 0 5px; font-size: 22px; color: #e94560; }
+    .info { text-align: center; color: #888; font-size: 13px; }
+    #stats { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.7);
+             padding: 8px 12px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>AVBD 3D Physics — WebGPU Augmented Vertex Block Descent</h1>
+  <p class="info">3D rigid body simulation rendered with Canvas 2D (isometric view)</p>
+  <div class="controls">
+    <button onclick="addCube()">Add Cube</button>
+    <button onclick="addSphere()">Add Sphere</button>
+    <button onclick="addStack3D()">Stack 5</button>
+    <button onclick="reset3D()">Reset</button>
+  </div>
+  <canvas id="canvas3d"></canvas>
+  <div id="stats">FPS: -- | Bodies: 0</div>
+
+  <script type="module">
+    import AVBD3D from '../src/3d/index.ts';
+
+    const canvas = document.getElementById('canvas3d');
+    const ctx = canvas.getContext('2d');
+    const stats = document.getElementById('stats');
+
+    function resize() {
+      canvas.width = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    const SCALE = 60;
+    const ISO_ANGLE = Math.PI / 6;
+
+    function toIso(x, y, z) {
+      const sx = canvas.width / 2 + (x - z) * Math.cos(ISO_ANGLE) * SCALE;
+      const sy = canvas.height * 0.7 - y * SCALE + (x + z) * Math.sin(ISO_ANGLE) * SCALE * 0.5;
+      return [sx, sy];
+    }
+
+    let world, bodies3d;
+
+    function init3D() {
+      world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, {
+        iterations: 10,
+      });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(5, 0.3, 5));
+      bodies3d = [];
+    }
+
+    function addCube() {
+      const x = (Math.random() - 0.5) * 4;
+      const z = (Math.random() - 0.5) * 4;
+      const y = 4 + Math.random() * 3;
+      const size = 0.3 + Math.random() * 0.3;
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(x, y, z)
+      );
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(size, size, size).setDensity(1), body);
+      bodies3d.push({ body, type: 'cube', size, color: randomColor() });
+    }
+
+    function addSphere() {
+      const x = (Math.random() - 0.5) * 4;
+      const z = (Math.random() - 0.5) * 4;
+      const y = 4 + Math.random() * 3;
+      const r = 0.2 + Math.random() * 0.3;
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(x, y, z)
+      );
+      world.createCollider(AVBD3D.ColliderDesc.ball(r).setDensity(1), body);
+      bodies3d.push({ body, type: 'sphere', radius: r, color: randomColor() });
+    }
+
+    function addStack3D() {
+      for (let i = 0; i < 5; i++) {
+        const body = world.createRigidBody(
+          AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 0.8 + i * 1.05, 0)
+        );
+        world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setDensity(1), body);
+        bodies3d.push({ body, type: 'cube', size: 0.5, color: randomColor() });
+      }
+    }
+
+    function randomColor() {
+      const hue = Math.random() * 360;
+      return `hsl(${hue}, 60%, 55%)`;
+    }
+
+    window.addCube = addCube;
+    window.addSphere = addSphere;
+    window.addStack3D = addStack3D;
+    window.reset3D = () => { init3D(); };
+
+    function render3D() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw ground grid
+      ctx.strokeStyle = '#2a2a4a';
+      ctx.lineWidth = 1;
+      for (let i = -5; i <= 5; i++) {
+        const [x1, y1] = toIso(i, 0, -5);
+        const [x2, y2] = toIso(i, 0, 5);
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+
+        const [x3, y3] = toIso(-5, 0, i);
+        const [x4, y4] = toIso(5, 0, i);
+        ctx.beginPath(); ctx.moveTo(x3, y3); ctx.lineTo(x4, y4); ctx.stroke();
+      }
+
+      // Sort bodies by depth for proper rendering
+      const sorted = [...bodies3d].sort((a, b) => {
+        const pa = a.body.translation();
+        const pb = b.body.translation();
+        return (pa.x + pa.z) - (pb.x + pb.z);
+      });
+
+      for (const { body, type, size, radius, color } of sorted) {
+        const pos = body.translation();
+        const [sx, sy] = toIso(pos.x, pos.y, pos.z);
+
+        if (type === 'cube') {
+          const s = size * SCALE;
+          // Simple isometric cube
+          ctx.fillStyle = color;
+          ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+          ctx.beginPath();
+          ctx.moveTo(sx, sy - s);
+          ctx.lineTo(sx + s * 0.866, sy - s * 0.5);
+          ctx.lineTo(sx + s * 0.866, sy + s * 0.5);
+          ctx.lineTo(sx, sy + s);
+          ctx.lineTo(sx - s * 0.866, sy + s * 0.5);
+          ctx.lineTo(sx - s * 0.866, sy - s * 0.5);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+        } else {
+          const r = radius * SCALE;
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(sx, sy, r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+          ctx.stroke();
+        }
+      }
+    }
+
+    let lastTime = performance.now(), frameCount = 0, fps = 0;
+
+    function gameLoop3D() {
+      world.step();
+      render3D();
+
+      frameCount++;
+      const now = performance.now();
+      if (now - lastTime >= 1000) {
+        fps = frameCount;
+        frameCount = 0;
+        lastTime = now;
+      }
+      stats.textContent = `FPS: ${fps} | Bodies: ${bodies3d.length}`;
+
+      requestAnimationFrame(gameLoop3D);
+    }
+
+    init3D();
+    addStack3D();
+    gameLoop3D();
+  </script>
+</body>
+</html>

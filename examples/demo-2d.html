@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AVBD 2D Physics Demo</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; color: #eee; font-family: 'Segoe UI', sans-serif; }
+    canvas { display: block; margin: 20px auto; border: 1px solid #333; background: #0f0f23; }
+    .controls { text-align: center; padding: 10px; }
+    .controls button {
+      background: #16213e; color: #eee; border: 1px solid #0f3460;
+      padding: 8px 16px; margin: 4px; cursor: pointer; border-radius: 4px;
+      font-size: 14px;
+    }
+    .controls button:hover { background: #0f3460; }
+    h1 { text-align: center; padding: 20px 0 5px; font-size: 24px; color: #e94560; }
+    .info { text-align: center; color: #888; font-size: 13px; padding: 5px; }
+    #stats { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.7);
+             padding: 8px 12px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>AVBD 2D Physics — WebGPU Augmented Vertex Block Descent</h1>
+  <p class="info">GPU-accelerated rigid body physics based on SIGGRAPH 2025</p>
+  <div class="controls">
+    <button onclick="addBox()">Add Box</button>
+    <button onclick="addBall()">Add Ball</button>
+    <button onclick="addStack()">Stack 5</button>
+    <button onclick="addPyramid()">Pyramid</button>
+    <button onclick="reset()">Reset</button>
+  </div>
+  <canvas id="canvas" width="800" height="600"></canvas>
+  <div id="stats">FPS: -- | Bodies: 0</div>
+
+  <script type="module">
+    import AVBD from '../src/2d/index.ts';
+
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const stats = document.getElementById('stats');
+
+    // Scale: 1 meter = 50 pixels
+    const SCALE = 50;
+    const ORIGIN_X = canvas.width / 2;
+    const ORIGIN_Y = canvas.height - 100;
+
+    let world;
+    let bodies = [];
+
+    function init() {
+      world = new AVBD.World({ x: 0, y: -9.81 }, {
+        iterations: 10,
+        beta: 100000,
+        postStabilize: true,
+      });
+
+      // Ground
+      world.createCollider(AVBD.ColliderDesc.cuboid(8, 0.3));
+
+      // Left wall
+      const lw = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(-7, 3));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.3, 3), lw);
+
+      // Right wall
+      const rw = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(7, 3));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.3, 3), rw);
+
+      bodies = [];
+    }
+
+    function toScreen(x, y) {
+      return [ORIGIN_X + x * SCALE, ORIGIN_Y - y * SCALE];
+    }
+
+    function addBox() {
+      const x = (Math.random() - 0.5) * 8;
+      const y = 5 + Math.random() * 3;
+      const size = 0.3 + Math.random() * 0.4;
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic()
+          .setTranslation(x, y)
+          .setRotation((Math.random() - 0.5) * 0.5)
+      );
+      world.createCollider(
+        AVBD.ColliderDesc.cuboid(size, size)
+          .setDensity(1)
+          .setFriction(0.5)
+          .setRestitution(0.2),
+        body
+      );
+      bodies.push({ body, type: 'box', size, color: randomColor() });
+    }
+
+    function addBall() {
+      const x = (Math.random() - 0.5) * 8;
+      const y = 5 + Math.random() * 3;
+      const radius = 0.2 + Math.random() * 0.3;
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+      );
+      world.createCollider(
+        AVBD.ColliderDesc.ball(radius).setDensity(1).setFriction(0.3),
+        body
+      );
+      bodies.push({ body, type: 'ball', radius, color: randomColor() });
+    }
+
+    function addStack() {
+      for (let i = 0; i < 5; i++) {
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(0, 0.8 + i * 1.05)
+        );
+        world.createCollider(
+          AVBD.ColliderDesc.cuboid(0.5, 0.5).setDensity(1).setFriction(0.5),
+          body
+        );
+        bodies.push({ body, type: 'box', size: 0.5, color: randomColor() });
+      }
+    }
+
+    function addPyramid() {
+      const rows = 5;
+      for (let row = 0; row < rows; row++) {
+        const count = rows - row;
+        const offset = -(count - 1) * 0.55;
+        for (let col = 0; col < count; col++) {
+          const x = offset + col * 1.1;
+          const y = 0.8 + row * 1.05;
+          const body = world.createRigidBody(
+            AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+          );
+          world.createCollider(
+            AVBD.ColliderDesc.cuboid(0.5, 0.5).setDensity(1).setFriction(0.5),
+            body
+          );
+          bodies.push({ body, type: 'box', size: 0.5, color: randomColor() });
+        }
+      }
+    }
+
+    function randomColor() {
+      const hue = Math.random() * 360;
+      return `hsl(${hue}, 60%, 55%)`;
+    }
+
+    window.addBox = addBox;
+    window.addBall = addBall;
+    window.addStack = addStack;
+    window.addPyramid = addPyramid;
+    window.reset = () => { init(); };
+
+    function render() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw ground
+      ctx.fillStyle = '#2a2a4a';
+      const [gx, gy] = toScreen(-8, 0.3);
+      ctx.fillRect(gx, gy, 16 * SCALE, 0.6 * SCALE);
+
+      // Draw walls
+      ctx.fillStyle = '#2a2a4a';
+      const [lwx, lwy] = toScreen(-7.3, 6);
+      ctx.fillRect(lwx, lwy, 0.6 * SCALE, 6 * SCALE);
+      const [rwx, rwy] = toScreen(6.7, 6);
+      ctx.fillRect(rwx, rwy, 0.6 * SCALE, 6 * SCALE);
+
+      // Draw bodies
+      for (const { body, type, size, radius, color } of bodies) {
+        const pos = body.translation();
+        const [sx, sy] = toScreen(pos.x, pos.y);
+
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.rotate(-body.rotation());
+
+        if (type === 'box') {
+          ctx.fillStyle = color;
+          const w = size * 2 * SCALE;
+          ctx.fillRect(-w / 2, -w / 2, w, w);
+          ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+          ctx.strokeRect(-w / 2, -w / 2, w, w);
+        } else {
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(0, 0, radius * SCALE, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+          ctx.stroke();
+          // Direction indicator
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.lineTo(radius * SCALE, 0);
+          ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+          ctx.stroke();
+        }
+
+        ctx.restore();
+      }
+    }
+
+    let lastTime = performance.now();
+    let frameCount = 0;
+    let fps = 0;
+
+    function gameLoop() {
+      world.step();
+      render();
+
+      frameCount++;
+      const now = performance.now();
+      if (now - lastTime >= 1000) {
+        fps = frameCount;
+        frameCount = 0;
+        lastTime = now;
+      }
+      stats.textContent = `FPS: ${fps} | Bodies: ${bodies.length}`;
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    init();
+    addStack();
+    gameLoop();
+  </script>
+</body>
+</html>

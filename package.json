@@ -1,0 +1,43 @@
+{
+  "name": "avbd-web",
+  "version": "0.1.0",
+  "description": "WebGPU-accelerated Augmented Vertex Block Descent physics engine",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    "./2d": {
+      "import": "./dist/2d/index.js",
+      "types": "./dist/2d/index.d.ts"
+    },
+    "./3d": {
+      "import": "./dist/3d/index.js",
+      "types": "./dist/3d/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src/ tests/",
+    "dev": "vite examples/"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@webgpu/types": "^0.1.52",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "vite": "^6.0.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "physics",
+    "webgpu",
+    "avbd",
+    "vbd",
+    "rigid-body",
+    "simulation",
+    "compute-shader"
+  ]
+}
