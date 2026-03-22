@@ -51,8 +51,8 @@ function broadphase2D(
     for (let j = i + 1; j < n; j++) {
       const b = bodies[j];
 
-      // Skip fixed-fixed pairs
-      if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
+      // Skip pairs where neither body is dynamic
+      if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
 
       // Check ignore list
       const key = i < j ? `${i}-${j}` : `${j}-${i}`;
@@ -83,6 +83,9 @@ export class AVBDSolver2D {
 
   /** Persistent joint constraint indices (not cleared each frame) */
   jointConstraintIndices: number[] = [];
+
+  /** Graph coloring for parallel dispatch (updated each step) */
+  colorGroups: ColorGroup[] = [];
 
   constructor(config: Partial<SolverConfig> = {}) {
     this.config = { ...DEFAULT_SOLVER_CONFIG_2D, ...config };
@@ -119,6 +122,9 @@ export class AVBDSolver2D {
       constraintStore.addRows(rows);
     }
 
+    // Apply cached warmstart values to new contacts
+    constraintStore.warmstartContacts();
+
     // ─── 2. Initialize & Warmstart Constraints ────────────────────
     for (const row of constraintStore.rows) {
       if (!row.active) continue;
@@ -134,15 +140,24 @@ export class AVBDSolver2D {
 
       if (config.postStabilize) {
         // With post-stabilization, lambda is reused fully
-        // (no decay needed)
       } else {
         row.lambda *= config.alpha * config.gamma;
       }
     }
 
+    // ─── 2b. Graph Coloring (for GPU dispatch ordering) ───────────
+    const constraintPairs = constraintStore.getConstraintPairs();
+    const fixedBodies = new Set<number>();
+    for (const body of bodies) {
+      if (body.type === RigidBodyType.Fixed) fixedBodies.add(body.index);
+    }
+    this.colorGroups = computeGraphColoring(
+      bodies.length, constraintPairs, fixedBodies,
+    );
+
     // ─── 3. Initialize Bodies ─────────────────────────────────────
     for (const body of bodies) {
-      if (body.type === RigidBodyType.Fixed) continue;
+      if (body.type !== RigidBodyType.Dynamic) continue;
 
       // Save initial position
       body.prevPosition = { ...body.position };
@@ -178,7 +193,7 @@ export class AVBDSolver2D {
 
       // ─── 4a. Primal Update (per body) ────────────────────────
       for (const body of bodies) {
-        if (body.type === RigidBodyType.Fixed) continue;
+        if (body.type !== RigidBodyType.Dynamic) continue;
 
         this.primalUpdate(body, isStabilization, dt);
       }
@@ -197,7 +212,7 @@ export class AVBDSolver2D {
       // ─── 4c. Velocity Recovery (at iteration N-1) ────────────
       if (iter === config.iterations - 1) {
         for (const body of bodies) {
-          if (body.type === RigidBodyType.Fixed) continue;
+          if (body.type !== RigidBodyType.Dynamic) continue;
 
           body.velocity = {
             x: (body.position.x - body.prevPosition.x) / dt,

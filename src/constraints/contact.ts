@@ -3,7 +3,7 @@
  * Implements the Taylor-series linearization from AVBD (Sec 4 of VBD paper).
  *
  * Each contact point generates 2 constraint rows:
- * - Normal constraint (non-penetration, unilateral: fmin=0)
+ * - Normal constraint (non-penetration, unilateral)
  * - Friction constraint (bilateral with Coulomb limit: |f| <= mu * |f_normal|)
  */
 
@@ -15,9 +15,7 @@ import { vec2Sub, vec2Dot, vec2Cross, vec2Perp } from '../core/math.js';
 
 /**
  * Compute the Jacobian for a 2D rigid body contact.
- * For body A at contact point p with normal n:
- * J_A = [n.x, n.y, (r_A × n)]
- * where r_A = p - x_A
+ * J_A = [n.x, n.y, (r_A × n)] where r_A = p - x_A
  */
 function computeContactJacobian(
   bodyPosition: Vec2,
@@ -25,8 +23,32 @@ function computeContactJacobian(
   normal: Vec2,
 ): [number, number, number] {
   const r = vec2Sub(contactPoint, bodyPosition);
-  const torque = vec2Cross(r, normal); // r × n (scalar in 2D)
+  const torque = vec2Cross(r, normal);
   return [normal.x, normal.y, torque];
+}
+
+/**
+ * Compute relative normal velocity at contact for restitution.
+ */
+function computeRelativeNormalVelocity(
+  bodyA: Body2D,
+  bodyB: Body2D,
+  contactPoint: Vec2,
+  normal: Vec2,
+): number {
+  const rA = vec2Sub(contactPoint, bodyA.position);
+  const rB = vec2Sub(contactPoint, bodyB.position);
+  // Point velocity = v + ω × r
+  const vA = {
+    x: bodyA.velocity.x - bodyA.angularVelocity * rA.y,
+    y: bodyA.velocity.y + bodyA.angularVelocity * rA.x,
+  };
+  const vB = {
+    x: bodyB.velocity.x - bodyB.angularVelocity * rB.y,
+    y: bodyB.velocity.y + bodyB.angularVelocity * rB.x,
+  };
+  const relVel = { x: vA.x - vB.x, y: vA.y - vB.y };
+  return vec2Dot(relVel, normal);
 }
 
 /**
@@ -41,7 +63,8 @@ export function createContactConstraintRows(
   stiffness: number = Infinity,
 ): ConstraintRow[] {
   const rows: ConstraintRow[] = [];
-  const mu = Math.sqrt(bodyA.friction * bodyB.friction); // Geometric mean friction
+  const mu = Math.sqrt(bodyA.friction * bodyB.friction);
+  const restitution = Math.max(bodyA.restitution, bodyB.restitution);
 
   for (const contact of manifold.contacts) {
     // ─── Normal constraint row ──────────────────────────────────
@@ -50,25 +73,31 @@ export function createContactConstraintRows(
     normalRow.bodyB = manifold.bodyB;
     normalRow.type = ForceType.Contact;
 
-    // Normal points from B to A
     const n = manifold.normal;
 
-    // Jacobians: J_A = dC/dx_A, J_B = dC/dx_B = -dC/dx_A
     normalRow.jacobianA = computeContactJacobian(bodyA.position, contact.position, n);
     normalRow.jacobianB = computeContactJacobian(bodyB.position, contact.position, n);
-    // Negate B's Jacobian (opposing contribution)
     normalRow.jacobianB[0] = -normalRow.jacobianB[0];
     normalRow.jacobianB[1] = -normalRow.jacobianB[1];
     normalRow.jacobianB[2] = -normalRow.jacobianB[2];
 
-    // Constraint value: negative depth means penetration
     // C < 0 when penetrating, C = 0 at contact surface
     normalRow.c = -contact.depth;
     normalRow.c0 = normalRow.c;
 
-    // Unilateral: compressive force only (force pushes bodies apart)
-    // With C < 0 when penetrating and J pointing in separation direction,
-    // the force f = clamp(penalty*C + lambda, fmin, fmax) must be <= 0
+    // Apply restitution: modify the constraint target to include bounce velocity
+    // v_bounce = -e * v_n (if approaching)
+    if (restitution > 0) {
+      const vn = computeRelativeNormalVelocity(bodyA, bodyB, contact.position, n);
+      if (vn < -0.5) { // Only apply restitution above a velocity threshold
+        // Bias the constraint to target a separating velocity
+        // c0 is modified to account for the desired post-collision velocity
+        const dt = 1 / 60; // Will be overridden by solver
+        normalRow.c0 = normalRow.c + restitution * vn * dt;
+      }
+    }
+
+    // Compressive force only
     normalRow.fmin = -Infinity;
     normalRow.fmax = 0;
 
@@ -92,15 +121,14 @@ export function createContactConstraintRows(
     fricRow.jacobianB[1] = -fricRow.jacobianB[1];
     fricRow.jacobianB[2] = -fricRow.jacobianB[2];
 
-    // Friction constraint value: relative tangential displacement
-    // Initially zero (set up at contact creation)
     fricRow.c = 0;
     fricRow.c0 = 0;
 
-    // Coulomb friction: |f_tangent| <= mu * |f_normal|
-    // We'll dynamically update fmax during the dual update
-    fricRow.fmin = -mu * penaltyMin * Math.abs(normalRow.c);
-    fricRow.fmax = mu * penaltyMin * Math.abs(normalRow.c);
+    // Initialize friction bounds from estimated normal force (penalty * depth)
+    // This gets corrected during dual update with actual normal lambda
+    const estimatedNormalForce = penaltyMin * contact.depth;
+    fricRow.fmin = -mu * estimatedNormalForce;
+    fricRow.fmax = mu * estimatedNormalForce;
 
     fricRow.penalty = penaltyMin;
     fricRow.stiffness = stiffness;

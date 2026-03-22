@@ -83,11 +83,44 @@ export function createDefaultRow(): ConstraintRow {
 
 // ─── Constraint Store ───────────────────────────────────────────────────────
 
+/**
+ * Cached contact data for warmstarting between frames.
+ * Stores lambda/penalty from previous contacts so they can be
+ * transferred to new contacts at similar positions.
+ */
+export interface CachedContact {
+  bodyA: number;
+  bodyB: number;
+  /** Normal lambda from previous frame */
+  normalLambda: number;
+  /** Normal penalty from previous frame */
+  normalPenalty: number;
+  /** Friction lambda from previous frame */
+  frictionLambda: number;
+  /** Friction penalty from previous frame */
+  frictionPenalty: number;
+  /** Contact position hash for matching */
+  positionHash: number;
+  /** Age in frames (for expiry) */
+  age: number;
+}
+
+/** Simple spatial hash for contact position matching */
+function contactHash(bodyA: number, bodyB: number, posX: number, posY: number): number {
+  // Quantize position to grid cells for fuzzy matching
+  const gx = Math.round(posX * 10);
+  const gy = Math.round(posY * 10);
+  return bodyA * 1000000 + bodyB * 10000 + gx * 100 + gy;
+}
+
 export class ConstraintStore {
   rows: ConstraintRow[] = [];
 
-  /** Map from body pair key to constraint row indices */
-  private contactMap: Map<string, number[]> = new Map();
+  /** Cache of contact data from previous frame for warmstarting */
+  contactCache: Map<string, CachedContact> = new Map();
+
+  /** Maximum age (in frames) before cached contacts expire */
+  maxContactAge: number = 5;
 
   addRow(row: ConstraintRow): number {
     const index = this.rows.length;
@@ -105,13 +138,80 @@ export class ConstraintStore {
 
   clear(): void {
     this.rows = [];
-    this.contactMap.clear();
+    this.contactCache.clear();
+  }
+
+  /**
+   * Save current contact lambdas/penalties to the cache before clearing.
+   * This enables warmstarting: new contacts at similar positions
+   * inherit the multipliers from previous contacts.
+   */
+  cacheContacts(): void {
+    // Age existing cache entries
+    for (const [key, cached] of this.contactCache) {
+      cached.age++;
+      if (cached.age > this.maxContactAge) {
+        this.contactCache.delete(key);
+      }
+    }
+
+    // Save current contacts
+    for (let i = 0; i < this.rows.length; i += 2) {
+      const row = this.rows[i];
+      if (row.type !== ForceType.Contact) continue;
+      if (i + 1 >= this.rows.length) break;
+
+      const frictionRow = this.rows[i + 1];
+      if (frictionRow.type !== ForceType.Contact) continue;
+
+      const key = row.bodyA < row.bodyB
+        ? `${row.bodyA}-${row.bodyB}`
+        : `${row.bodyB}-${row.bodyA}`;
+
+      this.contactCache.set(key, {
+        bodyA: row.bodyA,
+        bodyB: row.bodyB,
+        normalLambda: row.lambda,
+        normalPenalty: row.penalty,
+        frictionLambda: frictionRow.lambda,
+        frictionPenalty: frictionRow.penalty,
+        positionHash: 0,
+        age: 0,
+      });
+    }
+  }
+
+  /**
+   * Apply cached warmstart values to newly created contact rows.
+   */
+  warmstartContacts(): void {
+    for (let i = 0; i < this.rows.length; i += 2) {
+      const row = this.rows[i];
+      if (row.type !== ForceType.Contact) continue;
+      if (i + 1 >= this.rows.length) break;
+
+      const frictionRow = this.rows[i + 1];
+      if (frictionRow.type !== ForceType.Contact) continue;
+
+      const key = row.bodyA < row.bodyB
+        ? `${row.bodyA}-${row.bodyB}`
+        : `${row.bodyB}-${row.bodyA}`;
+
+      const cached = this.contactCache.get(key);
+      if (cached) {
+        row.lambda = cached.normalLambda;
+        row.penalty = cached.normalPenalty;
+        frictionRow.lambda = cached.frictionLambda;
+        frictionRow.penalty = cached.frictionPenalty;
+      }
+    }
   }
 
   clearContacts(): void {
-    // Remove all contact constraints, keep joints/springs
+    // Cache before clearing
+    this.cacheContacts();
+    // Remove all contact constraints, keep joints/springs/motors
     this.rows = this.rows.filter(r => r.type !== ForceType.Contact);
-    this.contactMap.clear();
   }
 
   /** Get constraint row indices involving a specific body */
