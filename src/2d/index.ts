@@ -12,9 +12,16 @@
 import type { Vec2, SolverConfig, RigidBodyHandle, ContactManifold2D } from '../core/types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_2D } from '../core/types.js';
 import { AVBDSolver2D } from '../core/solver.js';
+import { GPUSolver2D } from '../core/gpu-solver-2d.js';
+import { GPUContext } from '../core/gpu-context.js';
 import { RigidBodyDesc2D, ColliderDesc2D, type Body2D } from '../core/rigid-body.js';
 import { JointData2D, createJointConstraintRows, type JointDef2D } from '../constraints/joint.js';
 import { ForceType } from '../core/types.js';
+
+// ─── Module-level GPU state ─────────────────────────────────────────────────
+
+let gpuContext: GPUContext | null = null;
+let gpuAvailable = false;
 
 // ─── World ──────────────────────────────────────────────────────────────────
 
@@ -35,13 +42,15 @@ export interface WorldConfig {
 
 export class World {
   private solver: AVBDSolver2D;
+  private gpuSolver: GPUSolver2D | null = null;
+  private useGPU: boolean;
   private jointDefs: Map<number, JointDef2D> = new Map();
   private nextJointId = 0;
   private bodyHandleMap: Map<number, RigidBody> = new Map();
   private groundColliders: number[] = [];
 
   constructor(gravity: Vec2, config: WorldConfig = {}) {
-    this.solver = new AVBDSolver2D({
+    const solverConfig = {
       gravity,
       iterations: config.iterations ?? DEFAULT_SOLVER_CONFIG_2D.iterations,
       beta: config.beta ?? DEFAULT_SOLVER_CONFIG_2D.beta,
@@ -49,7 +58,16 @@ export class World {
       gamma: config.gamma ?? DEFAULT_SOLVER_CONFIG_2D.gamma,
       postStabilize: config.postStabilize ?? DEFAULT_SOLVER_CONFIG_2D.postStabilize,
       dt: config.dt ?? DEFAULT_SOLVER_CONFIG_2D.dt,
-    });
+    };
+
+    // Always create CPU solver (used for step() and as fallback)
+    this.solver = new AVBDSolver2D(solverConfig);
+
+    // Create GPU solver if WebGPU was initialized
+    this.useGPU = gpuAvailable && gpuContext !== null;
+    if (this.useGPU && gpuContext) {
+      this.gpuSolver = new GPUSolver2D(gpuContext, solverConfig);
+    }
   }
 
   /** Create a rigid body in the world */
@@ -107,20 +125,39 @@ export class World {
   }
 
   /**
-   * Step the physics simulation forward by one timestep.
-   * For the CPU solver, this is synchronous.
-   * For GPU solver (future), this will be async.
+   * Step the physics simulation using the CPU solver (synchronous).
+   * Use stepAsync() for GPU-accelerated stepping.
    */
   step(): void {
-    // Regenerate joint constraints (Jacobians change with body positions)
     this.regenerateJointConstraints();
-
     this.solver.step();
   }
 
-  /** Async step (for API compatibility with future GPU version) */
+  /**
+   * Step the physics simulation using the GPU solver if available.
+   * Falls back to CPU solver if WebGPU was not initialized.
+   *
+   * The GPU path dispatches WGSL compute shaders:
+   * - Primal update: one dispatch per graph color group (parallel bodies)
+   * - Dual update: one dispatch over all constraints
+   * - Readback: async GPU→CPU transfer of body positions
+   */
   async stepAsync(): Promise<void> {
-    this.step();
+    if (this.gpuSolver) {
+      // Sync body/constraint stores from CPU World to GPU solver
+      this.gpuSolver.bodyStore = this.solver.bodyStore;
+      this.gpuSolver.constraintStore = this.solver.constraintStore;
+      this.gpuSolver.ignorePairs = this.solver.ignorePairs;
+      this.regenerateJointConstraints();
+      await this.gpuSolver.step();
+    } else {
+      this.step();
+    }
+  }
+
+  /** Check if this world is using the GPU solver */
+  get isGPU(): boolean {
+    return this.gpuSolver !== null;
   }
 
   /** Get all body states as a flat Float32Array [x, y, angle, ...] */
@@ -303,10 +340,30 @@ export class JointHandle {
 // ─── Static AVBD namespace (Rapier-style entry point) ───────────────────────
 
 const AVBD = {
-  /** Initialize the AVBD engine (required before creating a world) */
+  /**
+   * Initialize the AVBD engine.
+   * Attempts to acquire a WebGPU adapter and device.
+   * If WebGPU is not available, falls back to CPU solver silently.
+   *
+   * Must be called before creating a World if you want GPU acceleration.
+   * Worlds created after init() will use GPU when available.
+   */
   async init(): Promise<void> {
-    // CPU solver doesn't need async init, but we keep the API
-    // compatible with future GPU version
+    try {
+      if (typeof navigator !== 'undefined' && navigator.gpu) {
+        gpuContext = await GPUContext.create({ powerPreference: 'high-performance' });
+        gpuAvailable = true;
+      }
+    } catch {
+      // WebGPU not available — fall back to CPU solver
+      gpuAvailable = false;
+      gpuContext = null;
+    }
+  },
+
+  /** Whether WebGPU GPU acceleration is available */
+  get isGPUAvailable(): boolean {
+    return gpuAvailable;
   },
 
   /** World class */
