@@ -41,6 +41,7 @@ struct ConstraintRow {
 @group(0) @binding(3) var<storage, read> constraints: array<ConstraintRow>;
 @group(0) @binding(4) var<storage, read> color_body_indices: array<u32>;
 @group(0) @binding(5) var<storage, read> body_constraint_ranges: array<u32>;
+@group(0) @binding(6) var<storage, read> constraint_indices: array<u32>;
 
 fn solve_ldl3(A: mat3x3<f32>, b: vec3<f32>) -> vec3<f32> {
   let D0 = A[0][0];
@@ -109,7 +110,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let constraint_count = body_constraint_ranges[range_base + 1u];
 
   for (var ci = 0u; ci < constraint_count; ci++) {
-    let cr_idx = constraint_start + ci;
+    let cr_idx = constraint_indices[constraint_start + ci];
     let cr = constraints[cr_idx];
 
     if (cr.is_active == 0u) { continue; }

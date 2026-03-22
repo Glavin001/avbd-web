@@ -103,6 +103,7 @@ export class GPUSolver3D {
   private solverParamsBuffer!: GPUBuffer;
   private colorIndicesBuffer!: GPUBuffer;
   private bodyConstraintRangesBuffer!: GPUBuffer;
+  private constraintIndicesBuffer!: GPUBuffer;
 
   private primalPipeline!: GPUComputePipeline;
   private dualPipeline!: GPUComputePipeline;
@@ -123,7 +124,7 @@ export class GPUSolver3D {
     if (this.initialized) return;
     const device = this.gpu.device;
 
-    // Primal pipeline: 6 bindings (same layout as 2D)
+    // Primal pipeline: 7 bindings
     this.primalBindGroupLayout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
@@ -132,6 +133,7 @@ export class GPUSolver3D {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // constraints
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // color_body_indices
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // body_constraint_ranges
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // constraint_indices
       ],
     });
 
@@ -227,14 +229,30 @@ export class GPUSolver3D {
     this.colorGroups = computeGraphColoring(bodies.length, constraintPairs, fixedBodies);
 
     // Initialize bodies
+    const gravMag = vec3Length(gravity);
     for (const body of bodies) {
       if (body.type !== RigidBodyType.Dynamic) continue;
       body.prevPosition = { ...body.position };
       body.prevRotation = { ...body.rotation };
+
+      // Adaptive gravity weighting (from CPU reference solver)
+      let gravWeight = 1;
+      if (gravMag > 0) {
+        const dvx = body.velocity.x - body.prevVelocity.x;
+        const dvy = body.velocity.y - body.prevVelocity.y;
+        const dvz = body.velocity.z - body.prevVelocity.z;
+        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+        if (dvMag > 0.01) {
+          const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag, z: gravity.z / gravMag };
+          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
+          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        }
+      }
+
       body.inertialPosition = {
-        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * dt * dt,
-        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * dt * dt,
-        z: body.position.z + body.velocity.z * dt + gravity.z * body.gravityScale * dt * dt,
+        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
+        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+        z: body.position.z + body.velocity.z * dt + gravity.z * body.gravityScale * gravWeight * dt * dt,
       };
       const wLen = vec3Length(body.angularVelocity);
       if (wLen > 1e-10) {
@@ -244,13 +262,12 @@ export class GPUSolver3D {
       } else {
         body.inertialRotation = { ...body.rotation };
       }
+      body.prevVelocity = { ...body.velocity };
     }
 
     // ─── 3. CPU→GPU: Upload Buffers ───────────────────────────────
     const numBodies = bodies.length;
     const numConstraints = this.constraintRows.length;
-
-    this.ensureBuffers(numBodies, Math.max(numConstraints, 1));
 
     // Upload body state (20 floats per body)
     const bodyData = new Float32Array(numBodies * BODY_STRIDE);
@@ -300,15 +317,17 @@ export class GPUSolver3D {
     }
     gpuWrite(device.queue, this.bodyPrevBuffer, 0, prevData);
 
-    // Sort constraints per body and build ranges
-    const { sortedRows, bodyRanges } = this.sortConstraintsPerBody(numBodies, numConstraints);
+    // Build per-body constraint indirection (indices into original constraint array)
+    const { bodyRanges, constraintIndices } = this.buildConstraintIndirection(numBodies, numConstraints);
 
-    // Upload sorted constraints (28 floats = 112 bytes per row)
+    this.ensureBuffers(numBodies, Math.max(numConstraints, 1), constraintIndices.length);
+
+    // Upload constraints in original order (28 floats = 112 bytes per row)
     if (numConstraints > 0) {
       const crData = new ArrayBuffer(numConstraints * CONSTRAINT_STRIDE * 4);
       const crView = new DataView(crData);
       for (let i = 0; i < numConstraints; i++) {
-        const row = sortedRows[i];
+        const row = this.constraintRows[i];
         const byteOff = i * CONSTRAINT_STRIDE * 4;
         crView.setInt32(byteOff + 0, row.bodyA, true);
         crView.setInt32(byteOff + 4, row.bodyB, true);
@@ -354,11 +373,25 @@ export class GPUSolver3D {
       gpuWrite(device.queue, this.constraintBuffer, 0, new Uint8Array(crData));
     }
 
-    // Upload body constraint ranges
+    // Upload body constraint ranges and indirection indices
     gpuWrite(device.queue, this.bodyConstraintRangesBuffer, 0, bodyRanges);
+    if (constraintIndices.length > 0) {
+      gpuWrite(device.queue, this.constraintIndicesBuffer, 0, constraintIndices);
+    }
 
     // ─── 4. GPU: Solver Iterations ────────────────────────────────
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
+    const velocityRecoveryIter = config.iterations - 1;
+
+    // Buffer to snapshot body state at velocity recovery iteration (before stabilization)
+    const bodyReadbackSize = numBodies * BODY_STRIDE * 4;
+    let velRecoveryBuffer: GPUBuffer | null = null;
+    if (config.postStabilize) {
+      velRecoveryBuffer = device.createBuffer({
+        size: bodyReadbackSize,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+    }
 
     for (let iter = 0; iter < totalIterations; iter++) {
       const isStabilization = config.postStabilize && iter === totalIterations - 1;
@@ -384,6 +417,7 @@ export class GPUSolver3D {
             { binding: 3, resource: { buffer: this.constraintBuffer } },
             { binding: 4, resource: { buffer: this.colorIndicesBuffer } },
             { binding: 5, resource: { buffer: this.bodyConstraintRangesBuffer } },
+            { binding: 6, resource: { buffer: this.constraintIndicesBuffer } },
           ],
         });
 
@@ -415,11 +449,15 @@ export class GPUSolver3D {
         pass.end();
       }
 
+      // Snapshot body state at velocity recovery iteration (before stabilization)
+      if (iter === velocityRecoveryIter && velRecoveryBuffer) {
+        encoder.copyBufferToBuffer(this.bodyStateBuffer, 0, velRecoveryBuffer, 0, bodyReadbackSize);
+      }
+
       device.queue.submit([encoder.finish()]);
     }
 
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
-    const bodyReadbackSize = numBodies * BODY_STRIDE * 4;
     const bodyStagingBuffer = device.createBuffer({
       size: bodyReadbackSize,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -439,13 +477,26 @@ export class GPUSolver3D {
 
     device.queue.submit([copyEncoder.finish()]);
 
-    // Map and read body positions
+    // Map and read final body positions
     await bodyStagingBuffer.mapAsync(GPUMapMode.READ);
     const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange().slice(0));
     bodyStagingBuffer.unmap();
     bodyStagingBuffer.destroy();
 
+    // Read pre-stabilization positions for velocity recovery (matches CPU behavior)
+    let velRecoveryResult: Float32Array | null = null;
+    if (velRecoveryBuffer) {
+      await velRecoveryBuffer.mapAsync(GPUMapMode.READ);
+      velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange().slice(0));
+      velRecoveryBuffer.unmap();
+      velRecoveryBuffer.destroy();
+    }
+
     // ─── 6. CPU: Apply Results ────────────────────────────────────
+    // Use pre-stabilization positions for velocity recovery (matching CPU solver),
+    // but final (post-stabilization) positions for body state
+    const velSource = velRecoveryResult ?? bodyResult;
+
     for (let i = 0; i < numBodies; i++) {
       const body = bodies[i];
       if (body.type !== RigidBodyType.Dynamic) continue;
@@ -459,19 +510,27 @@ export class GPUSolver3D {
       body.rotation.y = bodyResult[off + 5];
       body.rotation.z = bodyResult[off + 6];
 
-      // BDF1 velocity recovery
+      // BDF1 velocity recovery from pre-stabilization positions
+      const voff = i * BODY_STRIDE;
       body.velocity = {
-        x: (body.position.x - body.prevPosition.x) / dt,
-        y: (body.position.y - body.prevPosition.y) / dt,
-        z: (body.position.z - body.prevPosition.z) / dt,
+        x: (velSource[voff + 0] - body.prevPosition.x) / dt,
+        y: (velSource[voff + 1] - body.prevPosition.y) / dt,
+        z: (velSource[voff + 2] - body.prevPosition.z) / dt,
       };
-      // Angular velocity from quaternion difference
-      const dq = quatMul(body.rotation, {
-        w: body.prevRotation.w,
-        x: -body.prevRotation.x,
-        y: -body.prevRotation.y,
-        z: -body.prevRotation.z,
-      });
+      // Angular velocity from quaternion difference (using pre-stabilization rotation)
+      const vqw = velSource[voff + 3];
+      const vqx = velSource[voff + 4];
+      const vqy = velSource[voff + 5];
+      const vqz = velSource[voff + 6];
+      const dq = quatMul(
+        { w: vqw, x: vqx, y: vqy, z: vqz },
+        {
+          w: body.prevRotation.w,
+          x: -body.prevRotation.x,
+          y: -body.prevRotation.y,
+          z: -body.prevRotation.z,
+        },
+      );
       body.angularVelocity = vec3Scale(vec3(dq.x, dq.y, dq.z), 2 / dt);
     }
 
@@ -484,8 +543,8 @@ export class GPUSolver3D {
 
       for (let i = 0; i < numConstraints; i++) {
         const byteOff = i * CONSTRAINT_STRIDE * 4;
-        sortedRows[i].lambda = crResult.getFloat32(byteOff + 88, true);
-        sortedRows[i].penalty = crResult.getFloat32(byteOff + 92, true);
+        this.constraintRows[i].lambda = crResult.getFloat32(byteOff + 88, true);
+        this.constraintRows[i].penalty = crResult.getFloat32(byteOff + 92, true);
       }
     }
   }
@@ -547,13 +606,14 @@ export class GPUSolver3D {
     return rows;
   }
 
-  /** Sort constraints so each body's constraints are contiguous */
-  private sortConstraintsPerBody(numBodies: number, numConstraints: number): {
-    sortedRows: ConstraintRow3D[];
+  /** Build per-body constraint index lists for indirection on GPU */
+  private buildConstraintIndirection(numBodies: number, numConstraints: number): {
     bodyRanges: Uint32Array;
+    constraintIndices: Uint32Array;
   } {
     const rows = this.constraintRows;
 
+    // Build per-body constraint index lists
     const perBody: number[][] = Array.from({ length: numBodies }, () => []);
     for (let ci = 0; ci < numConstraints; ci++) {
       const row = rows[ci];
@@ -562,16 +622,16 @@ export class GPUSolver3D {
       if (row.bodyB >= 0 && row.bodyB < numBodies) perBody[row.bodyB].push(ci);
     }
 
-    const sortedIndices: number[] = [];
+    // Flatten into indirection array + build ranges
+    const allIndices: number[] = [];
     const bodyRanges = new Uint32Array(numBodies * 2);
     for (let i = 0; i < numBodies; i++) {
-      bodyRanges[i * 2 + 0] = sortedIndices.length;
+      bodyRanges[i * 2 + 0] = allIndices.length;
       bodyRanges[i * 2 + 1] = perBody[i].length;
-      sortedIndices.push(...perBody[i]);
+      allIndices.push(...perBody[i]);
     }
 
-    const sortedRows = sortedIndices.map(ci => rows[ci]);
-    return { sortedRows, bodyRanges };
+    return { bodyRanges, constraintIndices: new Uint32Array(allIndices) };
   }
 
   /** Write solver params uniform (3D: 11 fields + padding) */
@@ -597,8 +657,10 @@ export class GPUSolver3D {
     gpuWrite(this.gpu.device.queue, this.solverParamsBuffer, 0, new Uint8Array(data));
   }
 
+  private maxConstraintIndices = 0;
+
   /** Ensure GPU buffers are large enough */
-  private ensureBuffers(numBodies: number, numConstraints: number): void {
+  private ensureBuffers(numBodies: number, numConstraints: number, numConstraintIndices: number): void {
     const device = this.gpu.device;
     const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
 
@@ -619,6 +681,13 @@ export class GPUSolver3D {
       this.maxConstraints = Math.max(numConstraints, this.maxConstraints * 2, 64);
       if (this.constraintBuffer) this.constraintBuffer.destroy();
       this.constraintBuffer = device.createBuffer({ size: this.maxConstraints * CONSTRAINT_STRIDE * 4, usage: STORAGE });
+    }
+
+    const ciCount = Math.max(numConstraintIndices, 1);
+    if (ciCount > this.maxConstraintIndices) {
+      this.maxConstraintIndices = Math.max(ciCount, this.maxConstraintIndices * 2, 64);
+      if (this.constraintIndicesBuffer) this.constraintIndicesBuffer.destroy();
+      this.constraintIndicesBuffer = device.createBuffer({ size: this.maxConstraintIndices * 4, usage: STORAGE });
     }
   }
 
@@ -667,7 +736,8 @@ export class GPUSolver3D {
 
   destroy(): void {
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
-      this.solverParamsBuffer, this.colorIndicesBuffer, this.bodyConstraintRangesBuffer]) {
+      this.solverParamsBuffer, this.colorIndicesBuffer, this.bodyConstraintRangesBuffer,
+      this.constraintIndicesBuffer]) {
       if (buf) buf.destroy();
     }
   }

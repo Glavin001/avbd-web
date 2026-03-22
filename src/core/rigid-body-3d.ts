@@ -134,6 +134,7 @@ export interface Body3D {
   // Solver state
   prevPosition: Vec3;
   prevRotation: Quat;
+  prevVelocity: Vec3;
   inertialPosition: Vec3;
   inertialRotation: Quat;
   boundingRadius: number;
@@ -164,6 +165,7 @@ export class BodyStore3D {
       restitution: DEFAULT_MATERIAL.restitution,
       prevPosition: { ...desc.position },
       prevRotation: { ...desc.rotation },
+      prevVelocity: { ...desc.linearVelocity },
       inertialPosition: { ...desc.position },
       inertialRotation: { ...desc.rotation },
       boundingRadius: 0,

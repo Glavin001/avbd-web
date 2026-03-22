@@ -117,14 +117,28 @@
       );
       world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
 
+      // Also run CPU version for comparison
+      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      cpuWorld.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
+      const cpuBody = cpuWorld.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
+      );
+      cpuWorld.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), cpuBody);
+
       const trajectory = [];
+      const cpuTrajectory = [];
       for (let i = 0; i < 120; i++) {
         await world.step();
-        if (i % 20 === 0) trajectory.push({ step: i, y: body.translation().y });
+        cpuWorld.stepCPU();
+        if (i % 20 === 0) {
+          trajectory.push({ step: i, y: body.translation().y });
+          cpuTrajectory.push({ step: i, y: cpuBody.translation().y });
+        }
       }
 
       const y = body.translation().y;
-      return { y, aboveGround: y > 0.3, isGPU: world.isGPU, trajectory };
+      const cpuY = cpuBody.translation().y;
+      return { y, cpuY, aboveGround: y > 0.3, isGPU: world.isGPU, trajectory, cpuTrajectory };
     });
 
     await window.runTest('manyBodies', async () => {

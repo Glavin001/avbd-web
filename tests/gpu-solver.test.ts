@@ -207,6 +207,153 @@ describe('Buffer layout matches WGSL structs', () => {
   });
 });
 
+// ─── Constraint Indirection Bug (fixed) ─────────────────────────────────────
+// The GPU solver previously sorted constraints per body (duplicating rows) but
+// only uploaded numConstraints entries, leaving later bodies pointing at
+// uninitialized memory. Now uses an indirection buffer.
+
+describe('Constraint indirection for GPU primal shader', () => {
+  it('should build correct per-body indirection indices', () => {
+    // Simulate: 2 bodies (ground=0, box=1), 2 constraints (normal=0, friction=1)
+    // Both constraints reference body 0 (bodyA) and body 1 (bodyB)
+    // perBody[0] = [0, 1], perBody[1] = [0, 1]
+    // Expected: constraintIndices = [0, 1, 0, 1]
+    // bodyRanges: body0=[start:0, count:2], body1=[start:2, count:2]
+
+    const numBodies = 2;
+    const numConstraints = 2;
+
+    // Build the indirection manually (mimicking buildConstraintIndirection)
+    const perBody: number[][] = [[], []];
+    // Constraint 0: bodyA=0, bodyB=1
+    perBody[0].push(0);
+    perBody[1].push(0);
+    // Constraint 1: bodyA=0, bodyB=1
+    perBody[0].push(1);
+    perBody[1].push(1);
+
+    const allIndices: number[] = [];
+    const bodyRanges = new Uint32Array(numBodies * 2);
+    for (let i = 0; i < numBodies; i++) {
+      bodyRanges[i * 2 + 0] = allIndices.length;
+      bodyRanges[i * 2 + 1] = perBody[i].length;
+      allIndices.push(...perBody[i]);
+    }
+
+    // Body 0 (ground): constraints at indices [0, 1]
+    expect(bodyRanges[0]).toBe(0);  // start
+    expect(bodyRanges[1]).toBe(2);  // count
+
+    // Body 1 (box): constraints at indices [0, 1]
+    expect(bodyRanges[2]).toBe(2);  // start
+    expect(bodyRanges[3]).toBe(2);  // count
+
+    // Indirection: [0, 1, 0, 1]
+    expect(allIndices).toEqual([0, 1, 0, 1]);
+
+    // Verify body 1 can access its constraints via indirection
+    const body1Start = bodyRanges[2];
+    const body1Count = bodyRanges[3];
+    for (let ci = 0; ci < body1Count; ci++) {
+      const crIdx = allIndices[body1Start + ci];
+      expect(crIdx).toBeLessThan(numConstraints);  // Must be valid constraint index
+    }
+  });
+
+  it('should ensure all bodies see their constraints in multi-body scenario', () => {
+    // 4 bodies: ground(0), boxA(1), boxB(2), boxC(3)
+    // Constraints: 0=[0,1], 1=[0,1], 2=[1,2], 3=[1,2], 4=[2,3], 5=[2,3]
+    const pairs = [[0,1], [0,1], [1,2], [1,2], [2,3], [2,3]];
+    const numBodies = 4;
+    const numConstraints = 6;
+
+    const perBody: number[][] = Array.from({ length: numBodies }, () => []);
+    for (let ci = 0; ci < numConstraints; ci++) {
+      const [a, b] = pairs[ci];
+      perBody[a].push(ci);
+      perBody[b].push(ci);
+    }
+
+    const allIndices: number[] = [];
+    const bodyRanges = new Uint32Array(numBodies * 2);
+    for (let i = 0; i < numBodies; i++) {
+      bodyRanges[i * 2] = allIndices.length;
+      bodyRanges[i * 2 + 1] = perBody[i].length;
+      allIndices.push(...perBody[i]);
+    }
+
+    // Body 0: constraints [0, 1]
+    expect(bodyRanges[0 * 2 + 1]).toBe(2);
+    // Body 1: constraints [0, 1, 2, 3]
+    expect(bodyRanges[1 * 2 + 1]).toBe(4);
+    // Body 2: constraints [2, 3, 4, 5]
+    expect(bodyRanges[2 * 2 + 1]).toBe(4);
+    // Body 3: constraints [4, 5]
+    expect(bodyRanges[3 * 2 + 1]).toBe(2);
+
+    // ALL indices in allIndices must be valid constraint indices
+    for (const idx of allIndices) {
+      expect(idx).toBeGreaterThanOrEqual(0);
+      expect(idx).toBeLessThan(numConstraints);
+    }
+
+    // Total indirection entries = sum of all per-body counts
+    expect(allIndices.length).toBe(2 + 4 + 4 + 2);  // 12
+  });
+
+  it('should have constraint_indices binding in primal 2D shader', () => {
+    // Verify the primal shader uses the indirection buffer
+    expect(PRIMAL_UPDATE_2D_WGSL).toContain('constraint_indices');
+    expect(PRIMAL_UPDATE_2D_WGSL).toContain('@group(0) @binding(6)');
+    // Should use indirection: constraint_indices[constraint_start + ci]
+    expect(PRIMAL_UPDATE_2D_WGSL).toContain('constraint_indices[constraint_start + ci]');
+  });
+});
+
+// ─── Velocity Recovery Bug (fixed) ──────────────────────────────────────────
+// With postStabilize=true, the GPU solver must recover velocity from the
+// pre-stabilization position (iteration N-1), not the post-stabilization
+// position (iteration N). Using the wrong position causes incorrect velocity,
+// which feeds into the next step's inertial target.
+
+describe('Velocity recovery timing', () => {
+  it('CPU solver should recover velocity at iter N-1, not post-stabilization', () => {
+    // Verify the CPU solver does velocity recovery at the correct iteration
+    const world = new World({ x: 0, y: -9.81 }, { iterations: 5, postStabilize: true });
+    const body = world.createRigidBody(RigidBodyDesc2D.dynamic().setTranslation(0, 5));
+    world.createCollider(ColliderDesc2D.cuboid(0.5, 0.5), body);
+
+    world.stepCPU();
+    const v1 = body.linvel();
+    expect(v1.y).toBeLessThan(0);  // Falling
+
+    world.stepCPU();
+    const v2 = body.linvel();
+    expect(v2.y).toBeLessThan(v1.y);  // Accelerating
+
+    // Velocity should be approximately -g * t
+    const expectedV = -9.81 * 2 / 60;
+    expect(Math.abs(v2.y - expectedV)).toBeLessThan(0.1);
+  });
+
+  it('CPU box-on-ground should settle within physics tolerance', () => {
+    // This is the CPU reference test — the GPU should produce similar results
+    const world = new World({ x: 0, y: -9.81 }, { iterations: 10 });
+    world.createCollider(ColliderDesc2D.cuboid(10, 0.5));
+    const body = world.createRigidBody(RigidBodyDesc2D.dynamic().setTranslation(0, 3));
+    world.createCollider(ColliderDesc2D.cuboid(0.5, 0.5), body);
+
+    for (let i = 0; i < 120; i++) {
+      world.stepCPU();
+    }
+
+    const y = body.translation().y;
+    // Ground top at 0.5, box half-height 0.5 → resting at y≈1.0
+    expect(y).toBeGreaterThan(0.5);
+    expect(y).toBeLessThan(2.5);
+  });
+});
+
 // ─── Dispatch Pattern ───────────────────────────────────────────────────────
 
 describe('GPU dispatch architecture', () => {

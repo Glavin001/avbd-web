@@ -25,26 +25,44 @@ test.describe('AVBD GPU Execution', () => {
   test('should simulate free fall correctly', async ({ page }) => {
     const result = await page.evaluate(() => (window as any).testResults.freeFall);
     expect(result.success).toBe(true);
-
-    // Debug: log positions and GPU status
     console.log('Free fall result:', JSON.stringify(result));
 
-    // After 1 second of free fall from y=10: y ≈ 5.1
-    // Allow tolerance for implicit Euler damping
-    expect(result.y).toBeLessThan(10);
-    expect(result.y).toBeGreaterThan(0);
-    expect(Math.abs(result.y - result.expected)).toBeLessThan(2);
+    // After 60 steps (1 second) from y=10: y ≈ 10 - 0.5*9.81*1² ≈ 5.1
+    // GPU uses f32, so allow small tolerance vs analytical
+    expect(result.y).toBeGreaterThan(4.0);
+    expect(result.y).toBeLessThan(6.5);
+    expect(Math.abs(result.y - result.expected)).toBeLessThan(0.5);
+
+    // Verify monotonic descent during free fall
+    const positions = result.positions;
+    for (let i = 1; i < positions.length; i++) {
+      expect(positions[i].y).toBeLessThan(positions[i - 1].y);
+    }
   });
 
   test('should prevent box from falling through ground', async ({ page }) => {
     const result = await page.evaluate(() => (window as any).testResults.boxOnGround);
     console.log('Box on ground result:', JSON.stringify(result));
     expect(result.success).toBe(true);
-    // Contact detection is working (box slows near ground) - verify physics runs
-    expect(result.trajectory[0].y).toBeLessThan(3);
-    // Box should decelerate as it approaches ground (contacts create forces)
-    const speed1 = Math.abs(result.trajectory[1].y - result.trajectory[0].y);
-    expect(speed1).toBeLessThan(2); // Not free-falling at full speed
+
+    // Ground top at y=0.5, box half-height=0.5, so resting position ≈ y=1.0
+    // Box must stay above ground at all times
+    expect(result.aboveGround).toBe(true);
+    expect(result.y).toBeGreaterThan(0.5);  // Well above ground surface
+    expect(result.y).toBeLessThan(3.0);     // Settled, not still falling or bouncing high
+
+    // Verify box approaches ground and settles (not free-falling through)
+    // Find the minimum y in the trajectory (should be above 0.5)
+    const minY = Math.min(...result.trajectory.map((t: any) => t.y));
+    expect(minY).toBeGreaterThan(0.5);  // Never penetrates ground
+
+    // Final position should be near resting height y≈1.0
+    expect(result.y).toBeGreaterThan(0.7);
+    expect(result.y).toBeLessThan(2.0);
+
+    // GPU and CPU should both keep box above ground
+    expect(result.cpuY).toBeGreaterThan(0.5);
+    expect(result.cpuY).toBeLessThan(3.0);
   });
 
   test('should handle 50 bodies without NaN', async ({ page }) => {
@@ -59,9 +77,15 @@ test.describe('AVBD GPU Execution', () => {
     console.log('GPU diagnostic:', JSON.stringify(result, null, 2));
     expect(result.success).toBe(true);
     expect(result.preMass).toBeGreaterThan(0);
-    // GPU should produce same result as CPU
-    expect(result.gpuAfter1.y).toBeLessThan(10);
-    expect(Math.abs(result.gpuAfter60.y - result.cpuAfter60.y)).toBeLessThan(0.1);
+    expect(result.isGPU).toBe(true);
+
+    // First step: GPU and CPU should nearly match
+    expect(Math.abs(result.gpuAfter1.y - result.cpuAfter1.y)).toBeLessThan(0.001);
+
+    // After 60 steps of free fall: GPU (f32) and CPU (f64) diverge slightly
+    expect(result.gpuAfter60.y).toBeLessThan(10);
+    expect(result.gpuAfter60.y).toBeGreaterThan(0);
+    expect(Math.abs(result.gpuAfter60.y - result.cpuAfter60.y)).toBeLessThan(0.05);
   });
 
   test('should report GPU status', async ({ page }) => {
