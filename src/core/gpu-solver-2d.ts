@@ -281,11 +281,18 @@ export class GPUSolver2D {
         crView.setFloat32(byteOff + 52, row.hessianDiagA[1], true);
         crView.setFloat32(byteOff + 56, row.hessianDiagA[2], true);
         crView.setFloat32(byteOff + 60, 0, true);
-        // hessian_diag_b (vec4)
+        // hessian_diag_b (vec4) — .w stores friction coefficient mu for contact rows
         crView.setFloat32(byteOff + 64, row.hessianDiagB[0], true);
         crView.setFloat32(byteOff + 68, row.hessianDiagB[1], true);
         crView.setFloat32(byteOff + 72, row.hessianDiagB[2], true);
-        crView.setFloat32(byteOff + 76, 0, true);
+        // Pack mu (friction coefficient) into hessian_diag_b.w for GPU dual shader
+        let mu = 0.5;
+        if (row.type === ForceType.Contact && row.bodyA >= 0 && row.bodyB >= 0) {
+          const bA = this.bodyStore.bodies[row.bodyA];
+          const bB = this.bodyStore.bodies[row.bodyB];
+          if (bA && bB) mu = Math.sqrt(bA.friction * bB.friction);
+        }
+        crView.setFloat32(byteOff + 76, mu, true);
         // scalar fields (8 fields)
         crView.setFloat32(byteOff + 80, row.c, true);
         crView.setFloat32(byteOff + 84, row.c0, true);

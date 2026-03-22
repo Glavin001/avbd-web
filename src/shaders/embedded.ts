@@ -127,7 +127,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Contacts come in triplets: [normal, friction_t1, friction_t2, ...]
   // Normal row at idx % 3 == 0 updates the next two friction rows
   if (cr.force_type == 0u && (idx % 3u) == 0u) {
-    let mu = 0.5;
+    // mu is packed in jacobian_b_ang.w of the normal row during CPU upload
+    let mu = cr.jacobian_b_ang.w;
     let normal_force = abs(cr.lambda);
     let fric1_idx = idx + 1u;
     if (fric1_idx < params.num_constraints) {
@@ -248,8 +249,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       var fric = constraints[fric_idx];
       if (fric.active != 0u && fric.force_type == 0u) {
         // Coulomb friction: |f_tangent| <= mu * |f_normal|
-        // We use a default mu=0.5 here; ideally mu would be stored per constraint
-        let mu = 0.5;
+        // mu is packed in hessian_diag_b.w of the normal row during CPU upload
+        let mu = cr.hessian_diag_b.w;
         let normal_force = abs(cr.lambda);
         fric.fmin = -mu * normal_force;
         fric.fmax = mu * normal_force;

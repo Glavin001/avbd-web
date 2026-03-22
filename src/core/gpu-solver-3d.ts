@@ -90,6 +90,9 @@ export class GPUSolver3D {
   jointRows: ConstraintRow3D[] = [];
   colorGroups: ColorGroup[] = [];
 
+  /** Contact cache for warmstarting between frames (body pair key → cached lambdas/penalties) */
+  private contactCache: Map<string, { normalLambda: number; normalPenalty: number; fric1Lambda: number; fric1Penalty: number; fric2Lambda: number; fric2Penalty: number; age: number }> = new Map();
+
   private gpu: GPUContext;
   private initialized = false;
 
@@ -177,7 +180,9 @@ export class GPUSolver3D {
 
     if (bodies.length === 0) return;
 
-    // ─── 1. CPU: Collision Detection ──────────────────────────────
+    // ─── 1. CPU: Cache previous contacts, then collision detect ────
+    // Cache lambda/penalty from previous frame's contact rows
+    this.cacheContacts();
     this.constraintRows = [...this.jointRows];
 
     for (let i = 0; i < bodies.length; i++) {
@@ -198,6 +203,9 @@ export class GPUSolver3D {
     }
 
     // ─── 2. CPU: Warmstart & Initialize ───────────────────────────
+    // Apply cached warmstart values to new contact rows
+    this.warmstartContacts();
+
     for (const row of this.constraintRows) {
       if (!row.active) continue;
       row.penalty *= config.gamma;
@@ -321,11 +329,18 @@ export class GPUSolver3D {
         crView.setFloat32(byteOff + 52, row.jacobianB[1], true);
         crView.setFloat32(byteOff + 56, row.jacobianB[2], true);
         crView.setFloat32(byteOff + 60, 0, true);
-        // jacobian_b_ang (vec4): 3 floats + padding
+        // jacobian_b_ang (vec4): 3 floats + .w stores friction coefficient mu
         crView.setFloat32(byteOff + 64, row.jacobianB[3], true);
         crView.setFloat32(byteOff + 68, row.jacobianB[4], true);
         crView.setFloat32(byteOff + 72, row.jacobianB[5], true);
-        crView.setFloat32(byteOff + 76, 0, true);
+        // Pack mu (friction coefficient) into jacobian_b_ang.w for GPU dual shader
+        let mu = 0.5;
+        if (row.type === ForceType.Contact && row.bodyA >= 0 && row.bodyB >= 0) {
+          const bA = this.bodyStore.bodies[row.bodyA];
+          const bB = this.bodyStore.bodies[row.bodyB];
+          if (bA && bB) mu = Math.sqrt(bA.friction * bB.friction);
+        }
+        crView.setFloat32(byteOff + 76, mu, true);
         // scalar fields
         crView.setFloat32(byteOff + 80, row.c, true);
         crView.setFloat32(byteOff + 84, row.c0, true);
@@ -604,6 +619,49 @@ export class GPUSolver3D {
       this.maxConstraints = Math.max(numConstraints, this.maxConstraints * 2, 64);
       if (this.constraintBuffer) this.constraintBuffer.destroy();
       this.constraintBuffer = device.createBuffer({ size: this.maxConstraints * CONSTRAINT_STRIDE * 4, usage: STORAGE });
+    }
+  }
+
+  /** Cache contact lambda/penalty from current frame for warmstarting next frame */
+  private cacheContacts(): void {
+    // Age existing entries
+    for (const [key, cached] of this.contactCache) {
+      cached.age++;
+      if (cached.age > 5) this.contactCache.delete(key);
+    }
+    // Save current contacts (triplets: normal, fric1, fric2)
+    const rows = this.constraintRows;
+    for (let i = 0; i < rows.length; i += 3) {
+      const row = rows[i];
+      if (row.type !== ForceType.Contact) continue;
+      if (i + 2 >= rows.length) break;
+      const key = row.bodyA < row.bodyB ? `${row.bodyA}-${row.bodyB}` : `${row.bodyB}-${row.bodyA}`;
+      this.contactCache.set(key, {
+        normalLambda: row.lambda, normalPenalty: row.penalty,
+        fric1Lambda: rows[i + 1].lambda, fric1Penalty: rows[i + 1].penalty,
+        fric2Lambda: rows[i + 2].lambda, fric2Penalty: rows[i + 2].penalty,
+        age: 0,
+      });
+    }
+  }
+
+  /** Apply cached warmstart values to newly created contact rows */
+  private warmstartContacts(): void {
+    const rows = this.constraintRows;
+    for (let i = 0; i < rows.length; i += 3) {
+      const row = rows[i];
+      if (row.type !== ForceType.Contact) continue;
+      if (i + 2 >= rows.length) break;
+      const key = row.bodyA < row.bodyB ? `${row.bodyA}-${row.bodyB}` : `${row.bodyB}-${row.bodyA}`;
+      const cached = this.contactCache.get(key);
+      if (cached) {
+        row.lambda = cached.normalLambda;
+        row.penalty = cached.normalPenalty;
+        rows[i + 1].lambda = cached.fric1Lambda;
+        rows[i + 1].penalty = cached.fric1Penalty;
+        rows[i + 2].lambda = cached.fric2Lambda;
+        rows[i + 2].penalty = cached.fric2Penalty;
+      }
     }
   }
 

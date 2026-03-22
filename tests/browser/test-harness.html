@@ -45,7 +45,7 @@
       world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
 
       for (let i = 0; i < 60; i++) {
-        await world.stepAsync();
+        await world.step();
       }
 
       const pos = body.translation();
@@ -63,7 +63,7 @@
       world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
 
       for (let i = 0; i < 120; i++) {
-        await world.stepAsync();
+        await world.step();
       }
 
       const y = body.translation().y;
@@ -87,7 +87,7 @@
 
       const start = performance.now();
       for (let i = 0; i < 30; i++) {
-        await world.stepAsync();
+        await world.step();
       }
       const elapsed = performance.now() - start;
 

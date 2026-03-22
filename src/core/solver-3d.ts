@@ -405,7 +405,10 @@ export class AVBDSolver3D {
     }
 
     row.lambda = Math.max(row.fmin, Math.min(row.fmax, row.penalty * cEval + row.lambda));
-    row.penalty += this.config.beta * Math.abs(cEval);
+    // Conditional penalty ramp: only when lambda is interior (not at bounds)
+    if (row.lambda > row.fmin && row.lambda < row.fmax) {
+      row.penalty += this.config.beta * Math.abs(cEval);
+    }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) row.penalty = row.stiffness;
   }
