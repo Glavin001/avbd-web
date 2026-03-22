@@ -95,7 +95,7 @@ export class GPUSolver2D {
   }
 
   /** Initialize GPU pipelines. Called automatically on first step. */
-  init(): void {
+  async init(): Promise<void> {
     if (this.initialized) return;
     const device = this.gpu.device;
 
@@ -112,6 +112,12 @@ export class GPUSolver2D {
     });
 
     const primalModule = device.createShaderModule({ code: PRIMAL_UPDATE_2D_WGSL });
+    const primalInfo = await primalModule.getCompilationInfo();
+    for (const msg of primalInfo.messages) {
+      if (msg.type === 'error') {
+        throw new Error(`Primal shader error at line ${msg.lineNum}: ${msg.message}`);
+      }
+    }
     this.primalPipeline = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.primalBindGroupLayout] }),
       compute: { module: primalModule, entryPoint: 'main' },
@@ -128,6 +134,12 @@ export class GPUSolver2D {
     });
 
     const dualModule = device.createShaderModule({ code: DUAL_UPDATE_WGSL });
+    const dualInfo = await dualModule.getCompilationInfo();
+    for (const msg of dualInfo.messages) {
+      if (msg.type === 'error') {
+        throw new Error(`Dual shader error at line ${msg.lineNum}: ${msg.message}`);
+      }
+    }
     this.dualPipeline = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.dualBindGroupLayout] }),
       compute: { module: dualModule, entryPoint: 'main' },
@@ -146,7 +158,7 @@ export class GPUSolver2D {
    * Run one physics timestep on the GPU.
    */
   async step(): Promise<void> {
-    if (!this.initialized) this.init();
+    if (!this.initialized) await this.init();
 
     const { config, bodyStore, constraintStore, gpu } = this;
     const dt = config.dt;
@@ -312,6 +324,9 @@ export class GPUSolver2D {
     // ─── 4. GPU: Solver Iterations ────────────────────────────────
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
 
+    // Push error scope to catch GPU validation errors
+    device.pushErrorScope('validation');
+
     for (let iter = 0; iter < totalIterations; iter++) {
       const isStabilization = config.postStabilize && iter === totalIterations - 1;
 
@@ -370,6 +385,12 @@ export class GPUSolver2D {
       }
 
       device.queue.submit([encoder.finish()]);
+    }
+
+    // Check for GPU validation errors
+    const validationError = await device.popErrorScope();
+    if (validationError) {
+      console.error('GPU validation error:', validationError.message);
     }
 
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────

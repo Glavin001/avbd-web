@@ -8,11 +8,14 @@ export default defineConfig({
     // Launch Chrome with WebGPU flags
     browserName: 'chromium',
     launchOptions: {
+      executablePath: process.env.CHROMIUM_PATH || undefined,
       args: [
         '--enable-unsafe-webgpu',
         '--enable-features=Vulkan',
-        '--use-angle=vulkan',
+        '--use-angle=swiftshader',
         '--disable-gpu-sandbox',
+        '--no-sandbox',
+        '--headless=new',
       ],
     },
   },

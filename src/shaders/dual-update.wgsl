@@ -32,7 +32,7 @@ struct ConstraintRow {
   stiffness: f32,
   fmin: f32,
   fmax: f32,
-  active: u32,
+  is_active: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SolverParams;
@@ -46,7 +46,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (idx >= params.num_constraints) { return; }
 
   var cr = constraints[idx];
-  if (cr.active == 0u) { return; }
+  if (cr.is_active == 0u) { return; }
 
   // Re-evaluate linearized constraint
   var c_eval = cr.c0;
@@ -93,7 +93,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fric_idx = idx + 1u;
     if (fric_idx < params.num_constraints) {
       var fric = constraints[fric_idx];
-      if (fric.active != 0u && fric.force_type == 0u) {
+      if (fric.is_active != 0u && fric.force_type == 0u) {
         // Coulomb friction: |f_tangent| <= mu * |f_normal|
         // mu is packed in hessian_diag_b.w of the normal row during CPU upload
         let mu = cr.hessian_diag_b.w;

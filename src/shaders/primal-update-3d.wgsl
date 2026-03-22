@@ -32,7 +32,7 @@ struct ConstraintRow3D {
   stiffness: f32,
   fmin: f32,
   fmax: f32,
-  active: u32,
+  is_active: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SolverParams;
@@ -148,7 +148,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var ci = 0u; ci < constraint_count; ci++) {
     let cr_idx = constraint_start + ci;
     let cr = constraints[cr_idx];
-    if (cr.active == 0u) { continue; }
+    if (cr.is_active == 0u) { continue; }
 
     var J: array<f32, 6>;
     if (cr.body_a == i32(body_idx)) {

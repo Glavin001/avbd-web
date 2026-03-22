@@ -36,7 +36,7 @@ struct ConstraintRow3D {
   stiffness: f32,
   fmin: f32,
   fmax: f32,
-  active: u32,
+  is_active: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SolverParams;
@@ -50,7 +50,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (idx >= params.num_constraints) { return; }
 
   var cr = constraints[idx];
-  if (cr.active == 0u) { return; }
+  if (cr.is_active == 0u) { return; }
 
   // Re-evaluate linearized constraint: C = C0 + J_A·dp_A + J_B·dp_B
   var c_eval = cr.c0;
@@ -131,7 +131,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fric1_idx = idx + 1u;
     if (fric1_idx < params.num_constraints) {
       var fric1 = constraints[fric1_idx];
-      if (fric1.active != 0u && fric1.force_type == 0u) {
+      if (fric1.is_active != 0u && fric1.force_type == 0u) {
         fric1.fmin = -mu * normal_force;
         fric1.fmax = mu * normal_force;
         constraints[fric1_idx] = fric1;
@@ -140,7 +140,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fric2_idx = idx + 2u;
     if (fric2_idx < params.num_constraints) {
       var fric2 = constraints[fric2_idx];
-      if (fric2.active != 0u && fric2.force_type == 0u) {
+      if (fric2.is_active != 0u && fric2.force_type == 0u) {
         fric2.fmin = -mu * normal_force;
         fric2.fmax = mu * normal_force;
         constraints[fric2_idx] = fric2;

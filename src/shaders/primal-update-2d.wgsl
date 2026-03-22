@@ -32,7 +32,7 @@ struct ConstraintRow {
   stiffness: f32,
   fmin: f32,
   fmax: f32,
-  active: u32,
+  is_active: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SolverParams;
@@ -112,7 +112,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cr_idx = constraint_start + ci;
     let cr = constraints[cr_idx];
 
-    if (cr.active == 0u) { continue; }
+    if (cr.is_active == 0u) { continue; }
 
     var J: vec3<f32>;
     var H_diag: vec3<f32>;

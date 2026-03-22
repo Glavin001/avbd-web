@@ -29,7 +29,7 @@
     "dev": "vite examples/"
   },
   "devDependencies": {
-    "@playwright/test": "^1.58.2",
+    "@playwright/test": "^1.56.1",
     "@types/node": "^22.0.0",
     "@webgpu/types": "^0.1.52",
     "tsx": "^4.21.0",
