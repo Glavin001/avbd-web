@@ -22,11 +22,35 @@
       }
     };
 
+    // ─── Helper: run GPU and CPU in parallel, record full trajectory ────
+    async function gpuCpuRun(setupFn, steps, opts = {}) {
+      const iters = opts.iterations || 10;
+      const gpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: iters });
+      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: iters });
+      const gpuHandles = setupFn(gpuWorld);
+      const cpuHandles = setupFn(cpuWorld);
+      const gpuTrajectory = [];
+      const cpuTrajectory = [];
+      for (let i = 0; i < steps; i++) {
+        await gpuWorld.step();
+        cpuWorld.stepCPU();
+        gpuTrajectory.push(gpuHandles.map(b => ({ ...b.translation() })));
+        cpuTrajectory.push(cpuHandles.map(b => ({ ...b.translation() })));
+      }
+      return {
+        gpuTrajectory, cpuTrajectory,
+        gpuFinal: gpuHandles.map(b => b.translation()),
+        cpuFinal: cpuHandles.map(b => b.translation()),
+        isGPU: gpuWorld.isGPU,
+      };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Initialize
+    // ═══════════════════════════════════════════════════════════════════════
     try {
       await AVBD.init();
 
-      // Probe GPU compute capability
       let adapterInfo = null;
       let computeWorks = false;
       try {
@@ -37,7 +61,6 @@
           description: adapter.info?.description || 'unknown',
         } : null;
 
-        // Test that compute shaders actually work
         if (adapter) {
           const device = await adapter.requestDevice();
           const module = device.createShaderModule({
@@ -87,7 +110,9 @@
       document.getElementById('status').textContent = `Init failed: ${e.message}`;
     }
 
-    // Auto-run core tests
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 1: Free fall — analytical validation
+    // ═══════════════════════════════════════════════════════════════════════
     await window.runTest('freeFall', async () => {
       const world = new AVBD.World({ x: 0, y: -9.81 });
       const body = world.createRigidBody(
@@ -98,290 +123,155 @@
       const positions = [];
       for (let i = 0; i < 60; i++) {
         await world.step();
-        if (i < 5 || i % 10 === 0) {
-          positions.push({ step: i, y: body.translation().y });
-        }
+        positions.push({ step: i, y: body.translation().y });
       }
 
-      const pos = body.translation();
-      // After 1 second of free fall: y ≈ 10 - 0.5 * 9.81 * 1² ≈ 5.1
-      return { y: pos.y, expected: 10 - 0.5 * 9.81, isGPU: world.isGPU, positions };
-    });
-
-    await window.runTest('boxOnGround', async () => {
-      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
-      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
-
-      const body = world.createRigidBody(
-        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
-      );
-      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
-
-      // Also run CPU version for comparison
-      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
-      cpuWorld.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
-      const cpuBody = cpuWorld.createRigidBody(
-        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
-      );
-      cpuWorld.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), cpuBody);
-
-      const trajectory = [];
-      const cpuTrajectory = [];
-      for (let i = 0; i < 120; i++) {
-        await world.step();
-        cpuWorld.stepCPU();
-        if (i % 20 === 0) {
-          trajectory.push({ step: i, y: body.translation().y });
-          cpuTrajectory.push({ step: i, y: cpuBody.translation().y });
-        }
-      }
-
-      const y = body.translation().y;
-      const cpuY = cpuBody.translation().y;
-      return { y, cpuY, aboveGround: y > 0.3, isGPU: world.isGPU, trajectory, cpuTrajectory };
-    });
-
-    await window.runTest('manyBodies', async () => {
-      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 5 });
-      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5));
-
-      const bodies = [];
-      for (let i = 0; i < 50; i++) {
-        const x = (i % 10) * 1.2 - 5;
-        const y = 2 + Math.floor(i / 10) * 1.2;
-        const b = world.createRigidBody(
-          AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
-        );
-        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), b);
-        bodies.push(b);
-      }
-
-      const start = performance.now();
-      for (let i = 0; i < 30; i++) {
-        await world.step();
-      }
-      const elapsed = performance.now() - start;
-
-      // Check all positions are finite
-      let allFinite = true;
-      for (const b of bodies) {
-        const pos = b.translation();
-        if (!isFinite(pos.x) || !isFinite(pos.y)) allFinite = false;
-      }
-
-      return { elapsed, allFinite, bodyCount: 50, isGPU: world.isGPU };
-    });
-
-    // GPU diagnostic test
-    await window.runTest('gpuDiagnostic', async () => {
-      const world = new AVBD.World({ x: 0, y: -9.81 });
-      const body = world.createRigidBody(
-        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 10)
-      );
-      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
-
-      // Check body state before step
-      const preMass = body.mass();
-      const prePos = body.translation();
-
-      // Also test CPU to compare
-      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 });
-      const cpuBody = cpuWorld.createRigidBody(
-        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 10)
-      );
-      cpuWorld.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), cpuBody);
-      cpuWorld.stepCPU();
-      const cpuAfter = cpuBody.translation();
-
-      // Step GPU
-      await world.step();
-      const gpuAfter = body.translation();
-
-      // Check: do multiple CPU steps match expected behavior?
-      for (let i = 0; i < 59; i++) cpuWorld.stepCPU();
-      const cpuAfter60 = cpuBody.translation();
-
-      // Capture console.error for GPU validation errors from solver
-      const gpuErrors = [];
-      const origConsoleError = console.error;
-      console.error = (...args) => { gpuErrors.push(args.join(' ')); origConsoleError.apply(console, args); };
-
-      // Try more GPU steps
-      for (let i = 0; i < 59; i++) await world.step();
-      const gpuAfter60 = body.translation();
-
-      // Minimal standalone GPU compute test with same pattern as primal shader
-      let standaloneResult = -1;
-      try {
-        const dev = await (await gpu.requestAdapter()).requestDevice();
-        dev.pushErrorScope('validation');
-        const mod = dev.createShaderModule({ code: `
-          struct Params { value: f32, }
-          @group(0) @binding(0) var<uniform> params: Params;
-          @group(0) @binding(1) var<storage, read_write> output: array<f32>;
-          @compute @workgroup_size(1)
-          fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-            output[0] = output[0] + params.value;
-          }
-        `});
-        const bgl = dev.createBindGroupLayout({ entries: [
-          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-        ]});
-        const pip = dev.createComputePipeline({
-          layout: dev.createPipelineLayout({ bindGroupLayouts: [bgl] }),
-          compute: { module: mod, entryPoint: 'main' }
-        });
-        const paramBuf = dev.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        const dataBuf = dev.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-        const stagBuf = dev.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-
-        dev.queue.writeBuffer(paramBuf, 0, new Float32Array([5.0]));
-        dev.queue.writeBuffer(dataBuf, 0, new Float32Array([10.0]));
-
-        const bg = dev.createBindGroup({ layout: bgl, entries: [
-          { binding: 0, resource: { buffer: paramBuf } },
-          { binding: 1, resource: { buffer: dataBuf } },
-        ]});
-        const enc = dev.createCommandEncoder();
-        const pass = enc.beginComputePass();
-        pass.setPipeline(pip);
-        pass.setBindGroup(0, bg);
-        pass.dispatchWorkgroups(1);
-        pass.end();
-        enc.copyBufferToBuffer(dataBuf, 0, stagBuf, 0, 4);
-        dev.queue.submit([enc.finish()]);
-        const validationError = await dev.popErrorScope();
-        await stagBuf.mapAsync(GPUMapMode.READ);
-        standaloneResult = new Float32Array(stagBuf.getMappedRange())[0];
-        stagBuf.unmap();
-        dev.destroy();
-        if (validationError) gpuErrors.push('validation: ' + validationError.message);
-      } catch(e) { gpuErrors.push('standalone: ' + e.message); }
-
-      console.error = origConsoleError;
-
+      const finalY = body.translation().y;
+      // Analytical: y = 10 - 0.5 * 9.81 * 1² ≈ 5.095
+      const analytical = 10 - 0.5 * 9.81;
       return {
-        preMass,
-        prePos,
-        cpuAfter1: cpuAfter,
-        gpuAfter1: gpuAfter,
-        cpuAfter60,
-        gpuAfter60,
+        y: finalY,
+        analytical,
+        error: Math.abs(finalY - analytical),
         isGPU: world.isGPU,
-        gpuErrors,
-        standaloneResult,  // should be 15.0 (10+5)
+        positions,
+        // Verify every step is monotonically decreasing (no upward glitches)
+        monotonic: positions.every((p, i) => i === 0 || p.y < positions[i-1].y),
+        // x should stay at 0 (no horizontal drift)
+        xDrift: Math.abs(body.translation().x),
       };
     });
 
-    // ─── GPU vs CPU Equivalence Tests ────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 2: Box on ground — contact constraint validation
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('boxOnGround', async () => {
+      const r = await gpuCpuRun((world) => {
+        // Static ground: cuboid(10, 0.5) centered at (0,0), top surface at y=0.5
+        world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
+        // Dynamic box at y=3, half-height 0.5 → rests at y≈1.0
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
+        );
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+        return [body];
+      }, 120);
 
-    // Helper: run N steps on both GPU and CPU worlds with identical setup, return final states
-    async function gpuCpuCompare(setupFn, steps = 60) {
-      const gpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
-      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
-      const gpuBodies = setupFn(gpuWorld);
-      const cpuBodies = setupFn(cpuWorld);
+      // Ground surface is at y=0.5, box half-height=0.5 → resting y≈1.0
+      const gpuMinY = Math.min(...r.gpuTrajectory.map(t => t[0].y));
+      const cpuMinY = Math.min(...r.cpuTrajectory.map(t => t[0].y));
+      return {
+        gpuFinalY: r.gpuFinal[0].y,
+        cpuFinalY: r.cpuFinal[0].y,
+        gpuMinY, cpuMinY,
+        isGPU: r.isGPU,
+      };
+    });
 
-      for (let i = 0; i < steps; i++) {
-        await gpuWorld.step();
-        cpuWorld.stepCPU();
-      }
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 3: GPU vs CPU step-1 precision — must be near-identical
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('gpuCpuStep1', async () => {
+      const r = await gpuCpuRun((world) => {
+        world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(0, 10)
+        );
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+        return [body];
+      }, 1);
 
-      const gpuPositions = gpuBodies.map(b => b.translation());
-      const cpuPositions = cpuBodies.map(b => b.translation());
-      return { gpuPositions, cpuPositions, isGPU: gpuWorld.isGPU };
-    }
+      const gpuY = r.gpuTrajectory[0][0].y;
+      const cpuY = r.cpuTrajectory[0][0].y;
+      return {
+        gpuY, cpuY,
+        diff: Math.abs(gpuY - cpuY),
+        isGPU: r.isGPU,
+      };
+    });
 
-    // Test: Restitution (bouncy ball)
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 4: Restitution — bouncing ball must bounce higher with higher e
+    // ═══════════════════════════════════════════════════════════════════════
     await window.runTest('restitution', async () => {
-      const { gpuPositions, cpuPositions, isGPU } = await gpuCpuCompare((world) => {
+      async function dropBall(restitution) {
+        const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
         world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
         const body = world.createRigidBody(
           AVBD.RigidBodyDesc.dynamic().setTranslation(0, 5)
         );
-        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setRestitution(0.7), body);
-        return [body];
-      }, 180);
+        world.createCollider(
+          AVBD.ColliderDesc.cuboid(0.5, 0.5).setRestitution(restitution), body
+        );
+
+        let maxYAfterBounce = -Infinity;
+        let hitGround = false;
+        for (let i = 0; i < 180; i++) {
+          await world.step();
+          const y = body.translation().y;
+          if (y < 1.5) hitGround = true;
+          if (hitGround && y > 1.5) maxYAfterBounce = Math.max(maxYAfterBounce, y);
+        }
+        return { finalY: body.translation().y, maxYAfterBounce, hitGround };
+      }
+
+      const low = await dropBall(0.2);
+      const high = await dropBall(0.7);
       return {
-        gpuY: gpuPositions[0].y,
-        cpuY: cpuPositions[0].y,
-        gpuAboveGround: gpuPositions[0].y > 0.5,
-        cpuAboveGround: cpuPositions[0].y > 0.5,
-        isGPU,
+        lowE: low, highE: high,
+        // Higher restitution should bounce higher (or at least not less)
+        higherBounce: high.maxYAfterBounce >= low.maxYAfterBounce,
+        // Both should have hit ground
+        bothHitGround: low.hitGround && high.hitGround,
+        // Both should rest above ground at the end
+        lowAboveGround: low.finalY > 0.5,
+        highAboveGround: high.finalY > 0.5,
       };
     });
 
-    // Test: Friction (box sliding on a slope)
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 5: Friction — GPU vs CPU friction comparison
+    // ═══════════════════════════════════════════════════════════════════════
     await window.runTest('friction', async () => {
-      const { gpuPositions, cpuPositions, isGPU } = await gpuCpuCompare((world) => {
-        // Create a tilted ground by using a wide box
-        world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
-        // High-friction box
-        const hf = world.createRigidBody(
-          AVBD.RigidBodyDesc.dynamic().setTranslation(-2, 3)
-        );
-        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.8), hf);
-        // Low-friction box
-        const lf = world.createRigidBody(
-          AVBD.RigidBodyDesc.dynamic().setTranslation(2, 3)
-        );
-        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.05), lf);
-        return [hf, lf];
-      }, 120);
+      // Give box an initial horizontal velocity and drop onto ground
+      function makeFrictionWorld(mu) {
+        return (world) => {
+          world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5));
+          const body = world.createRigidBody(
+            AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.5).setLinvel(5, 0)
+          );
+          world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(mu), body);
+          return [body];
+        };
+      }
+
+      const highMu = await gpuCpuRun(makeFrictionWorld(0.8), 120);
+      const lowMu = await gpuCpuRun(makeFrictionWorld(0.05), 120);
+
       return {
-        gpuHighFricY: gpuPositions[0].y,
-        gpuLowFricY: gpuPositions[1].y,
-        cpuHighFricY: cpuPositions[0].y,
-        cpuLowFricY: cpuPositions[1].y,
-        bothAboveGround: gpuPositions[0].y > 0.3 && gpuPositions[1].y > 0.3,
-        isGPU,
+        // CPU friction must differentiate mu values
+        cpuHighX: highMu.cpuFinal[0].x,
+        cpuLowX: lowMu.cpuFinal[0].x,
+        cpuFrictionWorks: lowMu.cpuFinal[0].x > highMu.cpuFinal[0].x,
+        // GPU friction execution (may not differentiate — known dual shader issue)
+        gpuHighX: highMu.gpuFinal[0].x,
+        gpuLowX: lowMu.gpuFinal[0].x,
+        gpuFrictionDiff: Math.abs(lowMu.gpuFinal[0].x - highMu.gpuFinal[0].x),
+        // Both GPU runs should remain above ground (contact working)
+        gpuHighAbove: highMu.gpuFinal[0].y > 0.5,
+        gpuLowAbove: lowMu.gpuFinal[0].y > 0.5,
+        // Both should have moved rightward (velocity integration working)
+        gpuHighMoved: highMu.gpuFinal[0].x > 0,
+        gpuLowMoved: lowMu.gpuFinal[0].x > 0,
+        isGPU: highMu.isGPU,
       };
     });
 
-    // Test: Joint constraint (revolute joint pendulum)
-    await window.runTest('jointPendulum', async () => {
-      const gpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
-      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
-
-      function setupPendulum(world) {
-        const anchor = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(0, 5));
-        world.createCollider(AVBD.ColliderDesc.cuboid(0.1, 0.1), anchor);
-        // Bob starts 2 units to the right of anchor
-        const bob = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(2, 5));
-        world.createCollider(AVBD.ColliderDesc.cuboid(0.3, 0.3), bob);
-        // Joint: local anchor on anchor body = (0,0), local anchor on bob = (-2, 0) (offset from bob center to anchor)
-        world.createJoint(
-          AVBD.JointData.revolute({ x: 0, y: 0 }, { x: -2, y: 0 }),
-          anchor, bob
-        );
-        return bob;
-      }
-
-      const gpuBob = setupPendulum(gpuWorld);
-      const cpuBob = setupPendulum(cpuWorld);
-
-      for (let i = 0; i < 120; i++) {
-        await gpuWorld.step();
-        cpuWorld.stepCPU();
-      }
-      const gpuPos = gpuBob.translation();
-      const cpuPos = cpuBob.translation();
-      // Joint should keep bob within arm length of anchor (~2.0)
-      const gpuDist = Math.sqrt(gpuPos.x * gpuPos.x + (gpuPos.y - 5) * (gpuPos.y - 5));
-      const cpuDist = Math.sqrt(cpuPos.x * cpuPos.x + (cpuPos.y - 5) * (cpuPos.y - 5));
-      return {
-        gpuDist, cpuDist,
-        gpuPos, cpuPos,
-        gpuFinite: isFinite(gpuPos.x) && isFinite(gpuPos.y),
-        cpuFinite: isFinite(cpuPos.x) && isFinite(cpuPos.y),
-        isGPU: gpuWorld.isGPU,
-      };
-    });
-
-    // Test: Stacking (3 boxes on ground — stable even with f32)
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 6: Stacking — 3 boxes must settle in order
+    // ═══════════════════════════════════════════════════════════════════════
     await window.runTest('stacking', async () => {
-      const { gpuPositions, cpuPositions, isGPU } = await gpuCpuCompare((world) => {
+      const r = await gpuCpuRun((world) => {
         world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
         const bodies = [];
         for (let i = 0; i < 3; i++) {
@@ -394,20 +284,25 @@
         return bodies;
       }, 180);
 
-      // All boxes should be above ground and have finite positions
-      const allGpuAbove = gpuPositions.every(p => p.y > 0.3);
-      const allCpuAbove = cpuPositions.every(p => p.y > 0.3);
-      const allFinite = gpuPositions.every(p => isFinite(p.x) && isFinite(p.y));
+      const gpuYs = r.gpuFinal.map(p => p.y);
+      const cpuYs = r.cpuFinal.map(p => p.y);
       return {
-        gpuYs: gpuPositions.map(p => p.y),
-        cpuYs: cpuPositions.map(p => p.y),
-        allGpuAbove, allCpuAbove, allFinite, isGPU,
+        gpuYs, cpuYs,
+        // All GPU boxes above ground surface (y=0.5)
+        allGpuAbove: gpuYs.every(y => y > 0.5),
+        allCpuAbove: cpuYs.every(y => y > 0.5),
+        // GPU stack maintains ordering (bottom < middle < top)
+        gpuOrdered: gpuYs[0] < gpuYs[1] && gpuYs[1] < gpuYs[2],
+        cpuOrdered: cpuYs[0] < cpuYs[1] && cpuYs[1] < cpuYs[2],
+        isGPU: r.isGPU,
       };
     });
 
-    // Test: Circle collision (ball on ground)
-    await window.runTest('circleCollision', async () => {
-      const { gpuPositions, cpuPositions, isGPU } = await gpuCpuCompare((world) => {
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 7: Circle/ball collision on GPU
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('circleOnGround', async () => {
+      const r = await gpuCpuRun((world) => {
         world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
         const ball = world.createRigidBody(
           AVBD.RigidBodyDesc.dynamic().setTranslation(0, 5)
@@ -415,17 +310,85 @@
         world.createCollider(AVBD.ColliderDesc.ball(0.5), ball);
         return [ball];
       }, 120);
+
+      // Ball radius=0.5, ground top=0.5 → resting y≈1.0
       return {
-        gpuY: gpuPositions[0].y,
-        cpuY: cpuPositions[0].y,
-        gpuAboveGround: gpuPositions[0].y > 0.3,
-        cpuAboveGround: cpuPositions[0].y > 0.3,
-        isGPU,
+        gpuY: r.gpuFinal[0].y,
+        cpuY: r.cpuFinal[0].y,
+        isGPU: r.isGPU,
       };
     });
 
-    // Test: Many-body stress (200 bodies)
-    await window.runTest('stressTest200', async () => {
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 8: Joint pendulum — GPU constraint execution
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('jointPendulum', async () => {
+      const r = await gpuCpuRun((world) => {
+        const anchor = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(0, 5));
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.1, 0.1), anchor);
+        const bob = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(2, 5));
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.3, 0.3), bob);
+        world.createJoint(
+          AVBD.JointData.revolute({ x: 0, y: 0 }, { x: -2, y: 0 }),
+          anchor, bob
+        );
+        return [bob];
+      }, 120);
+
+      // CPU distance from anchor (0,5)
+      const cpuP = r.cpuFinal[0];
+      const cpuDist = Math.sqrt(cpuP.x * cpuP.x + (cpuP.y - 5) * (cpuP.y - 5));
+      // GPU distance
+      const gpuP = r.gpuFinal[0];
+      const gpuDist = Math.sqrt(gpuP.x * gpuP.x + (gpuP.y - 5) * (gpuP.y - 5));
+      // Track distance drift over time
+      const gpuDistPerStep = r.gpuTrajectory.map(t => Math.sqrt(t[0].x * t[0].x + (t[0].y - 5) * (t[0].y - 5)));
+      const maxGpuDist = Math.max(...gpuDistPerStep);
+
+      return {
+        cpuDist, gpuDist,
+        cpuPos: cpuP, gpuPos: gpuP,
+        maxGpuDist,
+        isGPU: r.isGPU,
+      };
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 9: Applied force — GPU must respond to forces
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('appliedForce', async () => {
+      const world = new AVBD.World({ x: 0, y: 0 }, { iterations: 10 }); // No gravity
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 0)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+
+      // Apply a rightward impulse
+      body.applyImpulse({ x: 10, y: 0 });
+
+      const positions = [];
+      for (let i = 0; i < 30; i++) {
+        await world.step();
+        positions.push({ x: body.translation().x, y: body.translation().y });
+      }
+
+      return {
+        finalX: body.translation().x,
+        finalY: body.translation().y,
+        isGPU: world.isGPU,
+        // Body should move right
+        movedRight: body.translation().x > 0,
+        // Y should stay near zero (no gravity)
+        yNearZero: Math.abs(body.translation().y) < 0.1,
+        // X should be monotonically increasing (constant velocity, no friction in air)
+        xMonotonic: positions.every((p, i) => i === 0 || p.x >= positions[i-1].x - 0.001),
+      };
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 10: 200-body stress test
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('stress200', async () => {
       const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 5 });
       world.createCollider(AVBD.ColliderDesc.cuboid(30, 0.5));
 
@@ -446,18 +409,26 @@
       }
       const elapsed = performance.now() - start;
 
-      let allFinite = true;
-      let allAboveGround = true;
+      let nanCount = 0;
+      let belowGround = 0;
+      let maxY = -Infinity;
       for (const b of bodies) {
         const pos = b.translation();
-        if (!isFinite(pos.x) || !isFinite(pos.y)) allFinite = false;
-        if (pos.y < -10) allAboveGround = false;
+        if (!isFinite(pos.x) || !isFinite(pos.y)) nanCount++;
+        if (pos.y < 0) belowGround++;
+        maxY = Math.max(maxY, pos.y);
       }
 
-      return { elapsed, allFinite, allAboveGround, bodyCount: 200, isGPU: world.isGPU };
+      return {
+        elapsed, nanCount, belowGround, maxY,
+        bodyCount: 200,
+        isGPU: world.isGPU,
+      };
     });
 
-    // Test: GPU determinism (same setup, two runs, results should match)
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 11: GPU determinism — two identical runs must produce same result
+    // ═══════════════════════════════════════════════════════════════════════
     await window.runTest('determinism', async () => {
       async function runSim() {
         const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
@@ -468,7 +439,7 @@
         world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), b2);
 
         for (let i = 0; i < 60; i++) await world.step();
-        return [b1.translation(), b2.translation()];
+        return { b1: b1.translation(), b2: b2.translation() };
       }
 
       const run1 = await runSim();
@@ -476,8 +447,105 @@
 
       return {
         run1, run2,
-        match: Math.abs(run1[0].y - run2[0].y) < 0.001
-            && Math.abs(run1[1].y - run2[1].y) < 0.001,
+        b1YDiff: Math.abs(run1.b1.y - run2.b1.y),
+        b2YDiff: Math.abs(run1.b2.y - run2.b2.y),
+        b1XDiff: Math.abs(run1.b1.x - run2.b1.x),
+        b2XDiff: Math.abs(run1.b2.x - run2.b2.x),
+      };
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 12: Multi-body collision — two boxes collide mid-air
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('midAirCollision', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+
+      // Two boxes approaching each other
+      const left = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(-3, 5).setLinvel(5, 0)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), left);
+
+      const right = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(3, 5).setLinvel(-5, 0)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), right);
+
+      // Capture pre-collision approach
+      let collisionDetected = false;
+      let preCollisionGap = Infinity;
+      for (let i = 0; i < 60; i++) {
+        await world.step();
+        const lx = left.translation().x;
+        const rx = right.translation().x;
+        const gap = rx - lx - 1.0; // subtract box width
+        if (gap < preCollisionGap) preCollisionGap = gap;
+        // After collision, boxes should reverse or stop
+        if (gap < 0.1 && !collisionDetected) collisionDetected = true;
+      }
+
+      const lFinal = left.translation();
+      const rFinal = right.translation();
+      return {
+        leftX: lFinal.x, rightX: rFinal.x,
+        leftY: lFinal.y, rightY: rFinal.y,
+        collisionDetected,
+        // Boxes should not pass through each other
+        noOverlap: rFinal.x > lFinal.x,
+        // Both finite
+        finite: isFinite(lFinal.x) && isFinite(rFinal.x) && isFinite(lFinal.y) && isFinite(rFinal.y),
+        isGPU: world.isGPU,
+      };
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 13: Empty world step — must not crash
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('emptyWorld', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 });
+      await world.step();
+      await world.step();
+      await world.step();
+      return { stepped: true, isGPU: world.isGPU };
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // TEST 14: GPU readback correctness — buffer round-trip validation
+    // ═══════════════════════════════════════════════════════════════════════
+    await window.runTest('gpuReadback', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 });
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 10)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+
+      // CPU reference
+      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 });
+      const cpuBody = cpuWorld.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 10)
+      );
+      cpuWorld.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), cpuBody);
+
+      // Step 1: GPU and CPU should be nearly identical
+      await world.step();
+      cpuWorld.stepCPU();
+      const gpu1 = body.translation();
+      const cpu1 = cpuBody.translation();
+      const diff1 = Math.abs(gpu1.y - cpu1.y);
+
+      // Step 60: accumulation of f32 vs f64 differences
+      for (let i = 1; i < 60; i++) {
+        await world.step();
+        cpuWorld.stepCPU();
+      }
+      const gpu60 = body.translation();
+      const cpu60 = cpuBody.translation();
+      const diff60 = Math.abs(gpu60.y - cpu60.y);
+
+      return {
+        gpu1Y: gpu1.y, cpu1Y: cpu1.y, diff1,
+        gpu60Y: gpu60.y, cpu60Y: cpu60.y, diff60,
+        isGPU: world.isGPU,
       };
     });
 
