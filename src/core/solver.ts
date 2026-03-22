@@ -156,33 +156,61 @@ export class AVBDSolver2D {
     );
 
     // ─── 3. Initialize Bodies ─────────────────────────────────────
+    const MAX_ANGULAR_VELOCITY = 50; // Reference clamps to [-50, 50]
+    const gravMag = vec2Length(gravity);
+
     for (const body of bodies) {
       if (body.type !== RigidBodyType.Dynamic) continue;
+
+      // Clamp angular velocity (reference: clamp(omega, -50, 50))
+      body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
+        Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
 
       // Save initial position
       body.prevPosition = { ...body.position };
       body.prevAngle = body.angle;
 
-      // Compute inertial target: x + v*dt + g*dt^2
-      body.inertialPosition = {
-        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * dt * dt,
-        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * dt * dt,
-      };
-      body.inertialAngle = body.angle + body.angularVelocity * dt;
+      // Adaptive gravity weighting (from reference solver.cpp)
+      // Bodies under support get less gravity in the inertial estimate
+      // accelWeight = clamp(accel_along_gravity / |gravity|, 0, 1)
+      let gravWeight = 1;
+      if (gravMag > 0) {
+        const dvx = body.velocity.x - body.prevVelocity.x;
+        const dvy = body.velocity.y - body.prevVelocity.y;
+        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
+        // Only apply adaptive weighting when there's meaningful velocity change
+        if (dvMag > 0.01) {
+          const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
+          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
+          // sign(gravity) * accel — positive when accelerating with gravity
+          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        }
+      }
 
-      // Apply damping to inertial target
+      // Apply velocity damping
+      let vx = body.velocity.x;
+      let vy = body.velocity.y;
+      let omega = body.angularVelocity;
+
       if (body.linearDamping > 0) {
         const dampFactor = 1 / (1 + body.linearDamping * dt);
-        const dampedV = vec2Scale(body.velocity, dampFactor);
-        body.inertialPosition = {
-          x: body.position.x + dampedV.x * dt + gravity.x * body.gravityScale * dt * dt,
-          y: body.position.y + dampedV.y * dt + gravity.y * body.gravityScale * dt * dt,
-        };
+        vx *= dampFactor;
+        vy *= dampFactor;
       }
       if (body.angularDamping > 0) {
         const dampFactor = 1 / (1 + body.angularDamping * dt);
-        body.inertialAngle = body.angle + body.angularVelocity * dampFactor * dt;
+        omega *= dampFactor;
       }
+
+      // Compute inertial target with adaptive gravity
+      body.inertialPosition = {
+        x: body.position.x + vx * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
+        y: body.position.y + vy * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+      };
+      body.inertialAngle = body.angle + omega * dt;
+
+      // Save velocity for next frame's adaptive gravity
+      body.prevVelocity = { ...body.velocity };
     }
 
     // ─── 4. Main Solver Loop ──────────────────────────────────────
@@ -279,8 +307,13 @@ export class AVBDSolver2D {
               + row.jacobianB[2] * (bB.angle - bB.prevAngle);
       }
 
+      // For soft constraints (finite stiffness), zero lambda in primal update
+      // Only hard constraints (infinite stiffness) use warmstarted lambda
+      // Reference: solver.cpp "lambda = isinf(stiffness[i]) ? force->lambda[i] : 0.0f"
+      const lambdaForPrimal = isFinite(row.stiffness) ? 0 : row.lambda;
+
       // Clamped force: f = clamp(penalty * C + lambda, fmin, fmax)
-      let f = row.penalty * cEval + row.lambda;
+      let f = row.penalty * cEval + lambdaForPrimal;
       f = Math.max(row.fmin, Math.min(row.fmax, f));
 
       // Accumulate RHS: += J * f
@@ -338,8 +371,12 @@ export class AVBDSolver2D {
             + row.jacobianB[2] * (bB.angle - bB.prevAngle);
     }
 
+    // For soft constraints (finite stiffness), zero lambda before accumulation
+    // Reference: solver.cpp "lambda = isinf(stiffness[i]) ? force->lambda[i] : 0.0f"
+    const prevLambda = isFinite(row.stiffness) ? 0 : row.lambda;
+
     // Update lambda: lambda = clamp(penalty * C + lambda, fmin, fmax)
-    row.lambda = row.penalty * cEval + row.lambda;
+    row.lambda = row.penalty * cEval + prevLambda;
     row.lambda = Math.max(row.fmin, Math.min(row.fmax, row.lambda));
 
     // Fracture check
@@ -349,8 +386,11 @@ export class AVBDSolver2D {
       return;
     }
 
-    // Ramp penalty: penalty += beta * |C|
-    row.penalty += this.config.beta * Math.abs(cEval);
+    // Conditional penalty ramping: only ramp when constraint is interior (not at bounds)
+    // Reference: "if (lambda > fmin && lambda < fmax) penalty += beta * |C|"
+    if (row.lambda > row.fmin && row.lambda < row.fmax) {
+      row.penalty += this.config.beta * Math.abs(cEval);
+    }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) {
       row.penalty = row.stiffness;

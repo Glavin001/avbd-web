@@ -62,13 +62,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
            + cr.jacobian_b.z * (body_state[bb_base + 2u] - body_prev[bb_prev_base + 2u]);
   }
 
+  // For soft constraints (finite stiffness), zero lambda before accumulation
+  var prev_lambda = cr.lambda;
+  if (cr.stiffness < 1e30) { // Not infinite
+    prev_lambda = 0.0;
+  }
+
   // Update lambda
-  var new_lambda = cr.penalty * c_eval + cr.lambda;
+  var new_lambda = cr.penalty * c_eval + prev_lambda;
   new_lambda = clamp(new_lambda, cr.fmin, cr.fmax);
   cr.lambda = new_lambda;
 
-  // Ramp penalty
-  cr.penalty += params.beta * abs(c_eval);
+  // Fracture check (if threshold > 0)
+  // Note: GPU can't easily disable, so we set active = 0
+  // (CPU side handles actual removal)
+
+  // Conditional penalty ramp: only when constraint is interior (not at bounds)
+  if (cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
+    cr.penalty += params.beta * abs(c_eval);
+  }
   cr.penalty = clamp(cr.penalty, params.penalty_min, params.penalty_max);
   if (cr.penalty > cr.stiffness) {
     cr.penalty = cr.stiffness;

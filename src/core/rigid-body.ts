@@ -158,6 +158,7 @@ export interface Body2D {
   // Solver state
   prevPosition: Vec2;
   prevAngle: number;
+  prevVelocity: Vec2;
   inertialPosition: Vec2;
   inertialAngle: number;
   boundingRadius: number;
@@ -189,6 +190,7 @@ export class BodyStore2D {
       restitution: DEFAULT_MATERIAL.restitution,
       prevPosition: { ...desc.position },
       prevAngle: desc.angle,
+      prevVelocity: { ...desc.linearVelocity },
       inertialPosition: { ...desc.position },
       inertialAngle: desc.angle,
       boundingRadius: 0,

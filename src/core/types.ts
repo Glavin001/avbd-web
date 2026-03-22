@@ -119,8 +119,8 @@ export const DEFAULT_SOLVER_CONFIG_2D: SolverConfig = {
   alpha: 0.99,
   gamma: 0.99,
   postStabilize: true,
-  penaltyMin: 100,
-  penaltyMax: 1e10,
+  penaltyMin: 1,
+  penaltyMax: 1e9,
   gravity: { x: 0, y: -9.81 },
 };
 
@@ -131,8 +131,8 @@ export const DEFAULT_SOLVER_CONFIG_3D: SolverConfig = {
   alpha: 0.99,
   gamma: 0.99,
   postStabilize: true,
-  penaltyMin: 100,
-  penaltyMax: 1e10,
+  penaltyMin: 1,
+  penaltyMax: 1e9,
   gravity: { x: 0, y: -9.81, z: 0 },
 };
 
@@ -170,6 +170,9 @@ export interface MaterialProperties {
   restitution: number;
   density: number;
 }
+
+/** Collision margin added to normal contacts (reference: 0.0005) */
+export const COLLISION_MARGIN = 0.0005;
 
 export const DEFAULT_MATERIAL: MaterialProperties = {
   friction: 0.5,

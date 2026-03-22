@@ -9,7 +9,7 @@
 
 import type { Vec2, ContactManifold2D, ContactPoint2D } from '../core/types.js';
 import type { Body2D } from '../core/rigid-body.js';
-import { ForceType } from '../core/types.js';
+import { ForceType, COLLISION_MARGIN } from '../core/types.js';
 import { createDefaultRow, type ConstraintRow } from './constraint.js';
 import { vec2Sub, vec2Dot, vec2Cross, vec2Perp } from '../core/math.js';
 
@@ -82,7 +82,8 @@ export function createContactConstraintRows(
     normalRow.jacobianB[2] = -normalRow.jacobianB[2];
 
     // C < 0 when penetrating, C = 0 at contact surface
-    normalRow.c = -contact.depth;
+    // Add collision margin to prevent micro-penetrations (reference: COLLISION_MARGIN = 0.0005)
+    normalRow.c = -contact.depth + COLLISION_MARGIN;
     normalRow.c0 = normalRow.c;
 
     // Apply restitution: modify the constraint target to include bounce velocity
