@@ -57,6 +57,28 @@ describe('3D Primal shader correctness', () => {
     expect(PRIMAL_UPDATE_3D_WGSL).toContain('J[i] * J[j] * cr.penalty');
   });
 
+  it('should apply geometric stiffness from hessian_diag_a/b_ang', () => {
+    // The 3D primal shader should read hessianDiag and add to angular diagonal
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('hessian_diag_a_ang');
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('hessian_diag_b_ang');
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('H_ang');
+    // Should take absolute value and multiply by |f|
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('abs(H_ang');
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('abs_f');
+    // Should add to angular diagonal entries (indices 3,4,5)
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('3u * 6u + 3u');
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('4u * 6u + 4u');
+    expect(PRIMAL_UPDATE_3D_WGSL).toContain('5u * 6u + 5u');
+  });
+
+  it('should have hessianDiag fields in 3D ConstraintRow3D struct', () => {
+    // All 3D shaders must have the updated struct with hessianDiag
+    for (const shader of [PRIMAL_UPDATE_3D_WGSL, DUAL_UPDATE_3D_WGSL, FRICTION_COUPLING_3D_WGSL]) {
+      expect(shader).toContain('hessian_diag_a_ang: vec4<f32>');
+      expect(shader).toContain('hessian_diag_b_ang: vec4<f32>');
+    }
+  });
+
   it('should have stiffness guard (lambda=0 for soft constraints)', () => {
     expect(PRIMAL_UPDATE_3D_WGSL).toContain('cr.stiffness < 1e30');
     expect(PRIMAL_UPDATE_3D_WGSL).toContain('lambda_for_primal = 0.0');
@@ -199,8 +221,9 @@ describe('3D buffer layout constants', () => {
     expect(data.byteLength).toBe(48);
   });
 
-  it('should pack 3D constraint row as 28 floats (112 bytes) with split lin/ang jacobians', () => {
-    const STRIDE = 28;
+  it('should pack 3D constraint row as 36 floats (144 bytes) with hessianDiag', () => {
+    // After adding geometric stiffness, the 3D constraint row grew from 28 to 36 floats
+    const STRIDE = 36;
     const data = new ArrayBuffer(STRIDE * 4);
     const view = new DataView(data);
     // [0-15] body_a, body_b, force_type, _pad
@@ -213,22 +236,47 @@ describe('3D buffer layout constants', () => {
     view.setFloat32(24, 0.0, true);
     // [32-47] jacobian_a_ang (vec4): [torque_x, torque_y, torque_z, 0]
     view.setFloat32(32, 0.5, true);
+    view.setFloat32(36, 0.0, true);
+    view.setFloat32(40, -0.3, true);
     // [48-63] jacobian_b_lin (vec4): [-nx, -ny, -nz, 0]
+    view.setFloat32(48, 0.0, true);
     view.setFloat32(52, -1.0, true);
+    view.setFloat32(56, 0.0, true);
     // [64-79] jacobian_b_ang (vec4): [-torque_x, -torque_y, -torque_z, mu]
+    view.setFloat32(64, -0.5, true);
+    view.setFloat32(68, 0.0, true);
+    view.setFloat32(72, 0.3, true);
     view.setFloat32(76, 0.5, true);  // mu packed in .w
-    // [80-111] scalar fields
-    view.setFloat32(80, -0.1, true);   // c
-    view.setFloat32(84, -0.1, true);   // c0
-    view.setFloat32(88, -50.0, true);  // lambda
-    view.setFloat32(92, 100.0, true);  // penalty
-    view.setFloat32(96, 1e30, true);   // stiffness
-    view.setFloat32(100, -1e30, true); // fmin
-    view.setFloat32(104, 0.0, true);   // fmax
-    view.setUint32(108, 1, true);      // is_active
-    expect(data.byteLength).toBe(112);
+    // [80-95] hessian_diag_a_ang (vec4): angular components of body A
+    view.setFloat32(80, -0.2, true);  // H_ang_a.x
+    view.setFloat32(84, -0.8, true);  // H_ang_a.y
+    view.setFloat32(88, -0.5, true);  // H_ang_a.z
+    view.setFloat32(92, 0.0, true);   // padding
+    // [96-111] hessian_diag_b_ang (vec4): angular components of body B
+    view.setFloat32(96, -0.3, true);  // H_ang_b.x
+    view.setFloat32(100, -0.7, true); // H_ang_b.y
+    view.setFloat32(104, -0.4, true); // H_ang_b.z
+    view.setFloat32(108, 0.0, true);  // padding
+    // [112-143] scalar fields (shifted from old offsets 80-111)
+    view.setFloat32(112, -0.1, true);   // c
+    view.setFloat32(116, -0.1, true);   // c0
+    view.setFloat32(120, -50.0, true);  // lambda  ← was at byte 88
+    view.setFloat32(124, 100.0, true);  // penalty ← was at byte 92
+    view.setFloat32(128, 1e30, true);   // stiffness
+    view.setFloat32(132, -1e30, true);  // fmin
+    view.setFloat32(136, 0.0, true);    // fmax
+    view.setUint32(140, 1, true);       // is_active
+    expect(data.byteLength).toBe(144);
     // Verify mu packed at correct offset
     expect(view.getFloat32(76, true)).toBe(0.5);
+    // Verify hessianDiag values at new offsets
+    expect(view.getFloat32(80, true)).toBeCloseTo(-0.2);
+    expect(view.getFloat32(84, true)).toBeCloseTo(-0.8);
+    expect(view.getFloat32(96, true)).toBeCloseTo(-0.3);
+    // Verify scalar fields at new (shifted) offsets
+    expect(view.getFloat32(112, true)).toBeCloseTo(-0.1);  // c
+    expect(view.getFloat32(120, true)).toBeCloseTo(-50.0);  // lambda
+    expect(view.getFloat32(124, true)).toBeCloseTo(100.0);  // penalty
   });
 });
 

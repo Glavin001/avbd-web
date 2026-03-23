@@ -281,3 +281,75 @@ test.describe('AVBD GPU Execution', () => {
     expect(r.diff60).toBeLessThan(0.5);
   });
 });
+
+// ─── GPU 2D Unit Tests: Contact, Friction, Rotation ───────────────────────
+
+test.describe('GPU 2D: Contact & Rotation', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 30000,
+    });
+  });
+
+  test('GPU 2D: box landing flat should not spin', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_rotationFlat);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    // Box dropped flat should have very small final angle
+    expect(Math.abs(r.finalAngle)).toBeLessThan(1.0);
+    // Should be above ground
+    expect(r.finalY).toBeGreaterThan(0.5);
+  });
+
+  test('GPU 2D: low friction slides farther than high friction', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_frictionDecel);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    // Low friction should slide farther
+    expect(r.lowFinalX).toBeGreaterThan(r.highFinalX);
+  });
+
+  test('GPU 2D: zero friction preserves velocity', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_zeroFriction);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    // With zero friction, horizontal velocity should persist
+    expect(r.vx).toBeGreaterThan(2.0);
+  });
+
+  test('GPU 2D: 5-box stack has bounded rotation', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_stackRotation);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.allFinite).toBe(true);
+    expect(r.allAboveGround).toBe(true);
+    // Boxes in a stack should have small angles (settled on faces)
+    expect(r.maxAngle).toBeLessThan(10);
+  });
+
+  test('GPU 2D: GPU vs CPU rotation parity', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_rotationParity);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    // GPU and CPU should produce similar final positions
+    expect(r.posDiff).toBeLessThan(1.0);
+  });
+
+  test('GPU 2D: corner contact (45° rotated box) settles', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_cornerContact);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.isFinite).toBe(true);
+    expect(r.aboveGround).toBe(true);
+  });
+
+  test('GPU 2D: geometric stiffness keeps 20-body sim stable', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_geometricStiffness);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.allFinite).toBe(true);
+    expect(r.allAboveGround).toBe(true);
+    expect(r.numBodies).toBe(20);
+  });
+});

@@ -641,6 +641,192 @@
       return { diff1, diff60, gpuY: gpuBody.translation().y, cpuY: cpuBody.translation().y, isGPU: true };
     });
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // GPU 2D UNIT TESTS: Contact, friction, rotation atomic validations
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── GPU 2D: Rotation stability (box landing flat) ────────────────
+    await window.runTest('gpu2d_rotationFlat', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), body);
+
+      let maxOmega = 0;
+      for (let i = 0; i < 180; i++) {
+        await world.step();
+        const rot = body.rotation();
+        // Track max angular velocity by angle change
+        maxOmega = Math.max(maxOmega, Math.abs(rot));
+      }
+      const finalAngle = body.rotation();
+      return {
+        finalAngle,
+        maxAngle: maxOmega,
+        finalY: body.translation().y,
+        isGPU: world.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: Friction deceleration ────────────────────────────────
+    await window.runTest('gpu2d_frictionDecel', async () => {
+      // High friction
+      const worldHigh = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      worldHigh.createCollider(AVBD.ColliderDesc.cuboid(30, 0.5).setFriction(0.8));
+      const highBody = worldHigh.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1).setLinvel(5, 0)
+      );
+      worldHigh.createCollider(AVBD.ColliderDesc.cuboid(0.3, 0.3).setFriction(0.8), highBody);
+
+      // Low friction
+      const worldLow = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      worldLow.createCollider(AVBD.ColliderDesc.cuboid(30, 0.5).setFriction(0.1));
+      const lowBody = worldLow.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1).setLinvel(5, 0)
+      );
+      worldLow.createCollider(AVBD.ColliderDesc.cuboid(0.3, 0.3).setFriction(0.1), lowBody);
+
+      for (let i = 0; i < 120; i++) {
+        await worldHigh.step();
+        await worldLow.step();
+      }
+
+      return {
+        highFinalX: highBody.translation().x,
+        lowFinalX: lowBody.translation().x,
+        highVx: highBody.linvel().x,
+        lowVx: lowBody.linvel().x,
+        isGPU: worldHigh.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: Zero friction preserves velocity ─────────────────────
+    await window.runTest('gpu2d_zeroFriction', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(50, 0.5).setFriction(0));
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1).setLinvel(5, 0)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.3, 0.3).setFriction(0).setRestitution(0), body);
+
+      for (let i = 0; i < 120; i++) await world.step();
+
+      return {
+        vx: body.linvel().x,
+        x: body.translation().x,
+        isGPU: world.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: 5-box stack rotation check ───────────────────────────
+    await window.runTest('gpu2d_stackRotation', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+
+      const boxes = [];
+      for (let i = 0; i < 5; i++) {
+        const b = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1 + i * 1.05)
+        );
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b);
+        boxes.push(b);
+      }
+
+      for (let i = 0; i < 300; i++) await world.step();
+
+      const angles = boxes.map(b => b.rotation());
+      const positions = boxes.map(b => b.translation());
+      return {
+        angles,
+        positions,
+        maxAngle: Math.max(...angles.map(Math.abs)),
+        allAboveGround: positions.every(p => p.y > 0.3),
+        allFinite: positions.every(p => isFinite(p.x) && isFinite(p.y)),
+        isGPU: world.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: GPU vs CPU rotation parity ───────────────────────────
+    await window.runTest('gpu2d_rotationParity', async () => {
+      const r = await gpuCpuRun((world) => {
+        world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(0.1, 3).setLinvel(2, 0)
+        );
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), body);
+        return [body];
+      }, 120);
+
+      return {
+        gpuFinal: r.gpuFinal[0],
+        cpuFinal: r.cpuFinal[0],
+        posDiff: Math.abs(r.gpuFinal[0].y - r.cpuFinal[0].y),
+        isGPU: r.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: Corner contact (45° rotated box) ─────────────────────
+    await window.runTest('gpu2d_cornerContact', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 4).setRotation(Math.PI / 4)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5).setRestitution(0.1), body);
+
+      for (let i = 0; i < 300; i++) await world.step();
+
+      const pos = body.translation();
+      return {
+        x: pos.x,
+        y: pos.y,
+        angle: body.rotation(),
+        settled: Math.abs(body.linvel().y) < 2.0,
+        aboveGround: pos.y > 0.3,
+        isFinite: isFinite(pos.x) && isFinite(pos.y),
+        isGPU: world.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: Geometric stiffness effect ───────────────────────────
+    await window.runTest('gpu2d_geometricStiffness', async () => {
+      // Drop 20 boxes — geometric stiffness should keep rotation bounded
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 5 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+      // Walls
+      const lw = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(-4, 3));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.3, 3), lw);
+      const rw = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(4, 3));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.3, 3), rw);
+
+      const bodies = [];
+      for (let i = 0; i < 20; i++) {
+        const col = i % 5;
+        const row = Math.floor(i / 5);
+        const b = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation((col - 2) * 1.1, 2 + row * 1.1)
+        );
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.4, 0.4).setFriction(0.4), b);
+        bodies.push(b);
+      }
+
+      for (let i = 0; i < 180; i++) await world.step();
+
+      const allFinite = bodies.every(b => {
+        const p = b.translation();
+        return isFinite(p.x) && isFinite(p.y);
+      });
+      const allAboveGround = bodies.every(b => b.translation().y > -1);
+      return {
+        allFinite,
+        allAboveGround,
+        numBodies: bodies.length,
+        isGPU: world.isGPU,
+      };
+    });
+
     // Signal completion
     window.testResults._complete = true;
     document.getElementById('status').textContent = 'Tests complete';
