@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AVBD 2D Physics Demo</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #1a1a2e;
+      color: #eee;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      overflow-x: hidden;
+    }
+
+    header {
+      text-align: center;
+      padding: 14px 16px 4px;
+    }
+
+    header h1 {
+      font-size: 22px;
+      color: #e94560;
+      letter-spacing: 0.5px;
+    }
+
+    header .subtitle {
+      color: #888;
+      font-size: 13px;
+      margin-top: 4px;
+    }
+
+    .toolbar {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar label {
+      color: #aaa;
+      font-size: 13px;
+    }
+
+    .toolbar select,
+    .toolbar button {
+      background: #16213e;
+      color: #eee;
+      border: 1px solid #0f3460;
+      padding: 7px 14px;
+      cursor: pointer;
+      border-radius: 4px;
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+
+    .toolbar select:hover,
+    .toolbar button:hover {
+      background: #0f3460;
+    }
+
+    .toolbar select:focus,
+    .toolbar button:focus {
+      outline: 1px solid #4fc3f7;
+      outline-offset: 1px;
+    }
+
+    .toolbar select {
+      min-width: 150px;
+    }
+
+    .hint {
+      text-align: center;
+      color: #555;
+      font-size: 11px;
+      padding: 4px 0 6px;
+    }
+
+    canvas {
+      display: block;
+      margin: 0 auto;
+      border: 1px solid #333;
+      background: #0f0f23;
+      cursor: crosshair;
+    }
+
+    #stats {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      background: rgba(0, 0, 0, 0.8);
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.7;
+      font-family: 'Consolas', 'Monaco', 'Fira Code', monospace;
+      min-width: 170px;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+
+    #stats .lbl { color: #888; }
+    #stats .val { color: #4fc3f7; }
+    #stats .gpu { color: #66bb6a; font-weight: bold; }
+    #stats .cpu { color: #ffa726; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AVBD 2D Physics &mdash; WebGPU Augmented Vertex Block Descent</h1>
+    <p class="subtitle">GPU-accelerated rigid body physics based on SIGGRAPH 2025</p>
+  </header>
+
+  <div class="toolbar">
+    <label for="sceneSelect">Scene:</label>
+    <select id="sceneSelect">
+      <option value="stack">Stack</option>
+      <option value="pyramid">Pyramid</option>
+      <option value="rope">Rope</option>
+      <option value="heavyRope">Heavy Rope</option>
+      <option value="friction">Friction</option>
+      <option value="fracture">Fracture</option>
+      <option value="jointGrid">Joint Grid</option>
+    </select>
+    <button id="btnReset">Reset</button>
+    <button id="btnPause">Pause</button>
+    <button id="btnStep">Step</button>
+  </div>
+
+  <p class="hint">Left-click drag to move bodies &nbsp;|&nbsp; Right-click to spawn a box</p>
+  <canvas id="canvas" width="900" height="600"></canvas>
+  <div id="stats"></div>
+
+  <script type="module">
+    import AVBD from '../src/2d/index.ts';
+
+    // ====================================================================
+    // Constants & DOM
+    // ====================================================================
+
+    const SCALE   = 50;   // pixels per meter
+    const canvas  = document.getElementById('canvas');
+    const ctx     = canvas.getContext('2d');
+    const statsEl = document.getElementById('stats');
+    const selScene = document.getElementById('sceneSelect');
+    const btnReset = document.getElementById('btnReset');
+    const btnPause = document.getElementById('btnPause');
+    const btnStep  = document.getElementById('btnStep');
+
+    const ORIGIN_X = canvas.width  / 2;
+    const ORIGIN_Y = canvas.height - 80;
+
+    // World extents (meters)
+    const GROUND_HW = 8.5;
+    const GROUND_HH = 0.3;
+    const WALL_HW   = 0.3;
+    const WALL_HH   = 5;
+    const WALL_X     = 8.2;
+
+    // ====================================================================
+    // Color palette
+    // ====================================================================
+
+    const PALETTE = [
+      '#e94560', '#4fc3f7', '#66bb6a', '#ffa726', '#ab47bc',
+      '#ef5350', '#42a5f5', '#26a69a', '#ffca28', '#ec407a',
+      '#7e57c2', '#29b6f6', '#9ccc65', '#ff7043', '#5c6bc0',
+    ];
+
+    function colorAt(i) {
+      return PALETTE[i % PALETTE.length];
+    }
+
+    // ====================================================================
+    // Coordinate transforms
+    // ====================================================================
+
+    function toScreen(wx, wy) {
+      return [ORIGIN_X + wx * SCALE, ORIGIN_Y - wy * SCALE];
+    }
+
+    function toWorld(sx, sy) {
+      return [(sx - ORIGIN_X) / SCALE, (ORIGIN_Y - sy) / SCALE];
+    }
+
+    // ====================================================================
+    // Engine init
+    // ====================================================================
+
+    let gpuStatus = 'CPU';
+    try {
+      await AVBD.init();
+      gpuStatus = 'GPU';
+    } catch (err) {
+      console.warn('WebGPU not available, falling back to CPU:', err.message);
+    }
+
+    // ====================================================================
+    // State
+    // ====================================================================
+
+    let world   = null;
+    let bodies  = [];   // {body, type:'box'|'ball', hw?, hh?, radius?, color, label?}
+    let joints  = [];   // {bodyA, bodyB}
+    let gpuMode = false;
+    let paused  = false;
+
+    // ====================================================================
+    // World factory
+    // ====================================================================
+
+    function createWorld() {
+      world  = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: true });
+      bodies = [];
+      joints = [];
+      gpuMode = (gpuStatus === 'GPU');
+
+      // Ground (static collider, no body needed)
+      world.createCollider(
+        AVBD.ColliderDesc.cuboid(GROUND_HW, GROUND_HH).setFriction(0.5)
+      );
+
+      // Left wall
+      const lw = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(-WALL_X, WALL_HH));
+      world.createCollider(AVBD.ColliderDesc.cuboid(WALL_HW, WALL_HH), lw);
+
+      // Right wall
+      const rw = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(WALL_X, WALL_HH));
+      world.createCollider(AVBD.ColliderDesc.cuboid(WALL_HW, WALL_HH), rw);
+    }
+
+    // ====================================================================
+    // Scene: Stack  (20 boxes stacked vertically)
+    // ====================================================================
+
+    function sceneStack() {
+      for (let i = 0; i < 20; i++) {
+        const y = 0.8 + i * 1.05;
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(0, y)
+        );
+        world.createCollider(
+          AVBD.ColliderDesc.cuboid(0.5, 0.5)
+            .setDensity(1).setFriction(0.5).setRestitution(0.1),
+          body
+        );
+        bodies.push({ body, type: 'box', hw: 0.5, hh: 0.5, color: colorAt(i) });
+      }
+    }
+
+    // ====================================================================
+    // Scene: Pyramid  (15-row pyramid of boxes)
+    // ====================================================================
+
+    function scenePyramid() {
+      const rows = 15;
+      let idx = 0;
+      for (let row = 0; row < rows; row++) {
+        const count  = rows - row;
+        const offset = -(count - 1) * 0.55;
+        for (let col = 0; col < count; col++) {
+          const x = offset + col * 1.1;
+          const y = 0.8 + row * 1.05;
+          const body = world.createRigidBody(
+            AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+          );
+          world.createCollider(
+            AVBD.ColliderDesc.cuboid(0.5, 0.5)
+              .setDensity(1).setFriction(0.5).setRestitution(0.05),
+            body
+          );
+          bodies.push({ body, type: 'box', hw: 0.5, hh: 0.5, color: colorAt(idx++) });
+        }
+      }
+    }
+
+    // ====================================================================
+    // Scene: Rope  (20 ball segments, revolute joints, fixed anchor)
+    // ====================================================================
+
+    function sceneRope() {
+      const segments = 20;
+      const segLen   = 0.4;
+      const startX   = 0;
+      const startY   = 8;
+
+      // Fixed anchor
+      const anchor = world.createRigidBody(
+        AVBD.RigidBodyDesc.fixed().setTranslation(startX, startY)
+      );
+      world.createCollider(AVBD.ColliderDesc.ball(0.15).setFriction(0.3), anchor);
+      bodies.push({ body: anchor, type: 'ball', radius: 0.15, color: '#ffffff' });
+
+      let prev = anchor;
+      for (let i = 0; i < segments; i++) {
+        const y = startY - (i + 1) * segLen;
+        const seg = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(startX, y)
+        );
+        world.createCollider(
+          AVBD.ColliderDesc.ball(0.12).setDensity(1).setFriction(0.3),
+          seg
+        );
+        bodies.push({ body: seg, type: 'ball', radius: 0.12, color: colorAt(i) });
+
+        const jd = AVBD.JointData.revolute(
+          { x: 0, y: -segLen / 2 },
+          { x: 0, y:  segLen / 2 }
+        );
+        world.createJoint(jd, prev, seg);
+        joints.push({ bodyA: prev, bodyB: seg });
+        prev = seg;
+      }
+    }
+
+    // ====================================================================
+    // Scene: Heavy Rope  (rope + heavy box at end)
+    // ====================================================================
+
+    function sceneHeavyRope() {
+      const segments = 20;
+      const segLen   = 0.4;
+      const startX   = 0;
+      const startY   = 8;
+
+      // Fixed anchor
+      const anchor = world.createRigidBody(
+        AVBD.RigidBodyDesc.fixed().setTranslation(startX, startY)
+      );
+      world.createCollider(AVBD.ColliderDesc.ball(0.15).setFriction(0.3), anchor);
+      bodies.push({ body: anchor, type: 'ball', radius: 0.15, color: '#ffffff' });
+
+      let prev = anchor;
+      for (let i = 0; i < segments; i++) {
+        const y = startY - (i + 1) * segLen;
+        const seg = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(startX, y)
+        );
+        world.createCollider(
+          AVBD.ColliderDesc.ball(0.12).setDensity(1).setFriction(0.3),
+          seg
+        );
+        bodies.push({ body: seg, type: 'ball', radius: 0.12, color: colorAt(i) });
+
+        const jd = AVBD.JointData.revolute(
+          { x: 0, y: -segLen / 2 },
+          { x: 0, y:  segLen / 2 }
+        );
+        world.createJoint(jd, prev, seg);
+        joints.push({ bodyA: prev, bodyB: seg });
+        prev = seg;
+      }
+
+      // Heavy weight at bottom
+      const weightY = startY - (segments + 1) * segLen;
+      const weight = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(startX, weightY)
+      );
+      world.createCollider(
+        AVBD.ColliderDesc.cuboid(0.6, 0.6).setDensity(10).setFriction(0.5),
+        weight
+      );
+      bodies.push({ body: weight, type: 'box', hw: 0.6, hh: 0.6, color: '#e94560' });
+
+      const jd = AVBD.JointData.revolute(
+        { x: 0, y: -segLen / 2 },
+        { x: 0, y: 0.6 }
+      );
+      world.createJoint(jd, prev, weight);
+      joints.push({ bodyA: prev, bodyB: weight });
+    }
+
+    // ====================================================================
+    // Scene: Friction  (11 boxes, friction 1.0 -> 0.0, rightward impulse)
+    // ====================================================================
+
+    function sceneFriction() {
+      for (let i = 0; i <= 10; i++) {
+        const friction = 1.0 - i * 0.1;
+        const x = -5.5 + i * 1.1;
+        const y = 1.5;
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic()
+            .setTranslation(x, y)
+            .setLinvel(0, 0)
+        );
+        world.createCollider(
+          AVBD.ColliderDesc.cuboid(0.4, 0.4)
+            .setDensity(1)
+            .setFriction(friction)
+            .setRestitution(0.0),
+          body
+        );
+        // Rightward impulse -- low-friction boxes will slide more
+        body.applyImpulse({ x: 8, y: 0 });
+
+        const hue = 120 * friction;  // green (high) -> red (low)
+        bodies.push({
+          body, type: 'box', hw: 0.4, hh: 0.4,
+          color: `hsl(${hue}, 70%, 50%)`,
+          label: friction.toFixed(1),
+        });
+      }
+    }
+
+    // ====================================================================
+    // Scene: Fracture  (chain of fixed joints + heavy boxes dropped on it)
+    // ====================================================================
+
+    function sceneFracture() {
+      const chainLen   = 10;
+      const segSpacing = 0.9;
+      const chainY     = 6;
+      const startX     = -(chainLen - 1) * segSpacing / 2;
+      const chainBodies = [];
+
+      // Build chain
+      for (let i = 0; i < chainLen; i++) {
+        const x = startX + i * segSpacing;
+        const isEnd = (i === 0 || i === chainLen - 1);
+        const desc = isEnd
+          ? AVBD.RigidBodyDesc.fixed().setTranslation(x, chainY)
+          : AVBD.RigidBodyDesc.dynamic().setTranslation(x, chainY);
+        const body = world.createRigidBody(desc);
+        world.createCollider(
+          AVBD.ColliderDesc.cuboid(0.35, 0.2).setDensity(1).setFriction(0.5),
+          body
+        );
+        bodies.push({
+          body, type: 'box', hw: 0.35, hh: 0.2,
+          color: isEnd ? '#ffffff' : colorAt(i),
+        });
+        chainBodies.push(body);
+      }
+
+      // Connect with breakable fixed joints
+      for (let i = 0; i < chainLen - 1; i++) {
+        const jd = AVBD.JointData.fixed(
+          { x:  segSpacing / 2, y: 0 },
+          { x: -segSpacing / 2, y: 0 }
+        ).setFractureThreshold(50);
+        world.createJoint(jd, chainBodies[i], chainBodies[i + 1]);
+        joints.push({ bodyA: chainBodies[i], bodyB: chainBodies[i + 1] });
+      }
+
+      // Drop 5 heavy boxes onto the chain
+      for (let i = 0; i < 5; i++) {
+        const x = startX + 2 + i * 1.2;
+        const y = 9 + Math.random() * 0.5;
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+        );
+        world.createCollider(
+          AVBD.ColliderDesc.cuboid(0.45, 0.45)
+            .setDensity(5).setFriction(0.5).setRestitution(0.1),
+          body
+        );
+        bodies.push({ body, type: 'box', hw: 0.45, hh: 0.45, color: '#e94560' });
+      }
+    }
+
+    // ====================================================================
+    // Scene: Joint Grid  (grid of boxes, top corners anchored)
+    // ====================================================================
+
+    function sceneJointGrid() {
+      const cols    = 8;
+      const rows    = 6;
+      const spacing = 0.9;
+      const startX  = -(cols - 1) * spacing / 2;
+      const startY  = 8;
+      const grid    = [];
+
+      for (let r = 0; r < rows; r++) {
+        grid[r] = [];
+        for (let c = 0; c < cols; c++) {
+          const x = startX + c * spacing;
+          const y = startY - r * spacing;
+          const isAnchor = (r === 0 && (c === 0 || c === cols - 1));
+          const desc = isAnchor
+            ? AVBD.RigidBodyDesc.fixed().setTranslation(x, y)
+            : AVBD.RigidBodyDesc.dynamic().setTranslation(x, y);
+          const body = world.createRigidBody(desc);
+          world.createCollider(
+            AVBD.ColliderDesc.cuboid(0.2, 0.2).setDensity(1).setFriction(0.3),
+            body
+          );
+          bodies.push({
+            body, type: 'box', hw: 0.2, hh: 0.2,
+            color: isAnchor ? '#ffffff' : colorAt(r * cols + c),
+          });
+          grid[r][c] = body;
+        }
+      }
+
+      // Horizontal joints
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols - 1; c++) {
+          const jd = AVBD.JointData.revolute(
+            { x:  spacing / 2, y: 0 },
+            { x: -spacing / 2, y: 0 }
+          );
+          world.createJoint(jd, grid[r][c], grid[r][c + 1]);
+          joints.push({ bodyA: grid[r][c], bodyB: grid[r][c + 1] });
+        }
+      }
+
+      // Vertical joints
+      for (let r = 0; r < rows - 1; r++) {
+        for (let c = 0; c < cols; c++) {
+          const jd = AVBD.JointData.revolute(
+            { x: 0, y: -spacing / 2 },
+            { x: 0, y:  spacing / 2 }
+          );
+          world.createJoint(jd, grid[r][c], grid[r + 1][c]);
+          joints.push({ bodyA: grid[r][c], bodyB: grid[r + 1][c] });
+        }
+      }
+    }
+
+    // ====================================================================
+    // Scene registry
+    // ====================================================================
+
+    const SCENES = {
+      stack:     sceneStack,
+      pyramid:   scenePyramid,
+      rope:      sceneRope,
+      heavyRope: sceneHeavyRope,
+      friction:  sceneFriction,
+      fracture:  sceneFracture,
+      jointGrid: sceneJointGrid,
+    };
+
+    function loadScene(name) {
+      createWorld();
+      if (SCENES[name]) SCENES[name]();
+    }
+
+    // ====================================================================
+    // Rendering
+    // ====================================================================
+
+    function render() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // --- Ground ---
+      ctx.fillStyle = '#2a2a4a';
+      const [gx, gy] = toScreen(-GROUND_HW, GROUND_HH);
+      ctx.fillRect(gx, gy, GROUND_HW * 2 * SCALE, GROUND_HH * 2 * SCALE);
+
+      // --- Walls ---
+      ctx.fillStyle = '#2a2a4a';
+      const [lwx, lwy] = toScreen(-WALL_X - WALL_HW, WALL_HH * 2);
+      ctx.fillRect(lwx, lwy, WALL_HW * 2 * SCALE, WALL_HH * 2 * SCALE);
+      const [rwx, rwy] = toScreen(WALL_X - WALL_HW, WALL_HH * 2);
+      ctx.fillRect(rwx, rwy, WALL_HW * 2 * SCALE, WALL_HH * 2 * SCALE);
+
+      // --- Joint lines ---
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+      ctx.lineWidth = 1;
+      for (const j of joints) {
+        const pA = j.bodyA.translation();
+        const pB = j.bodyB.translation();
+        const [ax, ay] = toScreen(pA.x, pA.y);
+        const [bx, by] = toScreen(pB.x, pB.y);
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+      }
+
+      // --- Bodies ---
+      for (const obj of bodies) {
+        const pos = obj.body.translation();
+        const rot = obj.body.rotation();
+        const [sx, sy] = toScreen(pos.x, pos.y);
+
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.rotate(-rot);  // negate: screen Y is flipped
+
+        if (obj.type === 'box') {
+          const w = obj.hw * 2 * SCALE;
+          const h = obj.hh * 2 * SCALE;
+          ctx.fillStyle = obj.color;
+          ctx.fillRect(-w / 2, -h / 2, w, h);
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(-w / 2, -h / 2, w, h);
+        } else if (obj.type === 'ball') {
+          const r = obj.radius * SCALE;
+          ctx.fillStyle = obj.color;
+          ctx.beginPath();
+          ctx.arc(0, 0, r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          // Direction indicator
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.lineTo(r * 0.8, 0);
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+          ctx.stroke();
+        }
+
+        ctx.restore();
+
+        // Friction labels
+        if (obj.label) {
+          ctx.fillStyle = '#fff';
+          ctx.font = '10px Consolas, Monaco, monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(obj.label, sx, sy - obj.hh * SCALE - 6);
+        }
+      }
+
+      // --- Drag line ---
+      if (isDragging && dragBody) {
+        const pos = dragBody.translation();
+        const [bx, by] = toScreen(pos.x, pos.y);
+        ctx.strokeStyle = 'rgba(233, 69, 96, 0.6)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(mouseX, mouseY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // ====================================================================
+    // Mouse interaction
+    // ====================================================================
+
+    let isDragging = false;
+    let dragBody   = null;
+    let mouseX     = 0;
+    let mouseY     = 0;
+
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    canvas.addEventListener('mousedown', e => {
+      const rect = canvas.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const [wx, wy] = toWorld(sx, sy);
+
+      if (e.button === 2) {
+        // Right-click: spawn a random box
+        spawnBox(wx, wy);
+        return;
+      }
+
+      // Left-click: find nearest dynamic body to drag
+      let bestDist = 1.5; // grab radius in meters
+      let bestBody = null;
+      for (const obj of bodies) {
+        if (obj.body.isFixed()) continue;
+        const pos = obj.body.translation();
+        const dx = pos.x - wx;
+        const dy = pos.y - wy;
+        const d  = Math.sqrt(dx * dx + dy * dy);
+        if (d < bestDist) {
+          bestDist = d;
+          bestBody = obj.body;
+        }
+      }
+
+      if (bestBody) {
+        isDragging = true;
+        dragBody   = bestBody;
+        mouseX     = sx;
+        mouseY     = sy;
+      }
+    });
+
+    canvas.addEventListener('mousemove', e => {
+      const rect = canvas.getBoundingClientRect();
+      mouseX = e.clientX - rect.left;
+      mouseY = e.clientY - rect.top;
+    });
+
+    canvas.addEventListener('mouseup', () => {
+      if (isDragging && dragBody) {
+        // Fling impulse toward mouse position
+        const [wx, wy] = toWorld(mouseX, mouseY);
+        const pos = dragBody.translation();
+        const strength = 5;
+        dragBody.applyImpulse({
+          x: (wx - pos.x) * strength,
+          y: (wy - pos.y) * strength,
+        });
+      }
+      isDragging = false;
+      dragBody   = null;
+    });
+
+    function spawnBox(wx, wy) {
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic()
+          .setTranslation(wx, wy)
+          .setRotation((Math.random() - 0.5) * 1.0)
+      );
+      const size = 0.3 + Math.random() * 0.3;
+      world.createCollider(
+        AVBD.ColliderDesc.cuboid(size, size)
+          .setDensity(1).setFriction(0.5).setRestitution(0.2),
+        body
+      );
+      bodies.push({
+        body, type: 'box', hw: size, hh: size,
+        color: colorAt(bodies.length),
+      });
+    }
+
+    // ====================================================================
+    // Controls
+    // ====================================================================
+
+    selScene.addEventListener('change', () => loadScene(selScene.value));
+
+    btnReset.addEventListener('click', () => loadScene(selScene.value));
+
+    btnPause.addEventListener('click', () => {
+      paused = !paused;
+      btnPause.textContent = paused ? 'Play' : 'Pause';
+    });
+
+    btnStep.addEventListener('click', async () => {
+      if (!paused) {
+        paused = true;
+        btnPause.textContent = 'Play';
+      }
+      await stepWorld();
+      render();
+    });
+
+    // ====================================================================
+    // Simulation loop
+    // ====================================================================
+
+    let lastTime   = performance.now();
+    let frameCount = 0;
+    let fps        = 0;
+    let stepTimeMs = 0;
+
+    async function stepWorld() {
+      const t0 = performance.now();
+
+      // Apply drag spring force
+      if (isDragging && dragBody) {
+        const [wx, wy] = toWorld(mouseX, mouseY);
+        const pos = dragBody.translation();
+        const stiffness = 20;
+        const dt = 1 / 60;
+        dragBody.applyImpulse({
+          x: (wx - pos.x) * stiffness * dt,
+          y: (wy - pos.y) * stiffness * dt,
+        });
+      }
+
+      // Try GPU, fall back to CPU
+      try {
+        await world.step();
+      } catch {
+        world.stepCPU();
+        gpuMode = false;
+      }
+
+      stepTimeMs = performance.now() - t0;
+    }
+
+    async function gameLoop() {
+      if (!paused) {
+        await stepWorld();
+      }
+
+      render();
+
+      // FPS tracking
+      frameCount++;
+      const now = performance.now();
+      if (now - lastTime >= 1000) {
+        fps = frameCount;
+        frameCount = 0;
+        lastTime = now;
+      }
+
+      // Stats overlay
+      const dynamicCount = bodies.filter(b => !b.body.isFixed()).length;
+      statsEl.innerHTML =
+        `<span class="lbl">Mode:</span> <span class="${gpuMode ? 'gpu' : 'cpu'}">${gpuMode ? 'GPU' : 'CPU'}</span><br>` +
+        `<span class="lbl">FPS:</span>  <span class="val">${fps}</span><br>` +
+        `<span class="lbl">Bodies:</span> <span class="val">${dynamicCount}</span><br>` +
+        `<span class="lbl">Step:</span> <span class="val">${stepTimeMs.toFixed(1)} ms</span>`;
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    // ====================================================================
+    // Start
+    // ====================================================================
+
+    loadScene('stack');
+    gameLoop();
+  </script>
+</body>
+</html>

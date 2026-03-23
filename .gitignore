@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+test-results/
+demo-dist/
+src/shaders/embedded.ts

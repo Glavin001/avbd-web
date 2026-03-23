@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AVBD 3D Physics Demo</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #111119;
+      color: #eee;
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      overflow: hidden;
+    }
+
+    #ui-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    #header {
+      text-align: center;
+      padding: 12px 0 4px;
+    }
+    #header h1 {
+      font-size: 20px;
+      color: #e94560;
+      font-weight: 600;
+      text-shadow: 0 0 20px rgba(233, 69, 96, 0.3);
+    }
+    #header p {
+      color: #666;
+      font-size: 12px;
+      margin-top: 2px;
+    }
+
+    #controls {
+      text-align: center;
+      padding: 8px 0;
+      pointer-events: all;
+    }
+    #controls select, #controls button {
+      background: #16213e;
+      color: #ccc;
+      border: 1px solid #0f3460;
+      padding: 6px 14px;
+      margin: 0 3px;
+      cursor: pointer;
+      border-radius: 4px;
+      font-size: 13px;
+      transition: background 0.2s;
+    }
+    #controls select:hover, #controls button:hover {
+      background: #0f3460;
+      color: #fff;
+    }
+    #controls select:focus { outline: 1px solid #e94560; }
+
+    #stats {
+      position: fixed;
+      top: 10px;
+      right: 12px;
+      background: rgba(0, 0, 0, 0.75);
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: 'Courier New', monospace;
+      line-height: 1.6;
+      z-index: 20;
+      border: 1px solid #222;
+    }
+    #stats .label { color: #888; }
+    #stats .value { color: #4fc3f7; }
+    #stats .value.gpu { color: #66bb6a; }
+
+    #hint {
+      position: fixed;
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.6);
+      padding: 8px 18px;
+      border-radius: 20px;
+      font-size: 12px;
+      color: #777;
+      z-index: 20;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="ui-overlay">
+    <div id="header">
+      <h1>AVBD 3D Physics — Augmented Vertex Block Descent</h1>
+      <p>3D rigid body simulation with Three.js rendering (CPU solver)</p>
+    </div>
+    <div id="controls">
+      <select id="scene-select">
+        <option value="ground">Ground</option>
+        <option value="stack" selected>Stack</option>
+        <option value="pyramid">Pyramid</option>
+        <option value="friction">Friction</option>
+      </select>
+      <button id="btn-reset">Reset</button>
+      <button id="btn-add-cube">Add Cube</button>
+      <button id="btn-add-sphere">Add Sphere</button>
+    </div>
+  </div>
+
+  <div id="stats">
+    <span class="label">FPS:</span> <span class="value" id="stat-fps">--</span><br>
+    <span class="label">Bodies:</span> <span class="value" id="stat-bodies">0</span><br>
+    <span class="label">Solver:</span> <span class="value" id="stat-solver">CPU</span>
+  </div>
+
+  <div id="hint">Click anywhere to shoot a cube | Scroll to zoom | Drag to orbit</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import AVBD3D from '../src/3d/index.ts';
+
+    // ── Three.js setup ───────────────────────────────────────────────────────
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111119);
+    scene.fog = new THREE.Fog(0x111119, 40, 80);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 200);
+    camera.position.set(12, 10, 12);
+    camera.lookAt(0, 2, 0);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 2, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.maxPolarAngle = Math.PI * 0.48;
+    controls.minDistance = 5;
+    controls.maxDistance = 50;
+    controls.update();
+
+    // ── Lighting ─────────────────────────────────────────────────────────────
+
+    const ambientLight = new THREE.AmbientLight(0x404060, 0.6);
+    scene.add(ambientLight);
+
+    const hemiLight = new THREE.HemisphereLight(0x8888cc, 0x444422, 0.4);
+    scene.add(hemiLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffeedd, 1.2);
+    dirLight.position.set(8, 15, 10);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(2048, 2048);
+    dirLight.shadow.camera.left = -20;
+    dirLight.shadow.camera.right = 20;
+    dirLight.shadow.camera.top = 20;
+    dirLight.shadow.camera.bottom = -20;
+    dirLight.shadow.camera.near = 1;
+    dirLight.shadow.camera.far = 50;
+    dirLight.shadow.bias = -0.001;
+    scene.add(dirLight);
+
+    // ── Ground ───────────────────────────────────────────────────────────────
+
+    const groundGeom = new THREE.PlaneGeometry(100, 100);
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x222233,
+      roughness: 0.9,
+      metalness: 0.1,
+    });
+    const groundMesh = new THREE.Mesh(groundGeom, groundMat);
+    groundMesh.rotation.x = -Math.PI / 2;
+    groundMesh.receiveShadow = true;
+    scene.add(groundMesh);
+
+    // Grid
+    const gridHelper = new THREE.GridHelper(40, 40, 0x333355, 0x222244);
+    gridHelper.position.y = 0.01;
+    scene.add(gridHelper);
+
+    // ── Physics init ─────────────────────────────────────────────────────────
+
+    let gpuMode = false;
+    try {
+      await AVBD3D.init();
+      gpuMode = true;
+    } catch (e) {
+      console.log('WebGPU not available, using CPU solver:', e.message);
+    }
+
+    document.getElementById('stat-solver').textContent = gpuMode ? 'GPU' : 'CPU';
+
+    // ── State ────────────────────────────────────────────────────────────────
+
+    let world = null;
+    let bodyMeshPairs = []; // { body, mesh, shape, hx, hy, hz, radius }
+
+    const CUBE_COLORS = [
+      0xe94560, 0x4fc3f7, 0x66bb6a, 0xffa726, 0xab47bc,
+      0xef5350, 0x42a5f5, 0x26c6da, 0xffee58, 0xec407a,
+      0x7e57c2, 0x5c6bc0, 0x29b6f6, 0x26a69a, 0xd4e157,
+    ];
+
+    function randomColor() {
+      return CUBE_COLORS[Math.floor(Math.random() * CUBE_COLORS.length)];
+    }
+
+    function createCubeMesh(hx, hy, hz, color) {
+      const geom = new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2);
+      const mat = new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.5,
+        metalness: 0.15,
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      return mesh;
+    }
+
+    function createSphereMesh(radius, color) {
+      const geom = new THREE.SphereGeometry(radius, 24, 16);
+      const mat = new THREE.MeshStandardMaterial({
+        color,
+        roughness: 0.35,
+        metalness: 0.2,
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      return mesh;
+    }
+
+    // ── World management ─────────────────────────────────────────────────────
+
+    function createWorld() {
+      world = new AVBD3D.World(
+        { x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useCPU: !gpuMode }
+      );
+      // Ground collider
+      world.createCollider(
+        AVBD3D.ColliderDesc.cuboid(50, 0.5, 50).setFriction(0.6).setRestitution(0.2)
+      );
+    }
+
+    function clearScene() {
+      for (const pair of bodyMeshPairs) {
+        scene.remove(pair.mesh);
+        pair.mesh.geometry.dispose();
+        pair.mesh.material.dispose();
+      }
+      bodyMeshPairs = [];
+    }
+
+    function addPhysicsCube(x, y, z, hx, hy, hz, friction, color) {
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(x, y, z)
+      );
+      world.createCollider(
+        AVBD3D.ColliderDesc.cuboid(hx, hy, hz).setFriction(friction).setDensity(1)
+      , body);
+      const mesh = createCubeMesh(hx, hy, hz, color ?? randomColor());
+      scene.add(mesh);
+      bodyMeshPairs.push({ body, mesh, shape: 'cube', hx, hy, hz });
+      return body;
+    }
+
+    function addPhysicsSphere(x, y, z, radius, color) {
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(x, y, z)
+      );
+      world.createCollider(
+        AVBD3D.ColliderDesc.ball(radius).setFriction(0.5).setDensity(1)
+      , body);
+      const mesh = createSphereMesh(radius, color ?? randomColor());
+      scene.add(mesh);
+      bodyMeshPairs.push({ body, mesh, shape: 'sphere', radius });
+      return body;
+    }
+
+    // ── Scenes ───────────────────────────────────────────────────────────────
+
+    function loadScene(name) {
+      clearScene();
+      createWorld();
+
+      switch (name) {
+        case 'ground':
+          sceneGround();
+          break;
+        case 'stack':
+          sceneStack();
+          break;
+        case 'pyramid':
+          scenePyramid();
+          break;
+        case 'friction':
+          sceneFriction();
+          break;
+      }
+    }
+
+    function sceneGround() {
+      addPhysicsCube(0, 3, 0, 0.5, 0.5, 0.5, 0.5, 0xe94560);
+    }
+
+    function sceneStack() {
+      const hx = 0.5, hy = 0.5, hz = 0.5;
+      for (let i = 0; i < 10; i++) {
+        const y = 0.5 + hy + i * (hy * 2 + 0.05);
+        const color = CUBE_COLORS[i % CUBE_COLORS.length];
+        addPhysicsCube(0, y, 0, hx, hy, hz, 0.5, color);
+      }
+    }
+
+    function scenePyramid() {
+      const hx = 0.5, hy = 0.5, hz = 0.5;
+      const layers = 6;
+      for (let row = 0; row < layers; row++) {
+        const count = layers - row;
+        const offsetX = -(count - 1) * hx;
+        for (let col = 0; col < count; col++) {
+          const x = offsetX + col * (hx * 2 + 0.05);
+          const y = 0.5 + hy + row * (hy * 2 + 0.05);
+          const color = CUBE_COLORS[(row * 7 + col) % CUBE_COLORS.length];
+          addPhysicsCube(x, y, 0, hx, hy, hz, 0.5, color);
+        }
+      }
+    }
+
+    function sceneFriction() {
+      // Create cubes at different positions with varying friction
+      const frictions = [0.0, 0.1, 0.3, 0.5, 0.8, 1.0];
+      const colors = [0xef5350, 0xffa726, 0xffee58, 0x66bb6a, 0x42a5f5, 0x7e57c2];
+
+      for (let i = 0; i < frictions.length; i++) {
+        const x = -5 + i * 2;
+        const friction = frictions[i];
+        const body = addPhysicsCube(x, 1.5, 0, 0.4, 0.4, 0.4, friction, colors[i]);
+        // Give each cube a lateral push to see friction differences
+        body.setLinvel({ x: 3, y: 0, z: 0 });
+      }
+
+      // Labels in the scene - small cubes as markers at ground level
+      // (visual indicator of friction values)
+    }
+
+    // ── Shooting cubes ───────────────────────────────────────────────────────
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    function shootCube(event) {
+      mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+      mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+      const dir = raycaster.ray.direction.clone().normalize();
+      const origin = camera.position.clone();
+
+      // Spawn cube slightly in front of camera
+      const spawnDist = 3;
+      const spawnPos = origin.clone().add(dir.clone().multiplyScalar(spawnDist));
+
+      const speed = 20;
+      const body = addPhysicsCube(
+        spawnPos.x, spawnPos.y, spawnPos.z,
+        0.3, 0.3, 0.3, 0.5, randomColor()
+      );
+      body.setLinvel({ x: dir.x * speed, y: dir.y * speed, z: dir.z * speed });
+    }
+
+    renderer.domElement.addEventListener('click', (e) => {
+      // Ignore clicks on UI
+      if (e.target !== renderer.domElement) return;
+      shootCube(e);
+    });
+
+    // ── UI wiring ────────────────────────────────────────────────────────────
+
+    const sceneSelect = document.getElementById('scene-select');
+    sceneSelect.addEventListener('change', () => loadScene(sceneSelect.value));
+
+    document.getElementById('btn-reset').addEventListener('click', () => {
+      loadScene(sceneSelect.value);
+    });
+
+    document.getElementById('btn-add-cube').addEventListener('click', () => {
+      const x = (Math.random() - 0.5) * 6;
+      const z = (Math.random() - 0.5) * 6;
+      addPhysicsCube(x, 6 + Math.random() * 3, z, 0.5, 0.5, 0.5, 0.5);
+    });
+
+    document.getElementById('btn-add-sphere').addEventListener('click', () => {
+      const x = (Math.random() - 0.5) * 6;
+      const z = (Math.random() - 0.5) * 6;
+      addPhysicsSphere(x, 6 + Math.random() * 3, z, 0.3 + Math.random() * 0.2);
+    });
+
+    // ── Resize ───────────────────────────────────────────────────────────────
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ── Sync physics -> Three.js meshes ──────────────────────────────────────
+
+    const _quat = new THREE.Quaternion();
+
+    function syncMeshes() {
+      for (const pair of bodyMeshPairs) {
+        const pos = pair.body.translation();
+        const rot = pair.body.rotation();
+        pair.mesh.position.set(pos.x, pos.y, pos.z);
+        _quat.set(rot.x, rot.y, rot.z, rot.w);
+        pair.mesh.quaternion.copy(_quat);
+      }
+    }
+
+    // ── FPS tracking ─────────────────────────────────────────────────────────
+
+    let frameCount = 0;
+    let lastFpsTime = performance.now();
+    let currentFps = 0;
+
+    const statFps = document.getElementById('stat-fps');
+    const statBodies = document.getElementById('stat-bodies');
+
+    // ── Game loop ────────────────────────────────────────────────────────────
+
+    function loop() {
+      requestAnimationFrame(loop);
+
+      // Step physics
+      if (world) {
+        world.step();
+      }
+
+      // Sync physics to meshes
+      syncMeshes();
+
+      // Update controls
+      controls.update();
+
+      // Render
+      renderer.render(scene, camera);
+
+      // FPS counter
+      frameCount++;
+      const now = performance.now();
+      if (now - lastFpsTime >= 1000) {
+        currentFps = frameCount;
+        frameCount = 0;
+        lastFpsTime = now;
+        statFps.textContent = currentFps;
+        statBodies.textContent = bodyMeshPairs.length;
+      }
+    }
+
+    // ── Boot ─────────────────────────────────────────────────────────────────
+
+    loadScene('stack');
+    loop();
+  </script>
+</body>
+</html>
