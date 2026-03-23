@@ -215,19 +215,65 @@ export class GPUSolver3D {
     this.cacheContacts();
     this.constraintRows = [...this.jointRows];
 
-    for (let i = 0; i < bodies.length; i++) {
-      const a = bodies[i];
-      const aabbA = getAABB3D(a);
-      for (let j = i + 1; j < bodies.length; j++) {
-        const b = bodies[j];
-        if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
-        const key = `${i}-${j}`;
-        if (this.ignorePairs.has(key)) continue;
-        if (!aabb3DOverlap(aabbA, getAABB3D(b))) continue;
-        const manifold = collide3D(a, b);
-        if (manifold) {
-          const rows = this.createContactRows3D(manifold, a, b);
-          this.constraintRows.push(...rows);
+    // Spatial hash broadphase: O(n) average instead of O(n²)
+    {
+      const n = bodies.length;
+      const aabbs = new Array(n);
+      for (let i = 0; i < n; i++) aabbs[i] = getAABB3D(bodies[i]);
+
+      let totalExtent = 0, dynCount = 0;
+      for (let i = 0; i < n; i++) {
+        if (bodies[i].type !== RigidBodyType.Fixed) {
+          const a = aabbs[i];
+          totalExtent += (a.max.x - a.min.x) + (a.max.y - a.min.y) + (a.max.z - a.min.z);
+          dynCount++;
+        }
+      }
+      const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 3)) * 2 : 1, 0.5);
+      const invCell = 1 / cellSize;
+
+      const grid = new Map<number, number[]>();
+      function hashKey3D(cx: number, cy: number, cz: number): number {
+        return ((cx + 0x400) * 0x100000) + ((cy + 0x400) * 0x800) + (cz + 0x400);
+      }
+
+      for (let i = 0; i < n; i++) {
+        const a = aabbs[i];
+        const x0 = Math.floor(a.min.x * invCell), x1 = Math.floor(a.max.x * invCell);
+        const y0 = Math.floor(a.min.y * invCell), y1 = Math.floor(a.max.y * invCell);
+        const z0 = Math.floor(a.min.z * invCell), z1 = Math.floor(a.max.z * invCell);
+        for (let cx = x0; cx <= x1; cx++) {
+          for (let cy = y0; cy <= y1; cy++) {
+            for (let cz = z0; cz <= z1; cz++) {
+              const k = hashKey3D(cx, cy, cz);
+              let cell = grid.get(k);
+              if (!cell) { cell = []; grid.set(k, cell); }
+              cell.push(i);
+            }
+          }
+        }
+      }
+
+      const tested = new Set<number>();
+      for (const cell of grid.values()) {
+        for (let ci = 0; ci < cell.length; ci++) {
+          const i = cell[ci];
+          for (let cj = ci + 1; cj < cell.length; cj++) {
+            const j = cell[cj];
+            const pk = i < j ? i * n + j : j * n + i;
+            if (tested.has(pk)) continue;
+            tested.add(pk);
+            const a = bodies[i], b = bodies[j];
+            if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
+            const key = `${i}-${j}`;
+            if (this.ignorePairs.has(key)) continue;
+            if (!aabb3DOverlap(aabbs[i], aabbs[j])) continue;
+            const manifold = collide3D(a, b);
+            if (manifold) {
+              const rows = this.createContactRows3D(manifold, a, b);
+              this.constraintRows.push(...rows);
+            }
+          }
         }
       }
     }
@@ -575,16 +621,18 @@ export class GPUSolver3D {
 
     device.queue.submit([copyEncoder.finish()]);
 
-    // Map and read final body positions
-    await bodyStagingBuffer.mapAsync(GPUMapMode.READ);
+    // Map ALL staging buffers in parallel — single GPU fence wait instead of 3 serial ones
+    const mapPromises: Promise<void>[] = [bodyStagingBuffer.mapAsync(GPUMapMode.READ)];
+    if (velRecoveryBuffer) mapPromises.push(velRecoveryBuffer.mapAsync(GPUMapMode.READ));
+    if (crStagingBuffer) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
+    await Promise.all(mapPromises);
+
     const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange().slice(0));
     bodyStagingBuffer.unmap();
     bodyStagingBuffer.destroy();
 
-    // Read pre-stabilization positions for velocity recovery (matches CPU behavior)
     let velRecoveryResult: Float32Array | null = null;
     if (velRecoveryBuffer) {
-      await velRecoveryBuffer.mapAsync(GPUMapMode.READ);
       velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange().slice(0));
       velRecoveryBuffer.unmap();
       velRecoveryBuffer.destroy();
@@ -644,9 +692,8 @@ export class GPUSolver3D {
       }
     }
 
-    // Readback constraint lambdas for warmstarting
+    // Readback constraint lambdas for warmstarting (already mapped via Promise.all above)
     if (crStagingBuffer && numConstraints > 0) {
-      await crStagingBuffer.mapAsync(GPUMapMode.READ);
       const crResult = new DataView(crStagingBuffer.getMappedRange().slice(0));
       crStagingBuffer.unmap();
       crStagingBuffer.destroy();

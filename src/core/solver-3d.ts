@@ -231,20 +231,66 @@ export class AVBDSolver3D {
     // 1. Clear contact rows, keep joint rows
     this.constraintRows = [...this.jointRows];
 
-    // 2. Broadphase + narrowphase
-    for (let i = 0; i < bodies.length; i++) {
-      const a = bodies[i];
-      const aabbA = getAABB3D(a);
-      for (let j = i + 1; j < bodies.length; j++) {
-        const b = bodies[j];
-        if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
-        const key = `${i}-${j}`;
-        if (this.ignorePairs.has(key)) continue;
-        if (!aabb3DOverlap(aabbA, getAABB3D(b))) continue;
-        const manifold = collide3D(a, b);
-        if (manifold) {
-          const rows = createContactRows3D(manifold, a, b, config.penaltyMin);
-          this.constraintRows.push(...rows);
+    // 2. Broadphase (spatial hash) + narrowphase
+    {
+      const n = bodies.length;
+      const aabbs = new Array(n);
+      for (let i = 0; i < n; i++) aabbs[i] = getAABB3D(bodies[i]);
+
+      // Cell size from average body extent
+      let totalExtent = 0, dynCount = 0;
+      for (let i = 0; i < n; i++) {
+        if (bodies[i].type !== RigidBodyType.Fixed) {
+          const a = aabbs[i];
+          totalExtent += (a.max.x - a.min.x) + (a.max.y - a.min.y) + (a.max.z - a.min.z);
+          dynCount++;
+        }
+      }
+      const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 3)) * 2 : 1, 0.5);
+      const invCell = 1 / cellSize;
+
+      const grid = new Map<number, number[]>();
+      function hashKey3D(cx: number, cy: number, cz: number): number {
+        return ((cx + 0x400) * 0x100000) + ((cy + 0x400) * 0x800) + (cz + 0x400);
+      }
+
+      for (let i = 0; i < n; i++) {
+        const a = aabbs[i];
+        const x0 = Math.floor(a.min.x * invCell), x1 = Math.floor(a.max.x * invCell);
+        const y0 = Math.floor(a.min.y * invCell), y1 = Math.floor(a.max.y * invCell);
+        const z0 = Math.floor(a.min.z * invCell), z1 = Math.floor(a.max.z * invCell);
+        for (let cx = x0; cx <= x1; cx++) {
+          for (let cy = y0; cy <= y1; cy++) {
+            for (let cz = z0; cz <= z1; cz++) {
+              const k = hashKey3D(cx, cy, cz);
+              let cell = grid.get(k);
+              if (!cell) { cell = []; grid.set(k, cell); }
+              cell.push(i);
+            }
+          }
+        }
+      }
+
+      const tested = new Set<number>();
+      for (const cell of grid.values()) {
+        for (let ci = 0; ci < cell.length; ci++) {
+          const i = cell[ci];
+          for (let cj = ci + 1; cj < cell.length; cj++) {
+            const j = cell[cj];
+            const pk = i < j ? i * n + j : j * n + i;
+            if (tested.has(pk)) continue;
+            tested.add(pk);
+            const a = bodies[i], b = bodies[j];
+            if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
+            const key = `${i}-${j}`;
+            if (this.ignorePairs.has(key)) continue;
+            if (!aabb3DOverlap(aabbs[i], aabbs[j])) continue;
+            const manifold = collide3D(a, b);
+            if (manifold) {
+              const rows = createContactRows3D(manifold, a, b, config.penaltyMin);
+              this.constraintRows.push(...rows);
+            }
+          }
         }
       }
     }

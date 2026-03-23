@@ -36,6 +36,11 @@ export interface IgnoreCollisionPair {
   bodyB: number;
 }
 
+/**
+ * Spatial hash grid for O(n) average-case broadphase collision detection.
+ * Each body is inserted into all grid cells its AABB overlaps.
+ * Potential collisions are only between bodies sharing a cell.
+ */
 function broadphase2D(
   bodyStore: BodyStore2D,
   ignorePairs: Set<string>,
@@ -43,29 +48,82 @@ function broadphase2D(
   const manifolds: ContactManifold2D[] = [];
   const bodies = bodyStore.bodies;
   const n = bodies.length;
+  if (n === 0) return manifolds;
+
+  // Compute all AABBs once
+  const aabbs = new Array(n);
+  for (let i = 0; i < n; i++) {
+    aabbs[i] = bodyStore.getAABB(bodies[i]);
+  }
+
+  // Choose cell size: ~2x the median body extent for good distribution
+  // For simplicity, use a fixed reasonable cell size
+  let totalExtent = 0;
+  let dynamicCount = 0;
+  for (let i = 0; i < n; i++) {
+    if (bodies[i].type === RigidBodyType.Dynamic) {
+      totalExtent += (aabbs[i].maxX - aabbs[i].minX) + (aabbs[i].maxY - aabbs[i].minY);
+      dynamicCount++;
+    }
+  }
+  const avgExtent = dynamicCount > 0 ? totalExtent / (dynamicCount * 2) : 1;
+  const cellSize = Math.max(avgExtent * 2, 0.5);
+  const invCell = 1 / cellSize;
+
+  // Insert bodies into spatial hash
+  const grid = new Map<number, number[]>();
+
+  function hashKey(cx: number, cy: number): number {
+    // Cantor pairing with offset for negative coords
+    const a = cx + 0x8000;
+    const b = cy + 0x8000;
+    return a * 0x10000 + b;
+  }
 
   for (let i = 0; i < n; i++) {
-    const a = bodies[i];
-    const aabbA = bodyStore.getAABB(a);
+    const aabb = aabbs[i];
+    const minCX = Math.floor(aabb.minX * invCell);
+    const minCY = Math.floor(aabb.minY * invCell);
+    const maxCX = Math.floor(aabb.maxX * invCell);
+    const maxCY = Math.floor(aabb.maxY * invCell);
 
-    for (let j = i + 1; j < n; j++) {
-      const b = bodies[j];
+    for (let cx = minCX; cx <= maxCX; cx++) {
+      for (let cy = minCY; cy <= maxCY; cy++) {
+        const key = hashKey(cx, cy);
+        let cell = grid.get(key);
+        if (!cell) { cell = []; grid.set(key, cell); }
+        cell.push(i);
+      }
+    }
+  }
 
-      // Skip pairs where neither body is dynamic
-      if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
+  // Check pairs within each cell
+  const tested = new Set<number>();
 
-      // Check ignore list
-      const key = i < j ? `${i}-${j}` : `${j}-${i}`;
-      if (ignorePairs.has(key)) continue;
+  for (const cell of grid.values()) {
+    for (let ci = 0; ci < cell.length; ci++) {
+      const i = cell[ci];
+      const a = bodies[i];
+      for (let cj = ci + 1; cj < cell.length; cj++) {
+        const j = cell[cj];
 
-      // AABB overlap test
-      const aabbB = bodyStore.getAABB(b);
-      if (!aabb2DOverlap(aabbA, aabbB)) continue;
+        // Deduplicate: each pair tested at most once
+        const pairKey = i < j ? i * n + j : j * n + i;
+        if (tested.has(pairKey)) continue;
+        tested.add(pairKey);
 
-      // Narrowphase
-      const manifold = collide2D(a, b);
-      if (manifold) {
-        manifolds.push(manifold);
+        const b = bodies[j];
+        if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
+
+        const strKey = i < j ? `${i}-${j}` : `${j}-${i}`;
+        if (ignorePairs.has(strKey)) continue;
+
+        // AABB overlap (already computed)
+        if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
+
+        // Narrowphase
+        const manifold = collide2D(a, b);
+        if (manifold) manifolds.push(manifold);
       }
     }
   }
