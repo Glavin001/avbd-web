@@ -105,6 +105,7 @@
         <option value="boxRain200">Box Rain (200)</option>
         <option value="largePyramid">Large Pyramid (120)</option>
         <option value="spherePile100">Sphere Pile (100)</option>
+        <option value="ballPit1000">Ball Pit (1,000)</option>
       </select>
       <button id="btn-reset">Reset</button>
       <button id="btn-add-cube">Add Cube</button>
@@ -307,6 +308,7 @@
         case 'boxRain200':   sceneBoxRain200(); break;
         case 'largePyramid': sceneLargePyramid(); break;
         case 'spherePile100': sceneSpherePile100(); break;
+        case 'ballPit1000':  sceneBallPit1000(); break;
       }
     }
 
@@ -402,6 +404,7 @@
         const mesh = createCubeMesh(w.hx, w.hy, w.hz, 0x333355);
         mesh.position.set(w.x, w.y, w.z);
         scene.add(mesh);
+        bodyMeshPairs.push({ body: wb, mesh, shape: 'cube', hx: w.hx, hy: w.hy, hz: w.hz });
       }
 
       for (let i = 0; i < 100; i++) {
@@ -409,6 +412,47 @@
         const z = (Math.random() - 0.5) * 3;
         const y = 1.5 + i * 0.35;
         addPhysicsSphere(x, y, z, 0.2 + Math.random() * 0.1);
+      }
+    }
+
+    function sceneBallPit1000() {
+      // Larger container for 1,000 spheres
+      const wallSpecs = [
+        { x: -5, y: 3, z: 0, hx: 0.2, hy: 3, hz: 5 },  // left
+        { x:  5, y: 3, z: 0, hx: 0.2, hy: 3, hz: 5 },  // right
+        { x: 0, y: 3, z: -5, hx: 5, hy: 3, hz: 0.2 },  // back
+        { x: 0, y: 3, z:  5, hx: 5, hy: 3, hz: 0.2 },  // front
+      ];
+      for (const w of wallSpecs) {
+        const wb = world.createRigidBody(
+          AVBD3D.RigidBodyDesc.fixed().setTranslation(w.x, w.y, w.z)
+        );
+        world.createCollider(AVBD3D.ColliderDesc.cuboid(w.hx, w.hy, w.hz), wb);
+        const mesh = createCubeMesh(w.hx, w.hy, w.hz, 0x333355);
+        mesh.position.set(w.x, w.y, w.z);
+        mesh.material.transparent = true;
+        mesh.material.opacity = 0.3;
+        scene.add(mesh);
+        bodyMeshPairs.push({ body: wb, mesh, shape: 'cube', hx: w.hx, hy: w.hy, hz: w.hz });
+      }
+
+      // Spawn 1,000 spheres in a 10x10x10 grid with jitter
+      const gridSize = 10;
+      const spacing = 0.65;
+      const rBase = 0.15;
+      let idx = 0;
+
+      for (let ly = 0; ly < gridSize && idx < 1000; ly++) {
+        for (let lz = 0; lz < gridSize && idx < 1000; lz++) {
+          for (let lx = 0; lx < gridSize && idx < 1000; lx++) {
+            const x = (lx - gridSize / 2 + 0.5) * spacing + (Math.random() - 0.5) * 0.1;
+            const y = 1.0 + ly * spacing;
+            const z = (lz - gridSize / 2 + 0.5) * spacing + (Math.random() - 0.5) * 0.1;
+            const r = rBase + Math.random() * 0.08;
+            addPhysicsSphere(x, y, z, r);
+            idx++;
+          }
+        }
       }
     }
 

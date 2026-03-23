@@ -126,6 +126,7 @@
       <option value="boxRain200">Box Rain (200)</option>
       <option value="largePyramid">Large Pyramid (120)</option>
       <option value="ballPit300">Ball Pit (300)</option>
+      <option value="ballPit1000">Ball Pit (1,000)</option>
     </select>
     <button id="btnReset">Reset</button>
     <button id="btnPause">Pause</button>
@@ -596,6 +597,40 @@
     }
 
     // ====================================================================
+    // Scene: Ball Pit (1,000 balls — stress test)
+    // ====================================================================
+
+    function sceneBallPit1000() {
+      // Spawn 1,000 balls in a grid pattern that fills the container
+      // Container is ~16 m wide (walls at ±8.2) — use most of it
+      const cols = 40;
+      const rows = 25;
+      const rBase = 0.10;
+      const spacing = 0.38;
+      const startX = -(cols - 1) * spacing / 2;
+      let idx = 0;
+
+      for (let row = 0; row < rows && idx < 1000; row++) {
+        const y = 0.8 + row * spacing;
+        const xOff = (row % 2) * spacing * 0.5; // Hexagonal packing
+        for (let col = 0; col < cols && idx < 1000; col++) {
+          const x = startX + col * spacing + xOff;
+          const r = rBase + Math.random() * 0.06;
+          const body = world.createRigidBody(
+            AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+          );
+          world.createCollider(
+            AVBD.ColliderDesc.ball(r)
+              .setDensity(1).setFriction(0.2).setRestitution(0.1),
+            body
+          );
+          bodies.push({ body, type: 'ball', radius: r, color: colorAt(idx) });
+          idx++;
+        }
+      }
+    }
+
+    // ====================================================================
     // Scene registry
     // ====================================================================
 
@@ -610,6 +645,7 @@
       boxRain200:   sceneBoxRain200,
       largePyramid: sceneLargePyramid,
       ballPit300:   sceneBallPit300,
+      ballPit1000:  sceneBallPit1000,
     };
 
     function loadScene(name) {
