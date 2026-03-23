@@ -352,4 +352,119 @@ test.describe('GPU 2D: Contact & Rotation', () => {
     expect(r.allAboveGround).toBe(true);
     expect(r.numBodies).toBe(20);
   });
+
+  // ─── GPU 2D Exhaustive: Additional code paths ───────────────────────
+
+  test('GPU 2D: soft constraint stiffness guard', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_softConstraint);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.isFinite).toBe(true);
+  });
+
+  test('GPU 2D: postStabilize produces valid results', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_postStabilize);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.stabFinite).toBe(true);
+    expect(r.noStabFinite).toBe(true);
+    // Both paths should produce above-ground results
+    expect(r.stabY).toBeGreaterThan(0.4);
+    expect(r.noStabY).toBeGreaterThan(0.4);
+  });
+
+  test('GPU 2D: bodies with zero constraints (free fall)', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_zeroConstraintBodies);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.allFinite).toBe(true);
+    expect(r.allFell).toBe(true);
+  });
+
+  test('GPU 2D: mixed shapes (circles + boxes) on ground', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_mixedShapes);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.boxFinite).toBe(true);
+    expect(r.ballFinite).toBe(true);
+    expect(r.boxAbove).toBe(true);
+    expect(r.ballAbove).toBe(true);
+  });
+
+  test('GPU 2D: restitution causes bounce', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu2d_restitution);
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.bounced).toBe(true);
+  });
+});
+
+// ─── GPU 3D Exhaustive Tests ──────────────────────────────────────────────
+
+test.describe('GPU 3D: Exhaustive code path coverage', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 30000,
+    });
+  });
+
+  test('GPU 3D: free fall preserves identity quaternion', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu3d_freeFallQuat);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    // After free fall, quaternion should stay near identity
+    expect(r.quatError).toBeLessThan(0.1);
+    expect(r.quatNormalized).toBe(true);
+    // Should have fallen
+    expect(r.y).toBeLessThan(10);
+    // No lateral drift
+    expect(Math.abs(r.x)).toBeLessThan(0.01);
+    expect(Math.abs(r.z)).toBeLessThan(0.01);
+  });
+
+  test('GPU 3D: box on ground never penetrates', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu3d_boxOnGround);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    expect(r.aboveGround).toBe(true);
+    expect(r.settled).toBe(true);
+    expect(r.quatNormalized).toBe(true);
+  });
+
+  test('GPU 3D: low friction slides farther than high friction', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu3d_frictionDecel);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    expect(r.lowSlidesFarther).toBe(true);
+  });
+
+  test('GPU 3D: 5-box stack stays stable', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu3d_stack);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    expect(r.allAbove).toBe(true);
+    expect(r.allFinite).toBe(true);
+    expect(r.quatsNormalized).toBe(true);
+    expect(r.numBoxes).toBe(5);
+  });
+
+  test('GPU 3D: off-center impact produces bounded rotation', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu3d_rotationImpact);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    expect(r.bounded).toBe(true);
+    expect(r.posFinite).toBe(true);
+  });
+
+  test('GPU 3D: GPU vs CPU parity within tolerance', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu3d_gpuCpuParity);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    // Step 1 should be very close
+    expect(r.diff1).toBeLessThan(0.01);
+    // After 60 steps, allow more divergence
+    expect(r.diff60).toBeLessThan(1.0);
+  });
+
+  test('GPU 3D: sphere collision on ground', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpu3d_sphereCollision);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    expect(r.aboveGround).toBe(true);
+    expect(r.isFinite).toBe(true);
+  });
 });

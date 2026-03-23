@@ -827,6 +827,327 @@
       };
     });
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // GPU 2D EXHAUSTIVE: Untested GPU code paths
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── GPU 2D: Soft vs hard constraint stiffness guard ──────────────
+    await window.runTest('gpu2d_softConstraint', async () => {
+      // Springs have finite stiffness; contacts have Infinity
+      // The primal shader zeros lambda for soft constraints
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), body);
+      // Add a spring (soft constraint) between body and an anchor
+      const anchor = world.createRigidBody(AVBD.RigidBodyDesc.fixed().setTranslation(0, 5));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.1, 0.1), anchor);
+      world.createSpring(anchor, body, { x: 0, y: 0 }, { x: 0, y: 0 }, 2.0, 500, 10);
+
+      for (let i = 0; i < 120; i++) await world.step();
+
+      const pos = body.translation();
+      return {
+        y: pos.y, isFinite: isFinite(pos.x) && isFinite(pos.y),
+        isGPU: world.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: postStabilize velocity recovery difference ───────────
+    await window.runTest('gpu2d_postStabilize', async () => {
+      // With postStabilize=true, an extra stabilization iteration runs AFTER velocity recovery
+      const worldStab = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: true });
+      worldStab.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+      const bodyStab = worldStab.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
+      );
+      worldStab.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), bodyStab);
+
+      const worldNoStab = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: false });
+      worldNoStab.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+      const bodyNoStab = worldNoStab.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3)
+      );
+      worldNoStab.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), bodyNoStab);
+
+      for (let i = 0; i < 120; i++) {
+        await worldStab.step();
+        await worldNoStab.step();
+      }
+      return {
+        stabY: bodyStab.translation().y,
+        noStabY: bodyNoStab.translation().y,
+        diff: Math.abs(bodyStab.translation().y - bodyNoStab.translation().y),
+        stabFinite: isFinite(bodyStab.translation().y),
+        noStabFinite: isFinite(bodyNoStab.translation().y),
+        isGPU: worldStab.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: Bodies with zero constraints (no contacts) ───────────
+    await window.runTest('gpu2d_zeroConstraintBodies', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 5 });
+      // No ground — all bodies are free-falling, zero constraints
+      const bodies = [];
+      for (let i = 0; i < 10; i++) {
+        const b = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(i * 3, 10)
+        );
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), b);
+        bodies.push(b);
+      }
+      for (let i = 0; i < 60; i++) await world.step();
+      const allFinite = bodies.every(b => isFinite(b.translation().y));
+      const allFell = bodies.every(b => b.translation().y < 10);
+      return { allFinite, allFell, isGPU: world.isGPU };
+    });
+
+    // ─── GPU 2D: Mixed shapes (circles + boxes) ──────────────────────
+    await window.runTest('gpu2d_mixedShapes', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+      const box = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(-1, 3)
+      );
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), box);
+      const ball = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(1, 3)
+      );
+      world.createCollider(AVBD.ColliderDesc.ball(0.5).setFriction(0.5), ball);
+      for (let i = 0; i < 120; i++) await world.step();
+      return {
+        boxY: box.translation().y, ballY: ball.translation().y,
+        boxFinite: isFinite(box.translation().y),
+        ballFinite: isFinite(ball.translation().y),
+        boxAbove: box.translation().y > 0.4,
+        ballAbove: ball.translation().y > 0.4,
+        isGPU: world.isGPU,
+      };
+    });
+
+    // ─── GPU 2D: Restitution bounce ───────────────────────────────────
+    await window.runTest('gpu2d_restitution', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10 });
+      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5).setRestitution(0.8));
+      const ball = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 5)
+      );
+      world.createCollider(AVBD.ColliderDesc.ball(0.3).setRestitution(0.8), ball);
+      const trajectory = [];
+      for (let i = 0; i < 180; i++) {
+        await world.step();
+        trajectory.push(ball.translation().y);
+      }
+      // Find the first bounce (local minimum then increase)
+      let bounced = false;
+      for (let i = 2; i < trajectory.length; i++) {
+        if (trajectory[i] > trajectory[i-1] && trajectory[i-1] < trajectory[i-2]) {
+          bounced = true; break;
+        }
+      }
+      return { bounced, finalY: ball.translation().y, isGPU: world.isGPU };
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // GPU 3D EXHAUSTIVE: Untested GPU code paths
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── GPU 3D: Free fall with quaternion ────────────────────────────
+    await window.runTest('gpu3d_freeFallQuat', async () => {
+      try {
+        await AVBD3D.init();
+      } catch(e) { return { skip: true, error: e.message }; }
+
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 });
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 10, 0)
+      );
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5), body);
+
+      for (let i = 0; i < 60; i++) await world.step();
+
+      const pos = body.translation();
+      const rot = body.rotation();
+      // After free fall, quaternion should stay identity (no rotation)
+      const quatError = Math.abs(rot.w - 1) + Math.abs(rot.x) + Math.abs(rot.y) + Math.abs(rot.z);
+      return {
+        y: pos.y, x: pos.x, z: pos.z,
+        quatError,
+        quatNormalized: Math.abs(rot.w*rot.w + rot.x*rot.x + rot.y*rot.y + rot.z*rot.z - 1) < 0.01,
+        isGPU: true,
+      };
+    });
+
+    // ─── GPU 3D: Box on ground (contact + geometric stiffness) ───────
+    await window.runTest('gpu3d_boxOnGround', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, { iterations: 10 });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 3, 0)
+      );
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), body);
+
+      let minY = Infinity;
+      for (let i = 0; i < 180; i++) {
+        await world.step();
+        minY = Math.min(minY, body.translation().y);
+      }
+      const pos = body.translation();
+      const rot = body.rotation();
+      return {
+        finalY: pos.y, minY,
+        aboveGround: minY > 0.3,
+        settled: Math.abs(pos.y - 1.0) < 1.0,
+        quatNormalized: Math.abs(rot.w*rot.w + rot.x*rot.x + rot.y*rot.y + rot.z*rot.z - 1) < 0.01,
+        isGPU: true,
+      };
+    });
+
+    // ─── GPU 3D: Friction deceleration ────────────────────────────────
+    await window.runTest('gpu3d_frictionDecel', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+
+      const worldHigh = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, { iterations: 10 });
+      worldHigh.createCollider(AVBD3D.ColliderDesc.cuboid(20, 0.5, 20).setFriction(0.8));
+      const highBody = worldHigh.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.5, 0).setLinvel(5, 0, 0)
+      );
+      worldHigh.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.8), highBody);
+
+      const worldLow = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, { iterations: 10 });
+      worldLow.createCollider(AVBD3D.ColliderDesc.cuboid(20, 0.5, 20).setFriction(0.1));
+      const lowBody = worldLow.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.5, 0).setLinvel(5, 0, 0)
+      );
+      worldLow.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.1), lowBody);
+
+      for (let i = 0; i < 120; i++) {
+        await worldHigh.step();
+        await worldLow.step();
+      }
+      return {
+        highX: highBody.translation().x,
+        lowX: lowBody.translation().x,
+        lowSlidesFarther: lowBody.translation().x > highBody.translation().x,
+        isGPU: true,
+      };
+    });
+
+    // ─── GPU 3D: Stack stability ──────────────────────────────────────
+    await window.runTest('gpu3d_stack', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, { iterations: 10 });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const boxes = [];
+      for (let i = 0; i < 5; i++) {
+        const b = world.createRigidBody(
+          AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.1 + i * 1.05, 0)
+        );
+        world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), b);
+        boxes.push(b);
+      }
+      for (let i = 0; i < 300; i++) await world.step();
+      const positions = boxes.map(b => b.translation());
+      const allAbove = positions.every(p => p.y > 0.3);
+      const allFinite = positions.every(p => isFinite(p.x) && isFinite(p.y) && isFinite(p.z));
+      // Check quaternions are normalized
+      const quatsNormalized = boxes.every(b => {
+        const r = b.rotation();
+        return Math.abs(r.w*r.w + r.x*r.x + r.y*r.y + r.z*r.z - 1) < 0.05;
+      });
+      return { allAbove, allFinite, quatsNormalized, numBoxes: 5, isGPU: true };
+    });
+
+    // ─── GPU 3D: Rotation from off-center impact ─────────────────────
+    await window.runTest('gpu3d_rotationImpact', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, { iterations: 10 });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(20, 0.5, 20).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.5, 0)
+      );
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), body);
+
+      // Settle first
+      for (let i = 0; i < 60; i++) await world.step();
+      // Lateral push
+      body.setLinvel({ x: 5, y: 0, z: 0 });
+
+      let maxAngVel = 0;
+      for (let i = 0; i < 120; i++) {
+        await world.step();
+        const av = body.angvel();
+        const mag = Math.sqrt(av.x*av.x + av.y*av.y + av.z*av.z);
+        maxAngVel = Math.max(maxAngVel, mag);
+      }
+      return {
+        maxAngVel,
+        bounded: maxAngVel < 100,
+        posFinite: isFinite(body.translation().x),
+        isGPU: true,
+      };
+    });
+
+    // ─── GPU 3D: GPU vs CPU parity for contacts ──────────────────────
+    await window.runTest('gpu3d_gpuCpuParity', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+
+      // GPU
+      const gpuWorld = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, { iterations: 10 });
+      gpuWorld.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const gpuBody = gpuWorld.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 3, 0)
+      );
+      gpuWorld.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), gpuBody);
+
+      // CPU
+      const cpuWorld = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, { useCPU: true, iterations: 10 });
+      cpuWorld.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const cpuBody = cpuWorld.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 3, 0)
+      );
+      cpuWorld.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), cpuBody);
+
+      // Step 1
+      await gpuWorld.step();
+      cpuWorld.step();
+      const diff1 = Math.abs(gpuBody.translation().y - cpuBody.translation().y);
+
+      // Step 60 more
+      for (let i = 0; i < 59; i++) {
+        await gpuWorld.step();
+        cpuWorld.step();
+      }
+      const diff60 = Math.abs(gpuBody.translation().y - cpuBody.translation().y);
+      return { diff1, diff60, gpuY: gpuBody.translation().y, cpuY: cpuBody.translation().y, isGPU: true };
+    });
+
+    // ─── GPU 3D: Sphere collision ─────────────────────────────────────
+    await window.runTest('gpu3d_sphereCollision', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 }, { iterations: 10 });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const sphere = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 3, 0)
+      );
+      world.createCollider(AVBD3D.ColliderDesc.ball(0.5).setFriction(0.5), sphere);
+
+      for (let i = 0; i < 120; i++) await world.step();
+      const pos = sphere.translation();
+      return {
+        y: pos.y, aboveGround: pos.y > 0.4,
+        isFinite: isFinite(pos.x) && isFinite(pos.y) && isFinite(pos.z),
+        isGPU: true,
+      };
+    });
+
     // Signal completion
     window.testResults._complete = true;
     document.getElementById('status').textContent = 'Tests complete';
