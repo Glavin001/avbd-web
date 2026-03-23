@@ -123,6 +123,9 @@
       <option value="friction">Friction</option>
       <option value="fracture">Fracture</option>
       <option value="jointGrid">Joint Grid</option>
+      <option value="boxRain200">Box Rain (200)</option>
+      <option value="largePyramid">Large Pyramid (120)</option>
+      <option value="ballPit300">Ball Pit (300)</option>
     </select>
     <button id="btnReset">Reset</button>
     <button id="btnPause">Pause</button>
@@ -521,17 +524,92 @@
     }
 
     // ====================================================================
+    // Scene: Box Rain (200 bodies raining down)
+    // ====================================================================
+
+    function sceneBoxRain200() {
+      const numBodies = 200;
+      const cols = 15;
+      for (let i = 0; i < numBodies; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const x = (col - cols / 2) * 0.75 + (Math.random() - 0.5) * 0.1;
+        const y = 1.5 + row * 0.75;
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+        );
+        const size = 0.2 + Math.random() * 0.15;
+        world.createCollider(
+          AVBD.ColliderDesc.cuboid(size, size)
+            .setDensity(1).setFriction(0.4).setRestitution(0.05),
+          body
+        );
+        bodies.push({ body, type: 'box', hw: size, hh: size, color: colorAt(i) });
+      }
+    }
+
+    // ====================================================================
+    // Scene: Large Pyramid (120 boxes, 15 rows)
+    // ====================================================================
+
+    function sceneLargePyramid() {
+      const rows = 15;
+      let idx = 0;
+      for (let row = 0; row < rows; row++) {
+        const count = rows - row;
+        const offset = -(count - 1) * 0.52;
+        for (let col = 0; col < count; col++) {
+          const x = offset + col * 1.04;
+          const y = 0.8 + row * 1.02;
+          const body = world.createRigidBody(
+            AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+          );
+          world.createCollider(
+            AVBD.ColliderDesc.cuboid(0.48, 0.48)
+              .setDensity(1).setFriction(0.5).setRestitution(0.02),
+            body
+          );
+          bodies.push({ body, type: 'box', hw: 0.48, hh: 0.48, color: colorAt(idx++) });
+        }
+      }
+    }
+
+    // ====================================================================
+    // Scene: Ball Pit (300 balls in a container)
+    // ====================================================================
+
+    function sceneBallPit300() {
+      for (let i = 0; i < 300; i++) {
+        const x = (Math.random() - 0.5) * 8;
+        const y = 1.5 + i * 0.15;
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+        );
+        const r = 0.12 + Math.random() * 0.08;
+        world.createCollider(
+          AVBD.ColliderDesc.ball(r)
+            .setDensity(1).setFriction(0.3).setRestitution(0.15),
+          body
+        );
+        bodies.push({ body, type: 'ball', radius: r, color: colorAt(i) });
+      }
+    }
+
+    // ====================================================================
     // Scene registry
     // ====================================================================
 
     const SCENES = {
-      stack:     sceneStack,
-      pyramid:   scenePyramid,
-      rope:      sceneRope,
-      heavyRope: sceneHeavyRope,
-      friction:  sceneFriction,
-      fracture:  sceneFracture,
-      jointGrid: sceneJointGrid,
+      stack:        sceneStack,
+      pyramid:      scenePyramid,
+      rope:         sceneRope,
+      heavyRope:    sceneHeavyRope,
+      friction:     sceneFriction,
+      fracture:     sceneFracture,
+      jointGrid:    sceneJointGrid,
+      boxRain200:   sceneBoxRain200,
+      largePyramid: sceneLargePyramid,
+      ballPit300:   sceneBallPit300,
     };
 
     function loadScene(name) {

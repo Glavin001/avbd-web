@@ -102,6 +102,9 @@
         <option value="stack" selected>Stack</option>
         <option value="pyramid">Pyramid</option>
         <option value="friction">Friction</option>
+        <option value="boxRain200">Box Rain (200)</option>
+        <option value="largePyramid">Large Pyramid (120)</option>
+        <option value="spherePile100">Sphere Pile (100)</option>
       </select>
       <button id="btn-reset">Reset</button>
       <button id="btn-add-cube">Add Cube</button>
@@ -297,18 +300,13 @@
       createWorld();
 
       switch (name) {
-        case 'ground':
-          sceneGround();
-          break;
-        case 'stack':
-          sceneStack();
-          break;
-        case 'pyramid':
-          scenePyramid();
-          break;
-        case 'friction':
-          sceneFriction();
-          break;
+        case 'ground':       sceneGround(); break;
+        case 'stack':        sceneStack(); break;
+        case 'pyramid':      scenePyramid(); break;
+        case 'friction':     sceneFriction(); break;
+        case 'boxRain200':   sceneBoxRain200(); break;
+        case 'largePyramid': sceneLargePyramid(); break;
+        case 'spherePile100': sceneSpherePile100(); break;
       }
     }
 
@@ -352,9 +350,66 @@
         // Give each cube a lateral push to see friction differences
         body.setLinvel({ x: 3, y: 0, z: 0 });
       }
+    }
 
-      // Labels in the scene - small cubes as markers at ground level
-      // (visual indicator of friction values)
+    function sceneBoxRain200() {
+      const cols = 10;
+      const rows = 10;
+      const zLayers = 2;
+      let count = 0;
+      for (let layer = 0; layer < zLayers; layer++) {
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            if (count >= 200) break;
+            const x = (c - cols / 2) * 1.2 + (Math.random() - 0.5) * 0.1;
+            const z = (layer - 0.5) * 1.5 + (Math.random() - 0.5) * 0.1;
+            const y = 1.5 + r * 1.1 + layer * rows * 1.1;
+            addPhysicsCube(x, y, z, 0.4, 0.4, 0.4, 0.4);
+            count++;
+          }
+        }
+      }
+    }
+
+    function sceneLargePyramid() {
+      const hx = 0.45, hy = 0.45, hz = 0.45;
+      const layers = 10;
+      for (let row = 0; row < layers; row++) {
+        const count = layers - row;
+        const offsetX = -(count - 1) * hx;
+        for (let col = 0; col < count; col++) {
+          const x = offsetX + col * (hx * 2 + 0.05);
+          const y = 0.5 + hy + row * (hy * 2 + 0.05);
+          const color = CUBE_COLORS[(row * 7 + col) % CUBE_COLORS.length];
+          addPhysicsCube(x, y, 0, hx, hy, hz, 0.5, color);
+        }
+      }
+    }
+
+    function sceneSpherePile100() {
+      // Walls to contain spheres
+      const wallSpecs = [
+        { x: -3, y: 2, z: 0, hx: 0.2, hy: 2, hz: 3 },
+        { x: 3, y: 2, z: 0, hx: 0.2, hy: 2, hz: 3 },
+        { x: 0, y: 2, z: -3, hx: 3, hy: 2, hz: 0.2 },
+        { x: 0, y: 2, z: 3, hx: 3, hy: 2, hz: 0.2 },
+      ];
+      for (const w of wallSpecs) {
+        const wb = world.createRigidBody(
+          AVBD3D.RigidBodyDesc.fixed().setTranslation(w.x, w.y, w.z)
+        );
+        world.createCollider(AVBD3D.ColliderDesc.cuboid(w.hx, w.hy, w.hz), wb);
+        const mesh = createCubeMesh(w.hx, w.hy, w.hz, 0x333355);
+        mesh.position.set(w.x, w.y, w.z);
+        scene.add(mesh);
+      }
+
+      for (let i = 0; i < 100; i++) {
+        const x = (Math.random() - 0.5) * 3;
+        const z = (Math.random() - 0.5) * 3;
+        const y = 1.5 + i * 0.35;
+        addPhysicsSphere(x, y, z, 0.2 + Math.random() * 0.1);
+      }
     }
 
     // ── Shooting cubes ───────────────────────────────────────────────────────
