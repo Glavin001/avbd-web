@@ -26,8 +26,11 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
-      - name: Build
+      - name: Build library
         run: npm run build
+
+      - name: Build demo
+        run: npm run build:demo
 
       - name: Unit tests
         run: npm test

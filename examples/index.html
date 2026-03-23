@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AVBD Physics — WebGPU Demo</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0f0f23; color: #ccc; font-family: 'Segoe UI', system-ui, sans-serif; }
+    .hero { text-align: center; padding: 60px 20px 40px; }
+    .hero h1 { font-size: 36px; color: #e94560; margin-bottom: 8px; }
+    .hero p { font-size: 16px; color: #888; max-width: 600px; margin: 0 auto; line-height: 1.5; }
+    .demos { display: flex; justify-content: center; gap: 24px; padding: 30px 20px; flex-wrap: wrap; }
+    .card {
+      background: #1a1a2e; border: 1px solid #333; border-radius: 12px;
+      padding: 30px; width: 300px; text-align: center; text-decoration: none;
+      color: #ccc; transition: border-color 0.2s, transform 0.2s;
+    }
+    .card:hover { border-color: #e94560; transform: translateY(-3px); }
+    .card h2 { color: #eee; font-size: 22px; margin-bottom: 8px; }
+    .card p { font-size: 14px; color: #888; line-height: 1.4; }
+    .badge {
+      display: inline-block; background: #16213e; border: 1px solid #0f3460;
+      padding: 4px 10px; border-radius: 12px; font-size: 11px; margin-top: 12px; color: #8bc6fc;
+    }
+    .footer { text-align: center; padding: 40px 20px; color: #555; font-size: 13px; }
+    .footer a { color: #e94560; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <h1>AVBD Physics Engine</h1>
+    <p>
+      WebGPU-accelerated rigid body physics based on
+      Augmented Vertex Block Descent (SIGGRAPH 2025).
+      Real-time simulation with GPU compute shaders.
+    </p>
+  </div>
+  <div class="demos">
+    <a class="card" href="/demo-2d.html">
+      <h2>2D Demo</h2>
+      <p>Boxes, balls, stacking, pyramids. Interactive canvas with GPU-accelerated contact and friction.</p>
+      <span class="badge">WebGPU Compute</span>
+    </a>
+    <a class="card" href="/demo-3d.html">
+      <h2>3D Demo</h2>
+      <p>Cubes and spheres in isometric view. 3D rigid body simulation with gravity and collisions.</p>
+      <span class="badge">Isometric Canvas</span>
+    </a>
+  </div>
+  <div class="footer">
+    <a href="https://graphics.cs.utah.edu/research/projects/avbd/">AVBD Paper</a>
+    &middot; SIGGRAPH 2025
+  </div>
+</body>
+</html>
