@@ -205,12 +205,12 @@ export class ConstraintStore {
 
       const cached = this.contactCache.get(key);
       if (cached) {
-        row.lambda = cached.normalLambda;
-        // Cap warmstarted penalty to prevent explosive forces from stale high-penalty contacts.
-        // Without this cap, a single high-penalty frame can cascade into instability.
+        // Only warmstart penalty, NOT lambda. Lambda from a previous frame's contact
+        // may have a different Jacobian direction (different contact normal/point),
+        // and applying it to the new contact creates forces in the wrong direction —
+        // the root cause of the pyramid spinning instability.
         const MAX_WARMSTART_PENALTY = 1e5;
         row.penalty = Math.min(cached.normalPenalty, MAX_WARMSTART_PENALTY);
-        frictionRow.lambda = cached.frictionLambda;
         frictionRow.penalty = Math.min(cached.frictionPenalty, MAX_WARMSTART_PENALTY);
       }
       i++; // Skip the friction row we just processed

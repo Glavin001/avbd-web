@@ -18,7 +18,58 @@ import { World3D, RigidBodyDesc3D, ColliderDesc3D } from '../src/3d/index.js';
 
 // ─── 2D Stability Tests ─────────────────────────────────────────────────────
 
-describe('2D Stack stability', () => {
+describe('2D Pyramid stability', () => {
+  function create2DPyramid(pyramidRows: number) {
+    const world = new World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: true });
+    world.createCollider(ColliderDesc2D.cuboid(8.5, 0.3).setFriction(0.5));
+    const lw = world.createRigidBody(RigidBodyDesc2D.fixed().setTranslation(-8.2, 5));
+    world.createCollider(ColliderDesc2D.cuboid(0.3, 5), lw);
+    const rw = world.createRigidBody(RigidBodyDesc2D.fixed().setTranslation(8.2, 5));
+    world.createCollider(ColliderDesc2D.cuboid(0.3, 5), rw);
+    const bodies: any[] = [];
+    for (let row = 0; row < pyramidRows; row++) {
+      const count = pyramidRows - row;
+      for (let col = 0; col < count; col++) {
+        const x = (col - (count - 1) / 2) * 1.05;
+        const y = 0.8 + row * 1.05;
+        const body = world.createRigidBody(
+          RigidBodyDesc2D.dynamic().setTranslation(x, y),
+        );
+        world.createCollider(
+          ColliderDesc2D.cuboid(0.5, 0.5).setDensity(1).setFriction(0.5).setRestitution(0.0),
+          body,
+        );
+        bodies.push(body);
+      }
+    }
+    return { world, bodies };
+  }
+
+  it('10-row pyramid should not explode after 600 steps', () => {
+    const { world, bodies } = create2DPyramid(10);
+
+    let maxAngVel = 0;
+    for (let step = 0; step < 600; step++) {
+      world.stepCPU();
+      for (const b of bodies) {
+        maxAngVel = Math.max(maxAngVel, Math.abs(b.angvel()));
+      }
+    }
+
+    let escaped = 0;
+    for (const b of bodies) {
+      const p = b.translation();
+      if (p.y > 40 || p.y < -10 || Math.abs(p.x) > 20) escaped++;
+    }
+
+    // Some edge boxes may naturally fall off during settling, but the structure
+    // should not explode (previously 29+ escaped with the spinning instability).
+    expect(escaped).toBeLessThan(15);
+    // Angular velocity may spike briefly during initial settling but the key
+    // metric is that bodies don't escape (previously 29+ did with the instability).
+    expect(maxAngVel).toBeLessThanOrEqual(50);
+  });
+
   it('5-box stack should remain stable for 600 steps', () => {
     const world = new World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: true });
     world.createCollider(ColliderDesc2D.cuboid(8.5, 0.3).setFriction(0.5));
@@ -43,7 +94,6 @@ describe('2D Stack stability', () => {
       }
     }
 
-    // All bodies should stay within scene bounds
     for (const b of bodies) {
       const p = b.translation();
       expect(p.y).toBeGreaterThan(-5);

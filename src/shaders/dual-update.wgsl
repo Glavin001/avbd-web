@@ -80,7 +80,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Normal contact rows have fmin=-inf; friction rows have finite Coulomb bounds.
   let is_friction = cr.force_type == 0u && cr.fmin > -1e30;
   if (!is_friction && cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
-    cr.penalty += params.beta * abs(c_eval);
+    let increment = params.beta * abs(c_eval);
+    let max_increment = cr.penalty * 0.5;
+    cr.penalty += min(increment, max_increment);
   }
   cr.penalty = clamp(cr.penalty, params.penalty_min, params.penalty_max);
   if (cr.penalty > cr.stiffness) {

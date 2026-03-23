@@ -419,7 +419,9 @@ export class AVBDSolver2D {
     // Normal contact rows have fmin=-Infinity; friction rows have finite Coulomb bounds.
     const isFrictionRow = row.type === ForceType.Contact && isFinite(row.fmin);
     if (!isFrictionRow && row.lambda > row.fmin && row.lambda < row.fmax) {
-      row.penalty += this.config.beta * Math.abs(cEval);
+      const increment = this.config.beta * Math.abs(cEval);
+      const maxIncrement = row.penalty * 0.5;
+      row.penalty += Math.min(increment, maxIncrement);
     }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) {
