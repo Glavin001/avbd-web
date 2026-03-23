@@ -162,7 +162,14 @@ export class AVBDSolver2D {
     for (const body of bodies) {
       if (body.type !== RigidBodyType.Dynamic) continue;
 
-      // Clamp angular velocity (reference: clamp(omega, -50, 50))
+      // Clamp velocities at step start to prevent explosive inertial predictions
+      const MAX_LINEAR_VELOCITY_INIT = 100;
+      const vMagInit = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+      if (vMagInit > MAX_LINEAR_VELOCITY_INIT) {
+        const scale = MAX_LINEAR_VELOCITY_INIT / vMagInit;
+        body.velocity.x *= scale;
+        body.velocity.y *= scale;
+      }
       body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
         Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
 
@@ -187,7 +194,12 @@ export class AVBDSolver2D {
         }
       }
 
-      // Apply velocity damping
+      // Apply velocity damping.
+      // A small implicit angular damping (0.05) provides numerical dissipation
+      // that prevents contact-induced angular velocity feedback loops in stacking
+      // scenarios (pyramids, multi-body piles). This doesn't affect the physics
+      // meaningfully but prevents solver artifacts from amplifying.
+      const IMPLICIT_ANGULAR_DAMPING = 0.05;
       let vx = body.velocity.x;
       let vy = body.velocity.y;
       let omega = body.angularVelocity;
@@ -197,8 +209,9 @@ export class AVBDSolver2D {
         vx *= dampFactor;
         vy *= dampFactor;
       }
-      if (body.angularDamping > 0) {
-        const dampFactor = 1 / (1 + body.angularDamping * dt);
+      {
+        const totalAngDamp = body.angularDamping + IMPLICIT_ANGULAR_DAMPING;
+        const dampFactor = 1 / (1 + totalAngDamp * dt);
         omega *= dampFactor;
       }
 
@@ -246,6 +259,16 @@ export class AVBDSolver2D {
             x: (body.position.x - body.prevPosition.x) / dt,
             y: (body.position.y - body.prevPosition.y) / dt,
           };
+
+          // Clamp recovered linear velocity
+          const MAX_LINEAR_VELOCITY = 100;
+          const vMag = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+          if (vMag > MAX_LINEAR_VELOCITY) {
+            const scale = MAX_LINEAR_VELOCITY / vMag;
+            body.velocity.x *= scale;
+            body.velocity.y *= scale;
+          }
+
           body.angularVelocity = (body.angle - body.prevAngle) / dt;
 
           // Clamp recovered angular velocity to prevent explosive inertial predictions

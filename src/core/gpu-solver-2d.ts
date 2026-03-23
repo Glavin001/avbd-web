@@ -255,7 +255,7 @@ export class GPUSolver2D {
 
       let vx = body.velocity.x, vy = body.velocity.y, omega = body.angularVelocity;
       if (body.linearDamping > 0) { const f = 1 / (1 + body.linearDamping * dt); vx *= f; vy *= f; }
-      if (body.angularDamping > 0) { omega *= 1 / (1 + body.angularDamping * dt); }
+      { const totalAngDamp = body.angularDamping + 0.05; omega *= 1 / (1 + totalAngDamp * dt); }
 
       body.inertialPosition = {
         x: body.position.x + vx * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
@@ -536,11 +536,23 @@ export class GPUSolver2D {
       body.angle = bodyResult[off + 2];
 
       // BDF1 velocity recovery from pre-stabilization positions
+      const MAX_LINEAR_VELOCITY = 100;
+      const MAX_ANGULAR_VELOCITY = 50;
       body.velocity = {
         x: (velSource[off + 0] - body.prevPosition.x) / dt,
         y: (velSource[off + 1] - body.prevPosition.y) / dt,
       };
+      // Clamp recovered linear velocity
+      const vMag = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+      if (vMag > MAX_LINEAR_VELOCITY) {
+        const scale = MAX_LINEAR_VELOCITY / vMag;
+        body.velocity.x *= scale;
+        body.velocity.y *= scale;
+      }
       body.angularVelocity = (velSource[off + 2] - body.prevAngle) / dt;
+      // Clamp recovered angular velocity
+      body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
+        Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
     }
 
     // Readback constraint lambdas for warmstarting

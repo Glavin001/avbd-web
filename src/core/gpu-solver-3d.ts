@@ -275,6 +275,10 @@ export class GPUSolver3D {
         }
       }
 
+      // Implicit angular damping
+      const angDampFactor = 1 / (1 + 0.05 * dt);
+      body.angularVelocity = vec3Scale(body.angularVelocity, angDampFactor);
+
       body.inertialPosition = {
         x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
         y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
@@ -591,12 +595,19 @@ export class GPUSolver3D {
       body.rotation.z = bodyResult[off + 6];
 
       // BDF1 velocity recovery from pre-stabilization positions
+      const MAX_LIN_VEL = 100;
+      const MAX_ANG_VEL = 50;
       const voff = i * BODY_STRIDE;
       body.velocity = {
         x: (velSource[voff + 0] - body.prevPosition.x) / dt,
         y: (velSource[voff + 1] - body.prevPosition.y) / dt,
         z: (velSource[voff + 2] - body.prevPosition.z) / dt,
       };
+      // Clamp recovered linear velocity
+      const vLen = vec3Length(body.velocity);
+      if (vLen > MAX_LIN_VEL) {
+        body.velocity = vec3Scale(body.velocity, MAX_LIN_VEL / vLen);
+      }
       // Angular velocity from quaternion difference (using pre-stabilization rotation)
       const vqw = velSource[voff + 3];
       const vqx = velSource[voff + 4];
@@ -612,6 +623,11 @@ export class GPUSolver3D {
         },
       );
       body.angularVelocity = vec3Scale(vec3(dq.x, dq.y, dq.z), 2 / dt);
+      // Clamp recovered angular velocity
+      const wLen = vec3Length(body.angularVelocity);
+      if (wLen > MAX_ANG_VEL) {
+        body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / wLen);
+      }
     }
 
     // Readback constraint lambdas for warmstarting

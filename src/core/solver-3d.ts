@@ -255,14 +255,53 @@ export class AVBDSolver3D {
     }
 
     // 4. Initialize bodies
+    const MAX_ANG_VEL = 50;
+    const MAX_LIN_VEL = 100;
+    const gravMag = vec3Length(gravity);
+
     for (const body of bodies) {
       if (body.type === RigidBodyType.Fixed) continue;
+
+      // Clamp velocities at step start to prevent explosive inertial predictions
+      const linSpeed = vec3Length(body.velocity);
+      if (linSpeed > MAX_LIN_VEL) {
+        body.velocity = vec3Scale(body.velocity, MAX_LIN_VEL / linSpeed);
+      }
+      const angSpeed = vec3Length(body.angularVelocity);
+      if (angSpeed > MAX_ANG_VEL) {
+        body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / angSpeed);
+      }
+
+      // Implicit angular damping: prevents contact-induced angular velocity
+      // feedback loops in stacking scenarios (pyramids, multi-body piles).
+      const IMPLICIT_ANGULAR_DAMPING = 0.05;
+      const angDampFactor = 1 / (1 + IMPLICIT_ANGULAR_DAMPING * dt);
+      body.angularVelocity = vec3Scale(body.angularVelocity, angDampFactor);
+
       body.prevPosition = { ...body.position };
       body.prevRotation = { ...body.rotation };
+
+      // Adaptive gravity weighting (from 2D reference solver):
+      // Bodies under support get less gravity in the inertial estimate,
+      // preventing artificial penetrations that cause explosive corrections.
+      let gravWeight = 1;
+      if (gravMag > 0 && body.prevVelocity) {
+        const dvx = body.velocity.x - body.prevVelocity.x;
+        const dvy = body.velocity.y - body.prevVelocity.y;
+        const dvz = body.velocity.z - body.prevVelocity.z;
+        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+        if (dvMag > 0.01) {
+          const gravDir = vec3Scale(gravity, 1 / gravMag);
+          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
+          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        }
+      }
+      body.prevVelocity = { ...body.velocity };
+
       body.inertialPosition = {
-        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * dt * dt,
-        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * dt * dt,
-        z: body.position.z + body.velocity.z * dt + gravity.z * body.gravityScale * dt * dt,
+        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
+        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+        z: body.position.z + body.velocity.z * dt + gravity.z * body.gravityScale * gravWeight * dt * dt,
       };
       // Inertial rotation: integrate angular velocity
       const wLen = vec3Length(body.angularVelocity);
@@ -318,10 +357,16 @@ export class AVBDSolver3D {
 
       // Velocity recovery at iteration N-1
       if (iter === config.iterations - 1) {
-        const MAX_ANG_VEL = 50;
         for (const body of bodies) {
           if (body.type === RigidBodyType.Fixed) continue;
           body.velocity = vec3Scale(vec3Sub(body.position, body.prevPosition), 1 / dt);
+
+          // Clamp recovered linear velocity
+          const vLen = vec3Length(body.velocity);
+          if (vLen > MAX_LIN_VEL) {
+            body.velocity = vec3Scale(body.velocity, MAX_LIN_VEL / vLen);
+          }
+
           // Angular velocity from quaternion difference
           const dq = quatMul(body.rotation, {
             w: body.prevRotation.w,
@@ -331,7 +376,7 @@ export class AVBDSolver3D {
           });
           body.angularVelocity = vec3Scale(vec3(dq.x, dq.y, dq.z), 2 / dt);
 
-          // Clamp recovered angular velocity to prevent explosive inertial predictions
+          // Clamp recovered angular velocity
           const wLen = vec3Length(body.angularVelocity);
           if (wLen > MAX_ANG_VEL) {
             body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / wLen);
@@ -478,7 +523,12 @@ export class AVBDSolver3D {
     // should stay low to avoid stiff angular springs that cause spinning instability.
     const isFrictionRow = row.type === ForceType.Contact && isFinite(row.fmin);
     if (!isFrictionRow && row.lambda > row.fmin && row.lambda < row.fmax) {
-      row.penalty += this.config.beta * Math.abs(cEval);
+      // Cap the per-iteration penalty increase to prevent exponential growth
+      // that causes explosive forces in many-body scenes (pyramids, stacks).
+      // Allow at most 50% growth per iteration (1.5^10 ≈ 57x max per step).
+      const increment = this.config.beta * Math.abs(cEval);
+      const maxIncrement = row.penalty * 0.5;
+      row.penalty += Math.min(increment, maxIncrement);
     }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) row.penalty = row.stiffness;
