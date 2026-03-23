@@ -106,6 +106,8 @@
         <option value="largePyramid">Large Pyramid (120)</option>
         <option value="spherePile100">Sphere Pile (100)</option>
         <option value="ballPit1000">Ball Pit (1,000)</option>
+        <option value="ballPit2000">Ball Pit (2,000)</option>
+        <option value="ballPit10000">Ball Pit (10,000)</option>
       </select>
       <button id="btn-reset">Reset</button>
       <button id="btn-add-cube">Add Cube</button>
@@ -308,7 +310,9 @@
         case 'boxRain200':   sceneBoxRain200(); break;
         case 'largePyramid': sceneLargePyramid(); break;
         case 'spherePile100': sceneSpherePile100(); break;
-        case 'ballPit1000':  sceneBallPit1000(); break;
+        case 'ballPit1000':  sceneBallPitN(1000); break;
+        case 'ballPit2000':  sceneBallPitN(2000); break;
+        case 'ballPit10000': sceneBallPitN(10000); break;
       }
     }
 
@@ -415,13 +419,22 @@
       }
     }
 
-    function sceneBallPit1000() {
-      // Larger container for 1,000 spheres
+    function sceneBallPitN(count) {
+      // Scale container and sphere sizes based on count
+      const rBase   = count <= 1000 ? 0.15 : count <= 2000 ? 0.12 : 0.07;
+      const rVar    = rBase * 0.5;
+      const spacing = rBase * 4;
+      // Cube root to get grid dimension, then size container to fit
+      const gridSize = Math.ceil(Math.cbrt(count));
+      const halfExt  = (gridSize * spacing) / 2 + 0.5;
+      const wallH    = Math.max(3, halfExt);
+
+      // Transparent container walls
       const wallSpecs = [
-        { x: -5, y: 3, z: 0, hx: 0.2, hy: 3, hz: 5 },  // left
-        { x:  5, y: 3, z: 0, hx: 0.2, hy: 3, hz: 5 },  // right
-        { x: 0, y: 3, z: -5, hx: 5, hy: 3, hz: 0.2 },  // back
-        { x: 0, y: 3, z:  5, hx: 5, hy: 3, hz: 0.2 },  // front
+        { x: -halfExt, y: wallH, z: 0, hx: 0.2, hy: wallH, hz: halfExt },
+        { x:  halfExt, y: wallH, z: 0, hx: 0.2, hy: wallH, hz: halfExt },
+        { x: 0, y: wallH, z: -halfExt, hx: halfExt, hy: wallH, hz: 0.2 },
+        { x: 0, y: wallH, z:  halfExt, hx: halfExt, hy: wallH, hz: 0.2 },
       ];
       for (const w of wallSpecs) {
         const wb = world.createRigidBody(
@@ -436,19 +449,15 @@
         bodyMeshPairs.push({ body: wb, mesh, shape: 'cube', hx: w.hx, hy: w.hy, hz: w.hz });
       }
 
-      // Spawn 1,000 spheres in a 10x10x10 grid with jitter
-      const gridSize = 10;
-      const spacing = 0.65;
-      const rBase = 0.15;
+      // Spawn spheres in a 3D grid with jitter
       let idx = 0;
-
-      for (let ly = 0; ly < gridSize && idx < 1000; ly++) {
-        for (let lz = 0; lz < gridSize && idx < 1000; lz++) {
-          for (let lx = 0; lx < gridSize && idx < 1000; lx++) {
+      for (let ly = 0; ly < gridSize && idx < count; ly++) {
+        for (let lz = 0; lz < gridSize && idx < count; lz++) {
+          for (let lx = 0; lx < gridSize && idx < count; lx++) {
             const x = (lx - gridSize / 2 + 0.5) * spacing + (Math.random() - 0.5) * 0.1;
             const y = 1.0 + ly * spacing;
             const z = (lz - gridSize / 2 + 0.5) * spacing + (Math.random() - 0.5) * 0.1;
-            const r = rBase + Math.random() * 0.08;
+            const r = rBase + Math.random() * rVar;
             addPhysicsSphere(x, y, z, r);
             idx++;
           }

@@ -127,6 +127,8 @@
       <option value="largePyramid">Large Pyramid (120)</option>
       <option value="ballPit300">Ball Pit (300)</option>
       <option value="ballPit1000">Ball Pit (1,000)</option>
+      <option value="ballPit2000">Ball Pit (2,000)</option>
+      <option value="ballPit10000">Ball Pit (10,000)</option>
     </select>
     <button id="btnReset">Reset</button>
     <button id="btnPause">Pause</button>
@@ -597,25 +599,25 @@
     }
 
     // ====================================================================
-    // Scene: Ball Pit (1,000 balls — stress test)
+    // Scene: Ball Pit (generic — scales to any count)
     // ====================================================================
 
-    function sceneBallPit1000() {
-      // Spawn 1,000 balls in a grid pattern that fills the container
-      // Container is ~16 m wide (walls at ±8.2) — use most of it
-      const cols = 40;
-      const rows = 25;
-      const rBase = 0.10;
-      const spacing = 0.38;
+    function sceneBallPitN(count) {
+      // Container is ~16 m wide (walls at ±8.2)
+      // Scale radius and spacing based on count so they fit
+      const rBase  = count <= 1000 ? 0.10 : count <= 2000 ? 0.08 : 0.04;
+      const rVar   = rBase * 0.6;
+      const spacing = rBase * 3.8;
+      const cols = Math.floor(15 / spacing);       // fill width
       const startX = -(cols - 1) * spacing / 2;
       let idx = 0;
 
-      for (let row = 0; row < rows && idx < 1000; row++) {
+      for (let row = 0; idx < count; row++) {
         const y = 0.8 + row * spacing;
-        const xOff = (row % 2) * spacing * 0.5; // Hexagonal packing
-        for (let col = 0; col < cols && idx < 1000; col++) {
+        const xOff = (row % 2) * spacing * 0.5;    // hexagonal packing
+        for (let col = 0; col < cols && idx < count; col++) {
           const x = startX + col * spacing + xOff;
-          const r = rBase + Math.random() * 0.06;
+          const r = rBase + Math.random() * rVar;
           const body = world.createRigidBody(
             AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
           );
@@ -645,7 +647,9 @@
       boxRain200:   sceneBoxRain200,
       largePyramid: sceneLargePyramid,
       ballPit300:   sceneBallPit300,
-      ballPit1000:  sceneBallPit1000,
+      ballPit1000:  () => sceneBallPitN(1000),
+      ballPit2000:  () => sceneBallPitN(2000),
+      ballPit10000: () => sceneBallPitN(10000),
     };
 
     function loadScene(name) {
