@@ -121,30 +121,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Write back this row
   constraints[idx] = cr;
 
-  // Friction coupling for 3D contacts:
-  // Contacts come in triplets: [normal, friction_t1, friction_t2, ...]
-  // Normal row at idx % 3 == 0 updates the next two friction rows
-  if (cr.force_type == 0u && (idx % 3u) == 0u) {
-    // mu is packed in jacobian_b_ang.w of the normal row during CPU upload
-    let mu = cr.jacobian_b_ang.w;
-    let normal_force = abs(cr.lambda);
-    let fric1_idx = idx + 1u;
-    if (fric1_idx < params.num_constraints) {
-      var fric1 = constraints[fric1_idx];
-      if (fric1.is_active != 0u && fric1.force_type == 0u) {
-        fric1.fmin = -mu * normal_force;
-        fric1.fmax = mu * normal_force;
-        constraints[fric1_idx] = fric1;
-      }
-    }
-    let fric2_idx = idx + 2u;
-    if (fric2_idx < params.num_constraints) {
-      var fric2 = constraints[fric2_idx];
-      if (fric2.is_active != 0u && fric2.force_type == 0u) {
-        fric2.fmin = -mu * normal_force;
-        fric2.fmax = mu * normal_force;
-        constraints[fric2_idx] = fric2;
-      }
-    }
-  }
+  // NOTE: Friction coupling runs as a SEPARATE compute pass (friction-coupling.wgsl)
+  // after the dual update, guaranteeing all normal lambdas are finalized.
 }

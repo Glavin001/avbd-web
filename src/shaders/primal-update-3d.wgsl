@@ -47,9 +47,13 @@ struct ConstraintRow3D {
 fn solve_ldl6(A: array<f32, 36>, b: array<f32, 6>) -> array<f32, 6> {
   var L: array<f32, 36>;
   var D: array<f32, 6>;
+  // Regularize to prevent f32 catastrophic cancellation when penalty >> mass/dt²
+  var max_diag6: f32 = 0.0;
+  for (var i = 0u; i < 6u; i++) { max_diag6 = max(max_diag6, A[i * 6u + i]); }
+  let eps6 = 1e-6 * max_diag6;
 
   for (var j = 0u; j < 6u; j++) {
-    var sum_d = A[j * 6u + j];
+    var sum_d = A[j * 6u + j] + eps6;
     for (var k = 0u; k < j; k++) {
       let ljk = L[k * 6u + j];
       sum_d -= ljk * ljk * D[k];

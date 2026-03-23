@@ -44,14 +44,17 @@ struct ConstraintRow {
 @group(0) @binding(6) var<storage, read> constraint_indices: array<u32>;
 
 fn solve_ldl3(A: mat3x3<f32>, b: vec3<f32>) -> vec3<f32> {
-  let D0 = A[0][0];
+  // Regularize to prevent f32 catastrophic cancellation when penalty >> mass/dt²
+  let max_diag = max(A[0][0], max(A[1][1], A[2][2]));
+  let eps = 1e-6 * max_diag;
+  let D0 = A[0][0] + eps;
   if (D0 <= 0.0) { return vec3<f32>(0.0); }
   let L10 = A[0][1] / D0;
   let L20 = A[0][2] / D0;
-  let D1 = A[1][1] - L10 * L10 * D0;
+  let D1 = A[1][1] + eps - L10 * L10 * D0;
   if (D1 <= 0.0) { return vec3<f32>(0.0); }
   let L21 = (A[1][2] - L20 * L10 * D0) / D1;
-  let D2 = A[2][2] - L20 * L20 * D0 - L21 * L21 * D1;
+  let D2 = A[2][2] + eps - L20 * L20 * D0 - L21 * L21 * D1;
   if (D2 <= 0.0) { return vec3<f32>(0.0); }
 
   let y0 = b.x;

@@ -86,22 +86,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Write back this row
   constraints[idx] = cr;
 
-  // Friction coupling: if this is a normal contact row (even index, force_type==0),
-  // update the next row's friction bounds based on current normal lambda.
-  // Contact rows come in pairs: [normal, friction, normal, friction, ...]
-  if (cr.force_type == 0u && (idx % 2u) == 0u) {
-    let fric_idx = idx + 1u;
-    if (fric_idx < params.num_constraints) {
-      var fric = constraints[fric_idx];
-      if (fric.is_active != 0u && fric.force_type == 0u) {
-        // Coulomb friction: |f_tangent| <= mu * |f_normal|
-        // mu is packed in hessian_diag_b.w of the normal row during CPU upload
-        let mu = cr.hessian_diag_b.w;
-        let normal_force = abs(cr.lambda);
-        fric.fmin = -mu * normal_force;
-        fric.fmax = mu * normal_force;
-        constraints[fric_idx] = fric;
-      }
-    }
-  }
+  // NOTE: Friction coupling runs as a SEPARATE compute pass (friction-coupling.wgsl)
+  // after the dual update, guaranteeing all normal lambdas are finalized.
 }
