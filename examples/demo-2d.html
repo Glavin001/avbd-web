@@ -911,11 +911,32 @@
 
       // Stats overlay
       const dynamicCount = bodies.filter(b => !b.body.isFixed()).length;
+      const t = world?.lastTimings;
+      let breakdownHtml = '';
+      if (t) {
+        const collision = (t.broadphase + t.narrowphase).toFixed(1);
+        const init = (t.warmstart + t.bodyInit).toFixed(1);
+        if (t.gpuDispatch != null) {
+          breakdownHtml =
+            `<span class="lbl" style="margin-left:6px">Collision:</span> <span class="val">${collision}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Init:</span> <span class="val">${init}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Upload:</span> <span class="val">${t.bufferUpload.toFixed(1)}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">GPU:</span> <span class="val">${t.gpuDispatch.toFixed(1)}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Readback:</span> <span class="val">${t.readback.toFixed(1)}</span><br>`;
+        } else {
+          breakdownHtml =
+            `<span class="lbl" style="margin-left:6px">Collision:</span> <span class="val">${collision}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Init:</span> <span class="val">${init}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Solve:</span> <span class="val">${t.solverIters.toFixed(1)}</span><br>`;
+        }
+      }
       statsEl.innerHTML =
         `<span class="lbl">Mode:</span> <span class="${gpuMode ? 'gpu' : 'cpu'}">${gpuMode ? 'GPU' : 'CPU'}</span><br>` +
         `<span class="lbl">FPS:</span>  <span class="val">${fps}</span><br>` +
-        `<span class="lbl">Bodies:</span> <span class="val">${dynamicCount}</span><br>` +
-        `<span class="lbl">Step:</span> <span class="val">${stepTimeMs.toFixed(1)} ms</span>`;
+        `<span class="lbl">Bodies:</span> <span class="val">${dynamicCount}</span>` +
+        (t ? ` / <span class="val">${t.numConstraints}</span> constraints` : '') + `<br>` +
+        `<span class="lbl">Step:</span> <span class="val">${stepTimeMs.toFixed(1)} ms</span><br>` +
+        breakdownHtml;
 
       requestAnimationFrame(gameLoop);
     }

@@ -7,7 +7,7 @@
  * 1. Broadphase → 2. Warmstart → 3. Primal update (6x6 LDL) → 4. Dual update
  */
 
-import type { Vec3, Quat, SolverConfig } from './types.js';
+import type { Vec3, Quat, SolverConfig, StepTimings } from './types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D } from './types.js';
 import { ForceType } from './types.js';
 import type { Body3D } from './rigid-body-3d.js';
@@ -212,6 +212,7 @@ export class AVBDSolver3D {
   constraintRows: ConstraintRow3D[] = [];
   ignorePairs: Set<string> = new Set();
   jointRows: ConstraintRow3D[] = [];
+  lastTimings: StepTimings | null = null;
 
   constructor(config: Partial<SolverConfig> = {}) {
     this.config = { ...DEFAULT_SOLVER_CONFIG_3D, ...config };
@@ -224,6 +225,8 @@ export class AVBDSolver3D {
     const gravity = config.gravity as Vec3;
     const bodies = bodyStore.bodies;
     if (bodies.length === 0) return;
+
+    const t0 = performance.now();
 
     // 1. Clear contact rows, keep joint rows
     this.constraintRows = [...this.jointRows];
@@ -246,6 +249,8 @@ export class AVBDSolver3D {
       }
     }
 
+    const tBP = performance.now();
+
     // 3. Warmstart
     for (const row of this.constraintRows) {
       if (!row.active) continue;
@@ -253,6 +258,8 @@ export class AVBDSolver3D {
       row.penalty = Math.max(config.penaltyMin, Math.min(config.penaltyMax, row.penalty));
       if (row.penalty > row.stiffness) row.penalty = row.stiffness;
     }
+
+    const tWS = performance.now();
 
     // 4. Initialize bodies
     const MAX_ANG_VEL = 50;
@@ -319,6 +326,8 @@ export class AVBDSolver3D {
         body.inertialRotation = { ...body.rotation };
       }
     }
+
+    const tBI = performance.now();
 
     // 5. Solver iterations
     const totalIters = config.postStabilize ? config.iterations + 1 : config.iterations;
@@ -429,6 +438,19 @@ export class AVBDSolver3D {
         }
       }
     }
+
+    const tEnd = performance.now();
+    this.lastTimings = {
+      total: tEnd - t0,
+      broadphase: tBP - t0,
+      narrowphase: 0,
+      warmstart: tWS - tBP,
+      bodyInit: tBI - tWS,
+      solverIters: tEnd - tBI,
+      velocityRecover: 0,
+      numBodies: bodies.length,
+      numConstraints: this.constraintRows.length,
+    };
   }
 
   private primalUpdate3D(body: Body3D, dt: number): void {

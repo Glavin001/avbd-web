@@ -16,7 +16,7 @@
  * 6. CPU: velocity/angular velocity recovery, contact caching
  */
 
-import type { Vec3, Quat, SolverConfig, ColorGroup } from './types.js';
+import type { Vec3, Quat, SolverConfig, ColorGroup, StepTimings } from './types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D, COLLISION_MARGIN } from './types.js';
 import { ForceType } from './types.js';
 import type { Body3D } from './rigid-body-3d.js';
@@ -92,6 +92,7 @@ export class GPUSolver3D {
   ignorePairs: Set<string> = new Set();
   jointRows: ConstraintRow3D[] = [];
   colorGroups: ColorGroup[] = [];
+  lastTimings: StepTimings | null = null;
 
   /** Contact cache for warmstarting between frames (body pair key → cached lambdas/penalties) */
   private contactCache: Map<string, { normalLambda: number; normalPenalty: number; fric1Lambda: number; fric1Penalty: number; fric2Lambda: number; fric2Penalty: number; age: number }> = new Map();
@@ -200,6 +201,7 @@ export class GPUSolver3D {
   async step(): Promise<void> {
     if (!this.initialized) this.init();
 
+    const t0 = performance.now();
     const { config, bodyStore, gpu } = this;
     const dt = config.dt;
     const gravity = config.gravity as Vec3;
@@ -229,6 +231,8 @@ export class GPUSolver3D {
         }
       }
     }
+
+    const tCollision = performance.now();
 
     // ─── 2. CPU: Warmstart & Initialize ───────────────────────────
     // Apply cached warmstart values to new contact rows
@@ -298,6 +302,8 @@ export class GPUSolver3D {
       }
       body.prevVelocity = { ...body.velocity };
     }
+
+    const tInit = performance.now();
 
     // ─── 3. CPU→GPU: Upload Buffers ───────────────────────────────
     const numBodies = bodies.length;
@@ -430,6 +436,8 @@ export class GPUSolver3D {
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
     const velocityRecoveryIter = config.iterations - 1;
 
+    const tUpload = performance.now();
+
     // Push error scope to catch GPU validation errors
     device.pushErrorScope('validation');
 
@@ -545,6 +553,8 @@ export class GPUSolver3D {
       console.error('GPU validation error:', validationError.message);
     }
 
+    const tDispatch = performance.now();
+
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
     const bodyStagingBuffer = device.createBuffer({
       size: bodyReadbackSize,
@@ -647,6 +657,22 @@ export class GPUSolver3D {
         this.constraintRows[i].penalty = crResult.getFloat32(byteOff + 124, true);
       }
     }
+
+    const tEnd = performance.now();
+    this.lastTimings = {
+      total: tEnd - t0,
+      broadphase: tCollision - t0,
+      narrowphase: 0,
+      warmstart: tInit - tCollision,
+      bodyInit: 0,
+      solverIters: 0,
+      velocityRecover: 0,
+      bufferUpload: tUpload - tInit,
+      gpuDispatch: tDispatch - tUpload,
+      readback: tEnd - tDispatch,
+      numBodies: bodies.length,
+      numConstraints: this.constraintRows.length,
+    };
   }
 
   /** Create 3D contact constraint rows from a manifold */

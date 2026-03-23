@@ -138,6 +138,26 @@ export const DEFAULT_SOLVER_CONFIG_3D: SolverConfig = {
 
 // ─── Graph Coloring ─────────────────────────────────────────────────────────
 
+/** Per-step performance breakdown in milliseconds. */
+export interface StepTimings {
+  total: number;
+  broadphase: number;
+  narrowphase: number;
+  warmstart: number;
+  bodyInit: number;
+  solverIters: number;
+  velocityRecover: number;
+  /** GPU-only: CPU→GPU buffer upload */
+  bufferUpload?: number;
+  /** GPU-only: GPU compute dispatch */
+  gpuDispatch?: number;
+  /** GPU-only: GPU→CPU readback */
+  readback?: number;
+  /** Diagnostic counts */
+  numBodies: number;
+  numConstraints: number;
+}
+
 export interface ColorGroup {
   /** Color index */
   color: number;

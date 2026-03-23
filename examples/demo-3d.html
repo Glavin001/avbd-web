@@ -118,7 +118,13 @@
   <div id="stats">
     <span class="label">FPS:</span> <span class="value" id="stat-fps">--</span><br>
     <span class="label">Bodies:</span> <span class="value" id="stat-bodies">0</span><br>
+    <span class="label">Constraints:</span> <span class="value" id="stat-constraints">0</span><br>
     <span class="label">Step:</span> <span class="value" id="stat-step">--</span><br>
+    <span class="label" style="margin-left:8px">Collision:</span> <span class="value" id="stat-collision">--</span><br>
+    <span class="label" style="margin-left:8px">Init:</span> <span class="value" id="stat-init">--</span><br>
+    <span class="label" style="margin-left:8px" id="stat-phase3-label">Solver:</span> <span class="value" id="stat-phase3">--</span><br>
+    <span class="label" style="margin-left:8px" id="stat-phase4-label"></span> <span class="value" id="stat-phase4"></span><br>
+    <span class="label" style="margin-left:8px" id="stat-phase5-label"></span> <span class="value" id="stat-phase5"></span><br>
     <span class="label">Solver:</span> <span class="value" id="stat-solver">CPU</span>
   </div>
 
@@ -548,7 +554,16 @@
 
     const statFps = document.getElementById('stat-fps');
     const statBodies = document.getElementById('stat-bodies');
+    const statConstraints = document.getElementById('stat-constraints');
     const statStep = document.getElementById('stat-step');
+    const statCollision = document.getElementById('stat-collision');
+    const statInit = document.getElementById('stat-init');
+    const statPhase3 = document.getElementById('stat-phase3');
+    const statPhase3Label = document.getElementById('stat-phase3-label');
+    const statPhase4 = document.getElementById('stat-phase4');
+    const statPhase4Label = document.getElementById('stat-phase4-label');
+    const statPhase5 = document.getElementById('stat-phase5');
+    const statPhase5Label = document.getElementById('stat-phase5-label');
     let stepTimeMs = 0;
 
     // ── Game loop ────────────────────────────────────────────────────────────
@@ -582,6 +597,30 @@
         statFps.textContent = currentFps;
         statBodies.textContent = bodyMeshPairs.length;
         statStep.textContent = stepTimeMs.toFixed(1) + ' ms';
+        // Show timing breakdown from solver
+        const t = world?.lastTimings;
+        if (t) {
+          statConstraints.textContent = t.numConstraints;
+          statCollision.textContent = (t.broadphase + t.narrowphase).toFixed(1) + ' ms';
+          statInit.textContent = (t.warmstart + t.bodyInit).toFixed(1) + ' ms';
+          if (t.gpuDispatch != null) {
+            // GPU path
+            statPhase3Label.textContent = 'Upload:';
+            statPhase3.textContent = t.bufferUpload.toFixed(1) + ' ms';
+            statPhase4Label.textContent = 'GPU:';
+            statPhase4.textContent = t.gpuDispatch.toFixed(1) + ' ms';
+            statPhase5Label.textContent = 'Readback:';
+            statPhase5.textContent = t.readback.toFixed(1) + ' ms';
+          } else {
+            // CPU path
+            statPhase3Label.textContent = 'Solve:';
+            statPhase3.textContent = t.solverIters.toFixed(1) + ' ms';
+            statPhase4Label.textContent = '';
+            statPhase4.textContent = '';
+            statPhase5Label.textContent = '';
+            statPhase5.textContent = '';
+          }
+        }
       }
     }
 

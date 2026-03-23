@@ -15,7 +15,7 @@
  * 6. CPU: velocity recovery, contact caching
  */
 
-import type { Vec2, SolverConfig, ColorGroup } from './types.js';
+import type { Vec2, SolverConfig, ColorGroup, StepTimings } from './types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_2D } from './types.js';
 import { ForceType } from './types.js';
 import type { Body2D } from './rigid-body.js';
@@ -67,6 +67,7 @@ export class GPUSolver2D {
   ignorePairs: Set<string> = new Set();
   jointConstraintIndices: number[] = [];
   colorGroups: ColorGroup[] = [];
+  lastTimings: StepTimings | null = null;
 
   private gpu: GPUContext;
   private initialized = false;
@@ -185,6 +186,7 @@ export class GPUSolver2D {
   async step(): Promise<void> {
     if (!this.initialized) await this.init();
 
+    const t0 = performance.now();
     const { config, bodyStore, constraintStore, gpu } = this;
     const dt = config.dt;
     const gravity = config.gravity as Vec2;
@@ -214,6 +216,8 @@ export class GPUSolver2D {
     }
 
     constraintStore.warmstartContacts();
+
+    const tCollision = performance.now();
 
     // ─── 2. CPU: Warmstart & Initialize ───────────────────────────
     for (const row of constraintStore.rows) {
@@ -267,6 +271,8 @@ export class GPUSolver2D {
       body.inertialAngle = body.angle + omega * dt;
       body.prevVelocity = { ...body.velocity };
     }
+
+    const tInit = performance.now();
 
     // ─── 3. CPU→GPU: Upload Buffers ───────────────────────────────
     const numBodies = bodies.length;
@@ -367,6 +373,8 @@ export class GPUSolver2D {
     if (constraintIndices.length > 0) {
       gpuWrite(device.queue, this.constraintIndicesBuffer, 0, constraintIndices);
     }
+
+    const tUpload = performance.now();
 
     // ─── 4. GPU: Solver Iterations ────────────────────────────────
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
@@ -487,6 +495,8 @@ export class GPUSolver2D {
       console.error('GPU validation error:', validationError.message);
     }
 
+    const tDispatch = performance.now();
+
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
     // Readback final body state (post-stabilization positions)
     const bodyStagingBuffer = device.createBuffer({
@@ -571,6 +581,22 @@ export class GPUSolver2D {
         rows[i].penalty = crResult.getFloat32(byteOff + 92, true);
       }
     }
+
+    const tEnd = performance.now();
+    this.lastTimings = {
+      total: tEnd - t0,
+      broadphase: tCollision - t0,
+      narrowphase: 0,
+      warmstart: tInit - tCollision,
+      bodyInit: 0,
+      solverIters: 0,
+      velocityRecover: 0,
+      bufferUpload: tUpload - tInit,
+      gpuDispatch: tDispatch - tUpload,
+      readback: tEnd - tDispatch,
+      numBodies: bodies.length,
+      numConstraints: constraintStore.rows.length,
+    };
   }
 
   /** Build per-body constraint index lists for indirection on GPU */

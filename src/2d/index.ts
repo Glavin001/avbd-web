@@ -9,7 +9,7 @@
  *   ...
  */
 
-import type { Vec2, SolverConfig, RigidBodyHandle, ContactManifold2D } from '../core/types.js';
+import type { Vec2, SolverConfig, RigidBodyHandle, ContactManifold2D, StepTimings } from '../core/types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_2D } from '../core/types.js';
 import { AVBDSolver2D } from '../core/solver.js';
 import { GPUSolver2D } from '../core/gpu-solver-2d.js';
@@ -210,6 +210,11 @@ export class World {
   /** Check if this world is using the GPU solver */
   get isGPU(): boolean {
     return this.gpuSolver !== null;
+  }
+
+  /** Per-step performance breakdown (ms) from the last step/stepCPU call */
+  get lastTimings(): StepTimings | null {
+    return this.gpuSolver?.lastTimings ?? this.solver.lastTimings;
   }
 
   /** Get all body states as a flat Float32Array [x, y, angle, ...] */
@@ -428,3 +433,4 @@ const AVBD = {
 
 export default AVBD;
 export { RigidBodyDesc2D, ColliderDesc2D, JointData2D, MotorData2D };
+export type { StepTimings };

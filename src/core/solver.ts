@@ -12,7 +12,7 @@
  * 5. Velocity recovery (BDF1)
  */
 
-import type { Vec2, SolverConfig, ContactManifold2D } from './types.js';
+import type { Vec2, SolverConfig, ContactManifold2D, StepTimings } from './types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_2D } from './types.js';
 import { ForceType } from './types.js';
 import type { Body2D } from './rigid-body.js';
@@ -87,6 +87,9 @@ export class AVBDSolver2D {
   /** Graph coloring for parallel dispatch (updated each step) */
   colorGroups: ColorGroup[] = [];
 
+  /** Last step's performance breakdown */
+  lastTimings: StepTimings | null = null;
+
   constructor(config: Partial<SolverConfig> = {}) {
     this.config = { ...DEFAULT_SOLVER_CONFIG_2D, ...config };
     this.bodyStore = new BodyStore2D();
@@ -105,11 +108,15 @@ export class AVBDSolver2D {
 
     if (bodies.length === 0) return;
 
+    const t0 = performance.now();
+
     // ─── 1. Broadphase & Narrowphase ──────────────────────────────
     // Clear contact constraints (keep joints)
     constraintStore.clearContacts();
 
+    const tBP = performance.now();
     const manifolds = broadphase2D(bodyStore, this.ignorePairs);
+    const tNP = performance.now();
 
     // Create contact constraint rows
     for (const manifold of manifolds) {
@@ -124,6 +131,7 @@ export class AVBDSolver2D {
 
     // Apply cached warmstart values to new contacts
     constraintStore.warmstartContacts();
+    const tNPEnd = performance.now();
 
     // ─── 2. Initialize & Warmstart Constraints ────────────────────
     for (const row of constraintStore.rows) {
@@ -154,6 +162,8 @@ export class AVBDSolver2D {
     this.colorGroups = computeGraphColoring(
       bodies.length, constraintPairs, fixedBodies,
     );
+
+    const tWS = performance.now();
 
     // ─── 3. Initialize Bodies ─────────────────────────────────────
     const MAX_ANGULAR_VELOCITY = 50; // Reference clamps to [-50, 50]
@@ -226,6 +236,8 @@ export class AVBDSolver2D {
       body.prevVelocity = { ...body.velocity };
     }
 
+    const tBI = performance.now();
+
     // ─── 4. Main Solver Loop ──────────────────────────────────────
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
 
@@ -277,6 +289,19 @@ export class AVBDSolver2D {
         }
       }
     }
+
+    const tEnd = performance.now();
+    this.lastTimings = {
+      total: tEnd - t0,
+      broadphase: tNP - tBP,
+      narrowphase: tNPEnd - tNP,
+      warmstart: tWS - tNPEnd,
+      bodyInit: tBI - tWS,
+      solverIters: tEnd - tBI,
+      velocityRecover: 0,
+      numBodies: bodies.length,
+      numConstraints: constraintStore.rows.length,
+    };
   }
 
   /**
