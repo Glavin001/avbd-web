@@ -17,6 +17,7 @@ import {
   vec3, vec3Add, vec3Sub, vec3Scale, vec3Cross, vec3Dot, vec3Length,
   quatIdentity, quatMul, quatNormalize, quatRotateVec3, quatFromAxisAngle,
 } from './math.js';
+import { COLLISION_MARGIN } from './types.js';
 
 // ─── 3D Constraint Row ─────────────────────────────────────────────────────
 
@@ -83,7 +84,7 @@ function createContactRows3D(
     const torqueB = vec3Cross(rB, n);
     nRow.jacobianB = [-n.x, -n.y, -n.z, -torqueB.x, -torqueB.y, -torqueB.z];
 
-    nRow.c = -contact.depth;
+    nRow.c = -contact.depth + COLLISION_MARGIN;
     nRow.c0 = nRow.c;
     nRow.fmin = -Infinity;
     nRow.fmax = 0;
@@ -263,12 +264,15 @@ export class AVBDSolver3D {
 
         // Friction coupling: update friction bounds from normal lambdas.
         // 3D contacts come in triplets: [normal, friction1, friction2].
-        for (let i = 0; i + 2 < this.constraintRows.length; i += 3) {
+        // Walk rows finding normal rows (fmax <= 0) and update the next 2 friction rows.
+        for (let i = 0; i + 2 < this.constraintRows.length; i++) {
           const normalRow = this.constraintRows[i];
-          if (normalRow.type !== ForceType.Contact || !normalRow.active) continue;
+          // Identify normal rows: Contact type with infinite fmin (unilateral constraint)
+          if (normalRow.type !== ForceType.Contact || !normalRow.active || isFinite(normalRow.fmin)) continue;
           const fric1 = this.constraintRows[i + 1];
           const fric2 = this.constraintRows[i + 2];
-          if (!fric1.active || !fric2.active) continue;
+          if (!fric1.active || fric1.type !== ForceType.Contact) continue;
+          if (!fric2.active || fric2.type !== ForceType.Contact) continue;
           const bA = this.bodyStore.bodies[normalRow.bodyA];
           const bB = this.bodyStore.bodies[normalRow.bodyB];
           const mu = Math.sqrt(bA.friction * bB.friction);
@@ -277,6 +281,7 @@ export class AVBDSolver3D {
           fric1.fmax = mu * normalForce;
           fric2.fmin = -mu * normalForce;
           fric2.fmax = mu * normalForce;
+          i += 2; // Skip past the friction rows
         }
       }
 

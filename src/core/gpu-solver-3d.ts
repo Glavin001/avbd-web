@@ -17,7 +17,7 @@
  */
 
 import type { Vec3, Quat, SolverConfig, ColorGroup } from './types.js';
-import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D } from './types.js';
+import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D, COLLISION_MARGIN } from './types.js';
 import { ForceType } from './types.js';
 import type { Body3D } from './rigid-body-3d.js';
 import { BodyStore3D } from './rigid-body-3d.js';
@@ -638,7 +638,7 @@ export class GPUSolver3D {
       nRow.jacobianA = [n.x, n.y, n.z, torqueA.x, torqueA.y, torqueA.z];
       const torqueB = vec3Cross(rB, n);
       nRow.jacobianB = [-n.x, -n.y, -n.z, -torqueB.x, -torqueB.y, -torqueB.z];
-      nRow.c = -contact.depth;
+      nRow.c = -contact.depth + COLLISION_MARGIN;
       nRow.c0 = nRow.c;
       nRow.fmin = -Infinity;
       nRow.fmax = 0;

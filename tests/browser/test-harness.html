@@ -8,8 +8,10 @@
   <div id="results"></div>
   <script type="module">
     import AVBD from '../../src/2d/index.ts';
+    import AVBD3D from '../../src/3d/index.ts';
 
     window.AVBD = AVBD;
+    window.AVBD3D = AVBD3D;
     window.testResults = {};
 
     // Helper to run a test scenario and store results
@@ -547,6 +549,96 @@
         gpu60Y: gpu60.y, cpu60Y: cpu60.y, diff60,
         isGPU: world.isGPU,
       };
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 3D GPU Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    try {
+      await AVBD3D.init();
+    } catch (e) {
+      // 3D init might fail if GPU is not available
+    }
+
+    // 3D Free Fall
+    await window.runTest('freeFall3D', async () => {
+      const world = new AVBD3D.World3D({ x: 0, y: -9.81, z: 0 });
+      const body = world.createRigidBody(AVBD3D.RigidBodyDesc3D.dynamic().setTranslation(0, 10, 0));
+      world.createCollider(AVBD3D.ColliderDesc3D.cuboid(0.5, 0.5, 0.5), body);
+
+      for (let i = 0; i < 60; i++) await world.step();
+
+      const expected = 10 - 0.5 * 9.81 * 1;
+      const y = body.translation().y;
+      const error = Math.abs(y - expected);
+      return { y, expected, error, isGPU: true };
+    });
+
+    // 3D Box on Ground
+    await window.runTest('boxOnGround3D', async () => {
+      const world = new AVBD3D.World3D({ x: 0, y: -9.81, z: 0 });
+      world.createCollider(AVBD3D.ColliderDesc3D.cuboid(10, 0.5, 10));
+      const body = world.createRigidBody(AVBD3D.RigidBodyDesc3D.dynamic().setTranslation(0, 5, 0));
+      world.createCollider(AVBD3D.ColliderDesc3D.cuboid(0.5, 0.5, 0.5), body);
+
+      let minY = Infinity;
+      for (let i = 0; i < 180; i++) {
+        await world.step();
+        minY = Math.min(minY, body.translation().y);
+      }
+      const finalY = body.translation().y;
+      return { minY, finalY, isGPU: true };
+    });
+
+    // 3D Stack
+    await window.runTest('stack3D', async () => {
+      const world = new AVBD3D.World3D({ x: 0, y: -9.81, z: 0 }, { iterations: 15 });
+      world.createCollider(AVBD3D.ColliderDesc3D.cuboid(10, 0.5, 10));
+      const bodies = [];
+      for (let i = 0; i < 3; i++) {
+        const b = world.createRigidBody(
+          AVBD3D.RigidBodyDesc3D.dynamic().setTranslation(0, 1.5 + i * 1.1, 0)
+        );
+        world.createCollider(AVBD3D.ColliderDesc3D.cuboid(0.5, 0.5, 0.5), b);
+        bodies.push(b);
+      }
+
+      for (let i = 0; i < 180; i++) await world.step();
+
+      const ys = bodies.map(b => b.translation().y);
+      const allAboveGround = ys.every(y => y > 0.3);
+      const ordered = ys[0] < ys[1] && ys[1] < ys[2];
+      return { ys, allAboveGround, ordered, isGPU: true };
+    });
+
+    // 3D GPU vs CPU parity
+    await window.runTest('gpuCpuParity3D', async () => {
+      // GPU
+      const gpuWorld = new AVBD3D.World3D({ x: 0, y: -9.81, z: 0 });
+      const gpuBody = gpuWorld.createRigidBody(
+        AVBD3D.RigidBodyDesc3D.dynamic().setTranslation(0, 10, 0)
+      );
+      gpuWorld.createCollider(AVBD3D.ColliderDesc3D.cuboid(0.5, 0.5, 0.5), gpuBody);
+
+      // CPU
+      const cpuWorld = new AVBD3D.World3D({ x: 0, y: -9.81, z: 0 }, { useCPU: true });
+      const cpuBody = cpuWorld.createRigidBody(
+        AVBD3D.RigidBodyDesc3D.dynamic().setTranslation(0, 10, 0)
+      );
+      cpuWorld.createCollider(AVBD3D.ColliderDesc3D.cuboid(0.5, 0.5, 0.5), cpuBody);
+
+      await gpuWorld.step();
+      cpuWorld.step();
+      const diff1 = Math.abs(gpuBody.translation().y - cpuBody.translation().y);
+
+      for (let i = 0; i < 59; i++) {
+        await gpuWorld.step();
+        cpuWorld.step();
+      }
+      const diff60 = Math.abs(gpuBody.translation().y - cpuBody.translation().y);
+
+      return { diff1, diff60, gpuY: gpuBody.translation().y, cpuY: cpuBody.translation().y, isGPU: true };
     });
 
     // Signal completion

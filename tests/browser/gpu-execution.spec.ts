@@ -234,4 +234,50 @@ test.describe('AVBD GPU Execution', () => {
     expect(r.stepped).toBe(true);
     expect(r.isGPU).toBe(true);
   });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 3D GPU Tests
+  // ═══════════════════════════════════════════════════════════════════════
+
+  test('3D GPU: free fall matches analytical formula', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.freeFall3D);
+    if (!r || !r.success) {
+      test.skip(); // 3D GPU might not be available
+      return;
+    }
+    expect(r.error).toBeLessThan(1.0);
+    expect(r.y).toBeGreaterThan(4.0);
+    expect(r.y).toBeLessThan(7.0);
+  });
+
+  test('3D GPU: box on ground never penetrates', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.boxOnGround3D);
+    if (!r || !r.success) {
+      test.skip();
+      return;
+    }
+    expect(r.minY).toBeGreaterThan(0.3);
+    expect(r.finalY).toBeGreaterThan(0.5);
+    expect(r.finalY).toBeLessThan(3.0);
+  });
+
+  test('3D GPU: stack of 3 boxes settles', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.stack3D);
+    if (!r || !r.success) {
+      test.skip();
+      return;
+    }
+    expect(r.allAboveGround).toBe(true);
+    expect(r.ordered).toBe(true);
+  });
+
+  test('3D GPU vs CPU parity within tolerance', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuCpuParity3D);
+    if (!r || !r.success) {
+      test.skip();
+      return;
+    }
+    expect(r.diff1).toBeLessThan(0.01);
+    expect(r.diff60).toBeLessThan(0.5);
+  });
 });

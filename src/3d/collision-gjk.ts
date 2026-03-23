@@ -168,7 +168,52 @@ export function collideBoxSphere(box: Body3D, sphere: Body3D): ContactManifold3D
   };
 }
 
-// ─── Box-Box (SAT 3D) ──────────────────────────────────────────────────────
+// ─── Box-Box (SAT 3D) with face clipping contact generation ─────────────────
+
+/**
+ * Get the 4 vertices of a box face in world space.
+ * faceAxis: which local axis the face normal is along (0=x, 1=y, 2=z)
+ * sign: +1 or -1 (which side of the box)
+ */
+function getBoxFaceVertices(
+  position: Vec3, axes: Vec3[], halfExtents: number[],
+  faceAxis: number, sign: number,
+): Vec3[] {
+  // The two tangent axes perpendicular to the face
+  const a1 = (faceAxis + 1) % 3;
+  const a2 = (faceAxis + 2) % 3;
+  const center = vec3Add(position, vec3Scale(axes[faceAxis], sign * halfExtents[faceAxis]));
+  const t1 = vec3Scale(axes[a1], halfExtents[a1]);
+  const t2 = vec3Scale(axes[a2], halfExtents[a2]);
+  return [
+    vec3Add(vec3Add(center, t1), t2),
+    vec3Add(vec3Sub(center, t1), t2),
+    vec3Sub(vec3Sub(center, t1), t2),
+    vec3Sub(vec3Add(center, t1), t2),
+  ];
+}
+
+/**
+ * Clip a polygon (array of 3D points) against a plane defined by (planeNormal, planeDist).
+ * Keeps points on the negative/zero side: dot(p, planeNormal) <= planeDist.
+ */
+function clipPolygonByPlane(polygon: Vec3[], planeNormal: Vec3, planeDist: number): Vec3[] {
+  if (polygon.length === 0) return [];
+  const out: Vec3[] = [];
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i];
+    const b = polygon[(i + 1) % polygon.length];
+    const da = vec3Dot(a, planeNormal) - planeDist;
+    const db = vec3Dot(b, planeNormal) - planeDist;
+    if (da <= 0) out.push(a); // a is inside
+    if ((da > 0) !== (db > 0)) {
+      // edge crosses the plane — compute intersection
+      const t = da / (da - db);
+      out.push(vec3Add(a, vec3Scale(vec3Sub(b, a), t)));
+    }
+  }
+  return out;
+}
 
 export function collideBoxBox3D(bodyA: Body3D, bodyB: Body3D): ContactManifold3D | null {
   // Get the 3 axes for each box
@@ -190,43 +235,43 @@ export function collideBoxBox3D(bodyA: Body3D, bodyB: Body3D): ContactManifold3D
 
   let minOverlap = Infinity;
   let bestAxis: Vec3 = vec3(0, 1, 0);
+  let bestAxisIndex = -1; // 0-2: faceA, 3-5: faceB, 6+: edge-edge
 
   // Test 15 axes: 3 face normals A, 3 face normals B, 9 edge cross products
-  const testAxes: Vec3[] = [];
+  const testAxes: { axis: Vec3; type: 'faceA' | 'faceB' | 'edge'; index: number }[] = [];
 
-  // Face normals
-  for (const a of axesA) testAxes.push(a);
-  for (const b of axesB) testAxes.push(b);
+  for (let i = 0; i < 3; i++) testAxes.push({ axis: axesA[i], type: 'faceA', index: i });
+  for (let i = 0; i < 3; i++) testAxes.push({ axis: axesB[i], type: 'faceB', index: i });
 
-  // Edge cross products
-  for (const a of axesA) {
-    for (const b of axesB) {
-      const cross = vec3Cross(a, b);
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      const cross = vec3Cross(axesA[i], axesB[j]);
       if (vec3Length(cross) > 1e-6) {
-        testAxes.push(vec3Normalize(cross));
+        testAxes.push({ axis: vec3Normalize(cross), type: 'edge', index: i * 3 + j });
       }
     }
   }
 
-  for (const axis of testAxes) {
-    // Project both boxes onto axis
+  for (let i = 0; i < testAxes.length; i++) {
+    const axis = testAxes[i].axis;
     let radiusA = 0;
-    for (let i = 0; i < 3; i++) {
-      radiusA += Math.abs(vec3Dot(axesA[i], axis)) * heA[i];
+    for (let k = 0; k < 3; k++) {
+      radiusA += Math.abs(vec3Dot(axesA[k], axis)) * heA[k];
     }
     let radiusB = 0;
-    for (let i = 0; i < 3; i++) {
-      radiusB += Math.abs(vec3Dot(axesB[i], axis)) * heB[i];
+    for (let k = 0; k < 3; k++) {
+      radiusB += Math.abs(vec3Dot(axesB[k], axis)) * heB[k];
     }
 
     const distance = Math.abs(vec3Dot(d, axis));
     const overlap = radiusA + radiusB - distance;
 
-    if (overlap < 0) return null; // Separating axis found
+    if (overlap < 0) return null;
 
     if (overlap < minOverlap) {
       minOverlap = overlap;
       bestAxis = axis;
+      bestAxisIndex = i;
     }
   }
 
@@ -235,15 +280,133 @@ export function collideBoxBox3D(bodyA: Body3D, bodyB: Body3D): ContactManifold3D
     bestAxis = vec3Scale(bestAxis, -1);
   }
 
-  // Contact point: midpoint approximation
-  const midpoint = vec3Scale(vec3Add(bodyA.position, bodyB.position), 0.5);
+  // ─── Generate multi-point contact manifold via face clipping ──────────
+  const bestInfo = testAxes[bestAxisIndex];
+
+  // Determine reference and incident faces.
+  // bestAxis points from B to A. The reference face is the face closest to the other body.
+  let refFaceVerts: Vec3[];
+  let incFaceVerts: Vec3[];
+  let refNormal: Vec3;
+
+  if (bestInfo.type === 'faceA') {
+    // Reference face on body A: face that points toward B (= anti-aligned with bestAxis)
+    const dirToB = vec3Scale(bestAxis, -1); // direction from A toward B
+    const sign = vec3Dot(dirToB, axesA[bestInfo.index]) > 0 ? 1 : -1;
+    refNormal = vec3Scale(axesA[bestInfo.index], sign);
+    refFaceVerts = getBoxFaceVertices(bodyA.position, axesA, heA, bestInfo.index, sign);
+    // Incident face on B: face that points toward A (= aligned with bestAxis)
+    const incAxis = findMostAntiAlignedAxis(axesB, refNormal);
+    const incSign = vec3Dot(bestAxis, axesB[incAxis]) > 0 ? 1 : -1;
+    incFaceVerts = getBoxFaceVertices(bodyB.position, axesB, heB, incAxis, incSign);
+  } else if (bestInfo.type === 'faceB') {
+    // Reference face on body B: face that points toward A (= aligned with bestAxis)
+    const sign = vec3Dot(bestAxis, axesB[bestInfo.index]) > 0 ? 1 : -1;
+    refNormal = vec3Scale(axesB[bestInfo.index], sign);
+    refFaceVerts = getBoxFaceVertices(bodyB.position, axesB, heB, bestInfo.index, sign);
+    // Incident face on A: face that points toward B (= anti-aligned with bestAxis)
+    const dirToB = vec3Scale(bestAxis, -1);
+    const incAxis = findMostAntiAlignedAxis(axesA, refNormal);
+    const incSign = vec3Dot(dirToB, axesA[incAxis]) > 0 ? 1 : -1;
+    incFaceVerts = getBoxFaceVertices(bodyA.position, axesA, heA, incAxis, incSign);
+  } else {
+    // Edge-edge: use midpoint fallback with single contact
+    const midpoint = vec3Scale(vec3Add(bodyA.position, bodyB.position), 0.5);
+    return {
+      bodyA: bodyA.index,
+      bodyB: bodyB.index,
+      normal: bestAxis,
+      contacts: [{ position: midpoint, normal: bestAxis, depth: minOverlap }],
+    };
+  }
+
+  // Clip incident face against reference face's 4 side planes
+  const refFaceAxis = bestInfo.type === 'faceA' ? bestInfo.index : bestInfo.index;
+  let clipped = [...incFaceVerts];
+
+  // The 4 side planes of the reference face are defined by the reference box edges
+  // Each side plane has a normal along a tangent axis and offset at the box extent
+  const refPos = bestInfo.type === 'faceA' ? bodyA.position : bodyB.position;
+  const sideTangents = getSideTangentAxes(
+    bestInfo.type === 'faceA' ? axesA : axesB,
+    refFaceAxis,
+    bestInfo.type === 'faceA' ? heA : heB,
+    refPos,
+  );
+
+  for (const side of sideTangents) {
+    clipped = clipPolygonByPlane(clipped, side.normal, side.dist);
+    if (clipped.length === 0) break;
+  }
+
+  if (clipped.length === 0) {
+    // Fallback: midpoint
+    const midpoint = vec3Scale(vec3Add(bodyA.position, bodyB.position), 0.5);
+    return {
+      bodyA: bodyA.index,
+      bodyB: bodyB.index,
+      normal: bestAxis,
+      contacts: [{ position: midpoint, normal: bestAxis, depth: minOverlap }],
+    };
+  }
+
+  // Keep only points behind the reference face and compute per-point depth
+  const refFaceOffset = vec3Dot(refNormal, refFaceVerts[0]);
+  const contacts: ContactPoint3D[] = [];
+
+  for (const p of clipped) {
+    const sep = vec3Dot(refNormal, p) - refFaceOffset;
+    if (sep <= 0.01) { // Small tolerance
+      contacts.push({
+        position: p,
+        normal: bestAxis,
+        depth: Math.max(0, -sep),
+      });
+    }
+  }
+
+  if (contacts.length === 0) {
+    const midpoint = vec3Scale(vec3Add(bodyA.position, bodyB.position), 0.5);
+    contacts.push({ position: midpoint, normal: bestAxis, depth: minOverlap });
+  }
 
   return {
     bodyA: bodyA.index,
     bodyB: bodyB.index,
     normal: bestAxis,
-    contacts: [{ position: midpoint, normal: bestAxis, depth: minOverlap }],
+    contacts,
   };
+}
+
+/** Find which axis (0, 1, 2) of the given axes is most anti-aligned with the direction */
+function findMostAntiAlignedAxis(axes: Vec3[], dir: Vec3): number {
+  let maxAbsDot = -1;
+  let best = 0;
+  for (let i = 0; i < 3; i++) {
+    const absd = Math.abs(vec3Dot(axes[i], dir));
+    if (absd > maxAbsDot) { maxAbsDot = absd; best = i; }
+  }
+  return best;
+}
+
+/**
+ * Get 4 side clipping planes for a box face (perpendicular to the face).
+ * Plane equation: dot(p, normal) <= dist keeps points inside the reference box.
+ */
+function getSideTangentAxes(
+  axes: Vec3[], faceAxis: number, he: number[], refPos: Vec3,
+): { normal: Vec3; dist: number }[] {
+  const a1 = (faceAxis + 1) % 3;
+  const a2 = (faceAxis + 2) % 3;
+  // Project reference position onto each tangent axis
+  const centerDotA1 = vec3Dot(refPos, axes[a1]);
+  const centerDotA2 = vec3Dot(refPos, axes[a2]);
+  return [
+    { normal: axes[a1], dist: centerDotA1 + he[a1] },
+    { normal: vec3Scale(axes[a1], -1), dist: -centerDotA1 + he[a1] },
+    { normal: axes[a2], dist: centerDotA2 + he[a2] },
+    { normal: vec3Scale(axes[a2], -1), dist: -centerDotA2 + he[a2] },
+  ];
 }
 
 // ─── Dispatch ───────────────────────────────────────────────────────────────

@@ -396,9 +396,10 @@ export class AVBDSolver2D {
       row.penalty = row.stiffness;
     }
 
-    // Update friction bounds for contact pairs (normal row updates friction row)
-    if (row.type === ForceType.Contact && rowIndex % 2 === 0) {
-      // This is a normal row; update the next row (friction row)
+    // Update friction bounds for contact pairs (normal row updates friction row).
+    // Normal rows are unilateral: fmin=-Infinity, fmax=0. Friction rows have finite bounds.
+    // We identify normal rows by their infinite fmin (never modified by friction coupling).
+    if (row.type === ForceType.Contact && !isFinite(row.fmin)) {
       if (rowIndex + 1 < this.constraintStore.rows.length) {
         const frictionRow = this.constraintStore.rows[rowIndex + 1];
         if (frictionRow.active && frictionRow.type === ForceType.Contact) {
