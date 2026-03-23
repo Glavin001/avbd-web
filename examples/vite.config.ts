@@ -8,6 +8,7 @@ export default defineConfig({
     emptyOutDir: true,
     target: 'esnext',
     rollupOptions: {
+      external: [/cdn\.jsdelivr\.net/],
       input: {
         main: resolve(__dirname, 'index.html'),
         demo2d: resolve(__dirname, 'demo-2d.html'),

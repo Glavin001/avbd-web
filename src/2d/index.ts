@@ -16,6 +16,8 @@ import { GPUSolver2D } from '../core/gpu-solver-2d.js';
 import { GPUContext } from '../core/gpu-context.js';
 import { RigidBodyDesc2D, ColliderDesc2D, type Body2D } from '../core/rigid-body.js';
 import { JointData2D, createJointConstraintRows, type JointDef2D } from '../constraints/joint.js';
+import { createSpringConstraintRows, type SpringDef2D } from '../constraints/spring.js';
+import { MotorData2D, createMotorConstraintRows, type MotorDef2D } from '../constraints/motor.js';
 import { ForceType } from '../core/types.js';
 
 // ─── Module-level GPU state ─────────────────────────────────────────────────
@@ -122,6 +124,47 @@ export class World {
     this.solver.ignorePairs.add(key);
 
     return new JointHandle(id);
+  }
+
+  /** Create a distance spring between two bodies */
+  createSpring(
+    bodyA: RigidBody, bodyB: RigidBody,
+    anchorA: Vec2, anchorB: Vec2,
+    restLength: number, stiffness: number, damping: number = 0,
+  ): void {
+    const def: SpringDef2D = {
+      bodyA: bodyA.handle.index, bodyB: bodyB.handle.index,
+      localAnchorA: anchorA, localAnchorB: anchorB,
+      restLength, stiffness, damping,
+    };
+    const bA = this.solver.bodyStore.bodies[def.bodyA];
+    const bB = this.solver.bodyStore.bodies[def.bodyB];
+    const rows = createSpringConstraintRows(def, bA, bB, this.solver.config.penaltyMin);
+    const indices = this.solver.constraintStore.addRows(rows);
+    this.solver.jointConstraintIndices.push(...indices);
+    // Add to ignore list
+    const key = def.bodyA < def.bodyB
+      ? `${def.bodyA}-${def.bodyB}` : `${def.bodyB}-${def.bodyA}`;
+    this.solver.ignorePairs.add(key);
+  }
+
+  /** Create an angular velocity motor between two bodies */
+  createMotor(
+    bodyA: RigidBody, bodyB: RigidBody,
+    targetVelocity: number, maxTorque: number = Infinity,
+  ): void {
+    const def: MotorDef2D = {
+      bodyA: bodyA.handle.index, bodyB: bodyB.handle.index,
+      targetVelocity, maxTorque, stiffness: Infinity,
+    };
+    const bA = this.solver.bodyStore.bodies[def.bodyA];
+    const bB = this.solver.bodyStore.bodies[def.bodyB];
+    const rows = createMotorConstraintRows(def, bA, bB, this.solver.config.penaltyMin, this.solver.config.dt);
+    const indices = this.solver.constraintStore.addRows(rows);
+    this.solver.jointConstraintIndices.push(...indices);
+    const key = def.bodyA < def.bodyB
+      ? `${def.bodyA}-${def.bodyB}` : `${def.bodyB}-${def.bodyA}`;
+    this.solver.ignorePairs.add(key);
   }
 
   /**
@@ -384,4 +427,4 @@ const AVBD = {
 };
 
 export default AVBD;
-export { RigidBodyDesc2D, ColliderDesc2D, JointData2D };
+export { RigidBodyDesc2D, ColliderDesc2D, JointData2D, MotorData2D };
