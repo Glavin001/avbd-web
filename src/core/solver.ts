@@ -386,9 +386,12 @@ export class AVBDSolver2D {
       return;
     }
 
-    // Conditional penalty ramping: only ramp when constraint is interior (not at bounds)
-    // Reference: "if (lambda > fmin && lambda < fmax) penalty += beta * |C|"
-    if (row.lambda > row.fmin && row.lambda < row.fmax) {
+    // Conditional penalty ramping: only ramp when constraint is interior (not at bounds).
+    // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
+    // should stay low to avoid creating stiff angular springs that cause spinning instability.
+    // Normal contact rows have fmin=-Infinity; friction rows have finite Coulomb bounds.
+    const isFrictionRow = row.type === ForceType.Contact && isFinite(row.fmin);
+    if (!isFrictionRow && row.lambda > row.fmin && row.lambda < row.fmax) {
       row.penalty += this.config.beta * Math.abs(cEval);
     }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
