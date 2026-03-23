@@ -123,32 +123,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Write back this row
   constraints[idx] = cr;
 
-  // Friction coupling for 3D contacts:
-  // Contacts come in triplets: [normal, friction_t1, friction_t2, ...]
-  // Normal row at idx % 3 == 0 updates the next two friction rows
-  if (cr.force_type == 0u && (idx % 3u) == 0u) {
-    // mu is packed in jacobian_b_ang.w of the normal row during CPU upload
-    let mu = cr.jacobian_b_ang.w;
-    let normal_force = abs(cr.lambda);
-    let fric1_idx = idx + 1u;
-    if (fric1_idx < params.num_constraints) {
-      var fric1 = constraints[fric1_idx];
-      if (fric1.is_active != 0u && fric1.force_type == 0u) {
-        fric1.fmin = -mu * normal_force;
-        fric1.fmax = mu * normal_force;
-        constraints[fric1_idx] = fric1;
-      }
-    }
-    let fric2_idx = idx + 2u;
-    if (fric2_idx < params.num_constraints) {
-      var fric2 = constraints[fric2_idx];
-      if (fric2.is_active != 0u && fric2.force_type == 0u) {
-        fric2.fmin = -mu * normal_force;
-        fric2.fmax = mu * normal_force;
-        constraints[fric2_idx] = fric2;
-      }
-    }
-  }
+  // NOTE: Friction coupling (normal→friction bounds update) is computed on
+  // CPU before upload. GPU parallel dispatch creates a race condition where
+  // the friction thread reads stale bounds before the normal thread writes.
 }
 `;
 
@@ -240,24 +217,67 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Write back this row
   constraints[idx] = cr;
 
-  // Friction coupling: if this is a normal contact row (even index, force_type==0),
-  // update the next row's friction bounds based on current normal lambda.
-  // Contact rows come in pairs: [normal, friction, normal, friction, ...]
-  if (cr.force_type == 0u && (idx % 2u) == 0u) {
-    let fric_idx = idx + 1u;
-    if (fric_idx < params.num_constraints) {
-      var fric = constraints[fric_idx];
-      if (fric.is_active != 0u && fric.force_type == 0u) {
-        // Coulomb friction: |f_tangent| <= mu * |f_normal|
-        // mu is packed in hessian_diag_b.w of the normal row during CPU upload
-        let mu = cr.hessian_diag_b.w;
-        let normal_force = abs(cr.lambda);
-        fric.fmin = -mu * normal_force;
-        fric.fmax = mu * normal_force;
-        constraints[fric_idx] = fric;
-      }
-    }
-  }
+  // NOTE: Friction coupling runs as a SEPARATE compute pass after the dual
+  // update, guaranteeing all normal lambdas are finalized before friction
+  // bounds are updated. See FRICTION_COUPLING_WGSL.
+}
+`;
+
+// ─── Friction Coupling Shader ───────────────────────────────────────────────
+// Runs as a separate compute pass AFTER the dual update.
+// Per the AVBD reference (manifold.cpp: computeConstraint), friction bounds
+// are updated using the current normal lambda BEFORE the next iteration's
+// primal/dual. Running this after dual guarantees all lambdas are finalized.
+// Contact rows are ordered [normal, friction, normal, friction, ...].
+// One thread per contact PAIR (not per row).
+export const FRICTION_COUPLING_WGSL = `
+struct FrictionParams {
+  num_constraints: u32,
+}
+
+struct ConstraintRow {
+  body_a: i32,
+  body_b: i32,
+  force_type: u32,
+  _pad0: u32,
+  jacobian_a: vec4<f32>,
+  jacobian_b: vec4<f32>,
+  hessian_diag_a: vec4<f32>,
+  hessian_diag_b: vec4<f32>,
+  c: f32,
+  c0: f32,
+  lambda: f32,
+  penalty: f32,
+  stiffness: f32,
+  fmin: f32,
+  fmax: f32,
+  is_active: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: FrictionParams;
+@group(0) @binding(1) var<storage, read_write> constraints: array<ConstraintRow>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let pair_idx = gid.x;
+  let normal_idx = pair_idx * 2u;
+  let friction_idx = normal_idx + 1u;
+
+  if (friction_idx >= params.num_constraints) { return; }
+
+  let normal = constraints[normal_idx];
+  // Only process contact pairs (force_type 0 = Contact)
+  if (normal.force_type != 0u || normal.is_active == 0u) { return; }
+
+  var friction = constraints[friction_idx];
+  if (friction.force_type != 0u || friction.is_active == 0u) { return; }
+
+  // mu is packed in hessian_diag_b.w of the normal row during CPU upload
+  let mu = normal.hessian_diag_b.w;
+  let normal_force = abs(normal.lambda);
+  friction.fmin = -mu * normal_force;
+  friction.fmax = mu * normal_force;
+  constraints[friction_idx] = friction;
 }
 `;
 
@@ -428,14 +448,21 @@ struct ConstraintRow {
 @group(0) @binding(6) var<storage, read> constraint_indices: array<u32>;
 
 fn solve_ldl3(A: mat3x3<f32>, b: vec3<f32>) -> vec3<f32> {
-  let D0 = A[0][0];
+  // Regularize diagonal to prevent f32 catastrophic cancellation.
+  // When penalty >> mass/dt², off-diagonal J*J^T*penalty terms can
+  // exactly cancel diagonal terms (e.g. 4e9 + 77.76 - 4e9 = 0 in f32).
+  // Adding eps proportional to max diagonal keeps the matrix SPD.
+  let max_diag = max(A[0][0], max(A[1][1], A[2][2]));
+  let eps = 1e-6 * max_diag;
+
+  let D0 = A[0][0] + eps;
   if (D0 <= 0.0) { return vec3<f32>(0.0); }
   let L10 = A[0][1] / D0;
   let L20 = A[0][2] / D0;
-  let D1 = A[1][1] - L10 * L10 * D0;
+  let D1 = A[1][1] + eps - L10 * L10 * D0;
   if (D1 <= 0.0) { return vec3<f32>(0.0); }
   let L21 = (A[1][2] - L20 * L10 * D0) / D1;
-  let D2 = A[2][2] - L20 * L20 * D0 - L21 * L21 * D1;
+  let D2 = A[2][2] + eps - L20 * L20 * D0 - L21 * L21 * D1;
   if (D2 <= 0.0) { return vec3<f32>(0.0); }
 
   let y0 = b.x;
@@ -608,8 +635,15 @@ fn solve_ldl6(A: array<f32, 36>, b: array<f32, 6>) -> array<f32, 6> {
   var L: array<f32, 36>;
   var D: array<f32, 6>;
 
+  // Regularize diagonal to prevent f32 catastrophic cancellation
+  var max_diag: f32 = 0.0;
+  for (var i = 0u; i < 6u; i++) {
+    max_diag = max(max_diag, A[i * 6u + i]);
+  }
+  let eps6 = 1e-6 * max_diag;
+
   for (var j = 0u; j < 6u; j++) {
-    var sum_d = A[j * 6u + j];
+    var sum_d = A[j * 6u + j] + eps6;
     for (var k = 0u; k < j; k++) {
       let ljk = L[k * 6u + j];
       sum_d -= ljk * ljk * D[k];

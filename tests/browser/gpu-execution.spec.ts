@@ -100,32 +100,31 @@ test.describe('AVBD GPU Execution', () => {
 
   // ─── Friction ───────────────────────────────────────────────────────
 
-  test('friction: CPU differentiates mu, GPU executes without crash', async ({ page }) => {
+  test('friction: GPU low-mu slides further than high-mu', async ({ page }) => {
     const r = await page.evaluate(() => (window as any).testResults.friction);
     console.log('friction:', JSON.stringify(r));
     expect(r.success).toBe(true);
     expect(r.isGPU).toBe(true);
 
-    // CPU friction MUST differentiate mu values
+    // CPU friction differentiates mu values
     expect(r.cpuFrictionWorks).toBe(true);
     expect(r.cpuLowX).toBeGreaterThan(r.cpuHighX);
 
-    // GPU contact constraints keep boxes above ground
+    // GPU friction MUST also differentiate mu values
+    expect(r.gpuFrictionDiff).toBeGreaterThan(1.0);
+    expect(r.gpuLowX).toBeGreaterThan(r.gpuHighX);
+
+    // Both remain above ground
     expect(r.gpuHighAbove).toBe(true);
     expect(r.gpuLowAbove).toBe(true);
-
-    // GPU velocity integration works (boxes moved right)
+    // Both moved right
     expect(r.gpuHighMoved).toBe(true);
     expect(r.gpuLowMoved).toBe(true);
-
-    // Track GPU friction differentiation for regression
-    // Currently gpuFrictionDiff ≈ 0 (known dual shader bug)
-    console.log(`GPU friction differentiation: ${r.gpuFrictionDiff.toFixed(4)} (target: > 0)`);
   });
 
   // ─── Stacking ───────────────────────────────────────────────────────
 
-  test('stacking: 3 boxes settle above ground in order', async ({ page }) => {
+  test('stacking: 5 boxes settle above ground in order', async ({ page }) => {
     const r = await page.evaluate(() => (window as any).testResults.stacking);
     console.log('stacking:', JSON.stringify(r));
     expect(r.success).toBe(true);
@@ -152,26 +151,25 @@ test.describe('AVBD GPU Execution', () => {
 
   // ─── Joint constraints ─────────────────────────────────────────────
 
-  test('joint pendulum: CPU holds arm length ≈ 2.0', async ({ page }) => {
+  test('joint pendulum: GPU and CPU both hold arm length ≈ 2.0', async ({ page }) => {
     const r = await page.evaluate(() => (window as any).testResults.jointPendulum);
     console.log('joint pendulum:', JSON.stringify(r));
     expect(r.success).toBe(true);
     expect(r.isGPU).toBe(true);
+
     // CPU must maintain joint constraint precisely
     expect(r.cpuDist).toBeGreaterThan(1.5);
     expect(r.cpuDist).toBeLessThan(2.5);
-  });
 
-  test('joint pendulum: GPU joint constraint drift (known limitation)', async ({ page }) => {
-    const r = await page.evaluate(() => (window as any).testResults.jointPendulum);
-    expect(r.success).toBe(true);
-    // GPU joints diverge due to f32 precision in the parallel dual update.
-    // This test documents the current drift magnitude for regression tracking.
-    // When we fix the GPU joint bug, tighten this to match CPU (< 2.5).
-    console.log(`GPU joint max drift: ${r.maxGpuDist.toFixed(2)} (target: < 2.5)`);
-    // At minimum, positions must not be NaN/Inf
-    expect(Number.isFinite(r.gpuPos.x)).toBe(true);
-    expect(Number.isFinite(r.gpuPos.y)).toBe(true);
+    // GPU must also maintain joint constraint (LDL regularization fix)
+    expect(r.gpuDist).toBeGreaterThan(1.5);
+    expect(r.gpuDist).toBeLessThan(2.5);
+
+    // GPU and CPU should produce similar results
+    expect(Math.abs(r.gpuDist - r.cpuDist)).toBeLessThan(0.01);
+
+    // Max drift during simulation should stay bounded
+    expect(r.maxGpuDist).toBeLessThan(3.0);
   });
 
   // ─── Applied forces ─────────────────────────────────────────────────

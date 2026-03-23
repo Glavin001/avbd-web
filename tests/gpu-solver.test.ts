@@ -89,8 +89,9 @@ describe('Embedded WGSL shaders', () => {
     // Should have 6-DOF constraint evaluation (quaternion angular displacement)
     expect(DUAL_UPDATE_3D_WGSL).toContain('jacobian_a_ang');
     expect(DUAL_UPDATE_3D_WGSL).toContain('jacobian_b_ang');
-    // Should have friction coupling for triplets (normal + 2 tangent)
-    expect(DUAL_UPDATE_3D_WGSL).toContain('idx % 3u');
+    // Friction coupling moved to CPU (was GPU race condition)
+    // 3D dual shader should note this in a comment
+    expect(DUAL_UPDATE_3D_WGSL).toContain('Friction coupling');
     // Body state stride should be 20
     expect(DUAL_UPDATE_3D_WGSL).toContain('* 20u');
     // Body prev stride should be 14

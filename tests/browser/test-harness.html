@@ -268,13 +268,13 @@
     });
 
     // ═══════════════════════════════════════════════════════════════════════
-    // TEST 6: Stacking — 3 boxes must settle in order
+    // TEST 6: Stacking — 5 boxes must settle in order
     // ═══════════════════════════════════════════════════════════════════════
     await window.runTest('stacking', async () => {
       const r = await gpuCpuRun((world) => {
         world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
         const bodies = [];
-        for (let i = 0; i < 3; i++) {
+        for (let i = 0; i < 5; i++) {
           const b = world.createRigidBody(
             AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.5 + i * 1.1)
           );
