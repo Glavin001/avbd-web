@@ -17,6 +17,8 @@ struct ConstraintRow3D {
   jacobian_a_ang: vec4<f32>,
   jacobian_b_lin: vec4<f32>,
   jacobian_b_ang: vec4<f32>,
+  hessian_diag_a_ang: vec4<f32>,
+  hessian_diag_b_ang: vec4<f32>,
   c: f32,
   c0: f32,
   lambda: f32,

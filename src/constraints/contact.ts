@@ -76,11 +76,20 @@ export function createContactConstraintRows(
 
     const n = manifold.normal;
 
+    const rA = vec2Sub(contact.position, bodyA.position);
+    const rB = vec2Sub(contact.position, bodyB.position);
+
     normalRow.jacobianA = computeContactJacobian(bodyA.position, contact.position, n);
     normalRow.jacobianB = computeContactJacobian(bodyB.position, contact.position, n);
     normalRow.jacobianB[0] = -normalRow.jacobianB[0];
     normalRow.jacobianB[1] = -normalRow.jacobianB[1];
     normalRow.jacobianB[2] = -normalRow.jacobianB[2];
+
+    // Geometric stiffness (Hessian diagonal) for angular DOF:
+    // d²C/dθ² = -(r · n), the second derivative of the contact constraint
+    // w.r.t. rotation. This stabilizes angular corrections in the LDL solve.
+    normalRow.hessianDiagA = [0, 0, -(rA.x * n.x + rA.y * n.y)];
+    normalRow.hessianDiagB = [0, 0, -(rB.x * n.x + rB.y * n.y)];
 
     // C < 0 when penetrating, C = 0 at contact surface
     // Add collision margin to prevent micro-penetrations (reference: COLLISION_MARGIN = 0.0005)
@@ -121,6 +130,10 @@ export function createContactConstraintRows(
     fricRow.jacobianB[0] = -fricRow.jacobianB[0];
     fricRow.jacobianB[1] = -fricRow.jacobianB[1];
     fricRow.jacobianB[2] = -fricRow.jacobianB[2];
+
+    // Geometric stiffness for friction: d²C_friction/dθ² = -(r · t)
+    fricRow.hessianDiagA = [0, 0, -(rA.x * tangent.x + rA.y * tangent.y)];
+    fricRow.hessianDiagB = [0, 0, -(rB.x * tangent.x + rB.y * tangent.y)];
 
     fricRow.c = 0;
     fricRow.c0 = 0;

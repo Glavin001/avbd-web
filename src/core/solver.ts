@@ -247,6 +247,10 @@ export class AVBDSolver2D {
             y: (body.position.y - body.prevPosition.y) / dt,
           };
           body.angularVelocity = (body.angle - body.prevAngle) / dt;
+
+          // Clamp recovered angular velocity to prevent explosive inertial predictions
+          body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
+            Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
         }
       }
     }

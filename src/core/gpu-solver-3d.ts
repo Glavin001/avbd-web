@@ -23,7 +23,7 @@ import type { Body3D } from './rigid-body-3d.js';
 import { BodyStore3D } from './rigid-body-3d.js';
 import type { ConstraintRow3D } from './solver-3d.js';
 import { collide3D, getAABB3D, aabb3DOverlap } from '../3d/collision-gjk.js';
-import { vec3Sub, vec3Scale, vec3Cross, vec3Length, vec3, quatMul, quatNormalize, quatFromAxisAngle } from './math.js';
+import { vec3Sub, vec3Scale, vec3Cross, vec3Dot, vec3Length, vec3, quatMul, quatNormalize, quatFromAxisAngle } from './math.js';
 import { computeGraphColoring } from './graph-coloring.js';
 import { GPUContext } from './gpu-context.js';
 import { PRIMAL_UPDATE_3D_WGSL, DUAL_UPDATE_3D_WGSL, FRICTION_COUPLING_3D_WGSL } from '../shaders/embedded.js';
@@ -35,14 +35,15 @@ const BODY_STRIDE = 20;
 /** Body prev 3D: [px,py,pz, pqw,pqx,pqy,pqz, ix,iy,iz, iqw,iqx,iqy,iqz] = 14 floats */
 const BODY_PREV_STRIDE = 14;
 /**
- * ConstraintRow3D: matches WGSL struct exactly = 28 floats (112 bytes)
+ * ConstraintRow3D: matches WGSL struct exactly = 36 floats (144 bytes)
  * [body_a(i32), body_b(i32), force_type(u32), _pad(u32),  // 4 = 16 bytes
  *  jacobian_a_lin(vec4), jacobian_a_ang(vec4),              // 2 vec4 = 32 bytes
  *  jacobian_b_lin(vec4), jacobian_b_ang(vec4),              // 2 vec4 = 32 bytes
+ *  hessian_diag_a_ang(vec4), hessian_diag_b_ang(vec4),      // 2 vec4 = 32 bytes
  *  c, c0, lambda, penalty, stiffness, fmin, fmax, active]  // 8 = 32 bytes
- * Total: 112 bytes
+ * Total: 144 bytes
  */
-const CONSTRAINT_STRIDE = 28;
+const CONSTRAINT_STRIDE = 36;
 /**
  * SolverParams 3D: 11 fields = 44 bytes
  * [dt, gravity_x, gravity_y, gravity_z, penalty_min, penalty_max, beta,
@@ -65,6 +66,8 @@ function createDefaultRow3D(): ConstraintRow3D {
     type: ForceType.Contact,
     jacobianA: [0, 0, 0, 0, 0, 0],
     jacobianB: [0, 0, 0, 0, 0, 0],
+    hessianDiagA: [0, 0, 0, 0, 0, 0],
+    hessianDiagB: [0, 0, 0, 0, 0, 0],
     c: 0, c0: 0,
     lambda: 0, penalty: 100,
     stiffness: Infinity,
@@ -384,15 +387,27 @@ export class GPUSolver3D {
           if (bA && bB) mu = Math.sqrt(bA.friction * bB.friction);
         }
         crView.setFloat32(byteOff + 76, mu, true);
+        // hessian_diag_a_ang (vec4): angular components only (linear is always 0)
+        const hA = row.hessianDiagA || [0, 0, 0, 0, 0, 0];
+        crView.setFloat32(byteOff + 80, hA[3] || 0, true);
+        crView.setFloat32(byteOff + 84, hA[4] || 0, true);
+        crView.setFloat32(byteOff + 88, hA[5] || 0, true);
+        crView.setFloat32(byteOff + 92, 0, true);
+        // hessian_diag_b_ang (vec4)
+        const hB = row.hessianDiagB || [0, 0, 0, 0, 0, 0];
+        crView.setFloat32(byteOff + 96, hB[3] || 0, true);
+        crView.setFloat32(byteOff + 100, hB[4] || 0, true);
+        crView.setFloat32(byteOff + 104, hB[5] || 0, true);
+        crView.setFloat32(byteOff + 108, 0, true);
         // scalar fields
-        crView.setFloat32(byteOff + 80, row.c, true);
-        crView.setFloat32(byteOff + 84, row.c0, true);
-        crView.setFloat32(byteOff + 88, row.lambda, true);
-        crView.setFloat32(byteOff + 92, row.penalty, true);
-        crView.setFloat32(byteOff + 96, isFinite(row.stiffness) ? row.stiffness : 1e30, true);
-        crView.setFloat32(byteOff + 100, isFinite(row.fmin) ? row.fmin : -1e30, true);
-        crView.setFloat32(byteOff + 104, isFinite(row.fmax) ? row.fmax : 1e30, true);
-        crView.setUint32(byteOff + 108, row.active ? 1 : 0, true);
+        crView.setFloat32(byteOff + 112, row.c, true);
+        crView.setFloat32(byteOff + 116, row.c0, true);
+        crView.setFloat32(byteOff + 120, row.lambda, true);
+        crView.setFloat32(byteOff + 124, row.penalty, true);
+        crView.setFloat32(byteOff + 128, isFinite(row.stiffness) ? row.stiffness : 1e30, true);
+        crView.setFloat32(byteOff + 132, isFinite(row.fmin) ? row.fmin : -1e30, true);
+        crView.setFloat32(byteOff + 136, isFinite(row.fmax) ? row.fmax : 1e30, true);
+        crView.setUint32(byteOff + 140, row.active ? 1 : 0, true);
       }
       gpuWrite(device.queue, this.constraintBuffer, 0, new Uint8Array(crData));
     }
@@ -608,8 +623,8 @@ export class GPUSolver3D {
 
       for (let i = 0; i < numConstraints; i++) {
         const byteOff = i * CONSTRAINT_STRIDE * 4;
-        this.constraintRows[i].lambda = crResult.getFloat32(byteOff + 88, true);
-        this.constraintRows[i].penalty = crResult.getFloat32(byteOff + 92, true);
+        this.constraintRows[i].lambda = crResult.getFloat32(byteOff + 120, true);
+        this.constraintRows[i].penalty = crResult.getFloat32(byteOff + 124, true);
       }
     }
   }
@@ -638,6 +653,19 @@ export class GPUSolver3D {
       nRow.jacobianA = [n.x, n.y, n.z, torqueA.x, torqueA.y, torqueA.z];
       const torqueB = vec3Cross(rB, n);
       nRow.jacobianB = [-n.x, -n.y, -n.z, -torqueB.x, -torqueB.y, -torqueB.z];
+
+      // Geometric stiffness (Hessian diagonal) for angular DOFs
+      const rAdotN = vec3Dot(rA, n);
+      const rBdotN = vec3Dot(rB, n);
+      nRow.hessianDiagA = [0, 0, 0,
+        -(rAdotN - rA.x * n.x),
+        -(rAdotN - rA.y * n.y),
+        -(rAdotN - rA.z * n.z)];
+      nRow.hessianDiagB = [0, 0, 0,
+        -(rBdotN - rB.x * n.x),
+        -(rBdotN - rB.y * n.y),
+        -(rBdotN - rB.z * n.z)];
+
       nRow.c = -contact.depth + COLLISION_MARGIN;
       nRow.c0 = nRow.c;
       nRow.fmin = -Infinity;
@@ -660,6 +688,19 @@ export class GPUSolver3D {
         fRow.jacobianA = [t.x, t.y, t.z, tA.x, tA.y, tA.z];
         const tB = vec3Cross(rB, t);
         fRow.jacobianB = [-t.x, -t.y, -t.z, -tB.x, -tB.y, -tB.z];
+
+        // Geometric stiffness for friction tangent
+        const rAdotT = vec3Dot(rA, t);
+        const rBdotT = vec3Dot(rB, t);
+        fRow.hessianDiagA = [0, 0, 0,
+          -(rAdotT - rA.x * t.x),
+          -(rAdotT - rA.y * t.y),
+          -(rAdotT - rA.z * t.z)];
+        fRow.hessianDiagB = [0, 0, 0,
+          -(rBdotT - rB.x * t.x),
+          -(rBdotT - rB.y * t.y),
+          -(rBdotT - rB.z * t.z)];
+
         fRow.c = 0;
         fRow.c0 = 0;
         fRow.fmin = -mu * this.config.penaltyMin * contact.depth;

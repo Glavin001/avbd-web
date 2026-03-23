@@ -29,6 +29,10 @@ export interface ConstraintRow3D {
   jacobianA: number[];
   /** Jacobian for body B */
   jacobianB: number[];
+  /** Diagonal of the Hessian for geometric stiffness (body A, 6-DOF) */
+  hessianDiagA: number[];
+  /** Diagonal of the Hessian for geometric stiffness (body B, 6-DOF) */
+  hessianDiagB: number[];
   c: number;
   c0: number;
   lambda: number;
@@ -46,6 +50,8 @@ function createDefaultRow3D(): ConstraintRow3D {
     type: ForceType.Contact,
     jacobianA: [0, 0, 0, 0, 0, 0],
     jacobianB: [0, 0, 0, 0, 0, 0],
+    hessianDiagA: [0, 0, 0, 0, 0, 0],
+    hessianDiagB: [0, 0, 0, 0, 0, 0],
     c: 0, c0: 0,
     lambda: 0, penalty: 100,
     stiffness: Infinity,
@@ -84,6 +90,19 @@ function createContactRows3D(
     const torqueB = vec3Cross(rB, n);
     nRow.jacobianB = [-n.x, -n.y, -n.z, -torqueB.x, -torqueB.y, -torqueB.z];
 
+    // Geometric stiffness (Hessian diagonal) for angular DOFs:
+    // H[3+i] = -(r·n) + r[i]*n[i], the second derivative of constraint w.r.t. rotation
+    const rAdotN = vec3Dot(rA, n);
+    const rBdotN = vec3Dot(rB, n);
+    nRow.hessianDiagA = [0, 0, 0,
+      -(rAdotN - rA.x * n.x),
+      -(rAdotN - rA.y * n.y),
+      -(rAdotN - rA.z * n.z)];
+    nRow.hessianDiagB = [0, 0, 0,
+      -(rBdotN - rB.x * n.x),
+      -(rBdotN - rB.y * n.y),
+      -(rBdotN - rB.z * n.z)];
+
     nRow.c = -contact.depth + COLLISION_MARGIN;
     nRow.c0 = nRow.c;
     nRow.fmin = -Infinity;
@@ -107,6 +126,18 @@ function createContactRows3D(
 
       const tB = vec3Cross(rB, t);
       fRow.jacobianB = [-t.x, -t.y, -t.z, -tB.x, -tB.y, -tB.z];
+
+      // Geometric stiffness for friction tangent direction
+      const rAdotT = vec3Dot(rA, t);
+      const rBdotT = vec3Dot(rB, t);
+      fRow.hessianDiagA = [0, 0, 0,
+        -(rAdotT - rA.x * t.x),
+        -(rAdotT - rA.y * t.y),
+        -(rAdotT - rA.z * t.z)];
+      fRow.hessianDiagB = [0, 0, 0,
+        -(rBdotT - rB.x * t.x),
+        -(rBdotT - rB.y * t.y),
+        -(rBdotT - rB.z * t.z)];
 
       fRow.c = 0;
       fRow.c0 = 0;
@@ -287,6 +318,7 @@ export class AVBDSolver3D {
 
       // Velocity recovery at iteration N-1
       if (iter === config.iterations - 1) {
+        const MAX_ANG_VEL = 50;
         for (const body of bodies) {
           if (body.type === RigidBodyType.Fixed) continue;
           body.velocity = vec3Scale(vec3Sub(body.position, body.prevPosition), 1 / dt);
@@ -298,6 +330,12 @@ export class AVBDSolver3D {
             z: -body.prevRotation.z,
           });
           body.angularVelocity = vec3Scale(vec3(dq.x, dq.y, dq.z), 2 / dt);
+
+          // Clamp recovered angular velocity to prevent explosive inertial predictions
+          const wLen = vec3Length(body.angularVelocity);
+          if (wLen > MAX_ANG_VEL) {
+            body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / wLen);
+          }
         }
       }
     }
@@ -374,11 +412,18 @@ export class AVBDSolver3D {
       // RHS += J * f
       for (let k = 0; k < n; k++) rhs[k] += J[k] * f;
 
-      // LHS += J * J^T * penalty + geometric stiffness
+      // LHS += J * J^T * penalty
       for (let i = 0; i < n; i++) {
         for (let j = 0; j < n; j++) {
           lhs[j * n + i] += J[i] * J[j] * row.penalty;
         }
+      }
+
+      // Geometric stiffness (diagonal lumping)
+      const hDiag = row.bodyA === body.index ? row.hessianDiagA : row.hessianDiagB;
+      const absF = Math.abs(f);
+      for (let i = 0; i < n; i++) {
+        lhs[i * n + i] += Math.abs(hDiag[i]) * absF;
       }
     }
 

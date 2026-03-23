@@ -25,6 +25,8 @@ struct ConstraintRow3D {
   jacobian_a_ang: vec4<f32>,
   jacobian_b_lin: vec4<f32>,
   jacobian_b_ang: vec4<f32>,
+  hessian_diag_a_ang: vec4<f32>,
+  hessian_diag_b_ang: vec4<f32>,
   c: f32,
   c0: f32,
   lambda: f32,
@@ -235,6 +237,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         lhs[j * 6u + i] += J[i] * J[j] * cr.penalty;
       }
     }
+
+    // Geometric stiffness (diagonal lumping) for angular DOFs
+    let abs_f = abs(f);
+    var H_ang: vec3<f32>;
+    if (cr.body_a == i32(body_idx)) {
+      H_ang = cr.hessian_diag_a_ang.xyz;
+    } else {
+      H_ang = cr.hessian_diag_b_ang.xyz;
+    }
+    lhs[3u * 6u + 3u] += abs(H_ang.x) * abs_f;
+    lhs[4u * 6u + 4u] += abs(H_ang.y) * abs_f;
+    lhs[5u * 6u + 5u] += abs(H_ang.z) * abs_f;
   }
 
   // Check diagonal validity
