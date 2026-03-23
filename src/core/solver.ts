@@ -37,18 +37,16 @@ export interface IgnoreCollisionPair {
 }
 
 /**
- * Spatial hash grid for O(n) average-case broadphase collision detection.
- * Each body is inserted into all grid cells its AABB overlaps.
- * Potential collisions are only between bodies sharing a cell.
+ * Spatial hash grid broadphase: returns candidate pairs (i, j) that pass AABB overlap.
+ * O(n) average-case instead of O(n²).
  */
 function broadphase2D(
   bodyStore: BodyStore2D,
   ignorePairs: Set<string>,
-): ContactManifold2D[] {
-  const manifolds: ContactManifold2D[] = [];
+): [number, number][] {
   const bodies = bodyStore.bodies;
   const n = bodies.length;
-  if (n === 0) return manifolds;
+  if (n === 0) return [];
 
   // Compute all AABBs once
   const aabbs = new Array(n);
@@ -56,8 +54,7 @@ function broadphase2D(
     aabbs[i] = bodyStore.getAABB(bodies[i]);
   }
 
-  // Choose cell size: ~2x the median body extent for good distribution
-  // For simplicity, use a fixed reasonable cell size
+  // Cell size: ~2x average body extent
   let totalExtent = 0;
   let dynamicCount = 0;
   for (let i = 0; i < n; i++) {
@@ -66,19 +63,11 @@ function broadphase2D(
       dynamicCount++;
     }
   }
-  const avgExtent = dynamicCount > 0 ? totalExtent / (dynamicCount * 2) : 1;
-  const cellSize = Math.max(avgExtent * 2, 0.5);
+  const cellSize = Math.max(dynamicCount > 0 ? totalExtent / (dynamicCount * 2) * 2 : 1, 0.5);
   const invCell = 1 / cellSize;
 
   // Insert bodies into spatial hash
   const grid = new Map<number, number[]>();
-
-  function hashKey(cx: number, cy: number): number {
-    // Cantor pairing with offset for negative coords
-    const a = cx + 0x8000;
-    const b = cy + 0x8000;
-    return a * 0x10000 + b;
-  }
 
   for (let i = 0; i < n; i++) {
     const aabb = aabbs[i];
@@ -89,7 +78,7 @@ function broadphase2D(
 
     for (let cx = minCX; cx <= maxCX; cx++) {
       for (let cy = minCY; cy <= maxCY; cy++) {
-        const key = hashKey(cx, cy);
+        const key = (cx + 0x8000) * 0x10000 + (cy + 0x8000);
         let cell = grid.get(key);
         if (!cell) { cell = []; grid.set(key, cell); }
         cell.push(i);
@@ -97,38 +86,33 @@ function broadphase2D(
     }
   }
 
-  // Check pairs within each cell
+  // Collect candidate pairs
+  const pairs: [number, number][] = [];
   const tested = new Set<number>();
 
   for (const cell of grid.values()) {
     for (let ci = 0; ci < cell.length; ci++) {
       const i = cell[ci];
-      const a = bodies[i];
       for (let cj = ci + 1; cj < cell.length; cj++) {
         const j = cell[cj];
-
-        // Deduplicate: each pair tested at most once
         const pairKey = i < j ? i * n + j : j * n + i;
         if (tested.has(pairKey)) continue;
         tested.add(pairKey);
 
-        const b = bodies[j];
+        const a = bodies[i], b = bodies[j];
         if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
 
         const strKey = i < j ? `${i}-${j}` : `${j}-${i}`;
         if (ignorePairs.has(strKey)) continue;
 
-        // AABB overlap (already computed)
         if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
 
-        // Narrowphase
-        const manifold = collide2D(a, b);
-        if (manifold) manifolds.push(manifold);
+        pairs.push([i, j]);
       }
     }
   }
 
-  return manifolds;
+  return pairs;
 }
 
 // ─── AVBD Solver ────────────────────────────────────────────────────────────
@@ -169,25 +153,23 @@ export class AVBDSolver2D {
     const t0 = performance.now();
 
     // ─── 1. Broadphase & Narrowphase ──────────────────────────────
-    // Clear contact constraints (keep joints)
     constraintStore.clearContacts();
 
     const tBP = performance.now();
-    const manifolds = broadphase2D(bodyStore, this.ignorePairs);
+    const candidatePairs = broadphase2D(bodyStore, this.ignorePairs);
     const tNP = performance.now();
 
-    // Create contact constraint rows
-    for (const manifold of manifolds) {
-      const bodyA = bodies[manifold.bodyA];
-      const bodyB = bodies[manifold.bodyB];
-      const rows = createContactConstraintRows(
-        manifold, bodyA, bodyB,
-        config.penaltyMin, Infinity, config.dt,
-      );
-      constraintStore.addRows(rows);
+    // Narrowphase: SAT collision detection on candidate pairs
+    for (const [i, j] of candidatePairs) {
+      const manifold = collide2D(bodies[i], bodies[j]);
+      if (manifold) {
+        const rows = createContactConstraintRows(
+          manifold, bodies[i], bodies[j],
+          config.penaltyMin, Infinity, config.dt,
+        );
+        constraintStore.addRows(rows);
+      }
     }
-
-    // Apply cached warmstart values to new contacts
     constraintStore.warmstartContacts();
     const tNPEnd = performance.now();
 

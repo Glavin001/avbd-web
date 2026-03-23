@@ -216,6 +216,7 @@ export class GPUSolver3D {
     this.constraintRows = [...this.jointRows];
 
     // Spatial hash broadphase: O(n) average instead of O(n²)
+    const gpuCandidatePairs: [number, number][] = [];
     {
       const n = bodies.length;
       const aabbs = new Array(n);
@@ -263,18 +264,24 @@ export class GPUSolver3D {
             const pk = i < j ? i * n + j : j * n + i;
             if (tested.has(pk)) continue;
             tested.add(pk);
-            const a = bodies[i], b = bodies[j];
-            if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
+            if (bodies[i].type === RigidBodyType.Fixed && bodies[j].type === RigidBodyType.Fixed) continue;
             const key = `${i}-${j}`;
             if (this.ignorePairs.has(key)) continue;
             if (!aabb3DOverlap(aabbs[i], aabbs[j])) continue;
-            const manifold = collide3D(a, b);
-            if (manifold) {
-              const rows = this.createContactRows3D(manifold, a, b);
-              this.constraintRows.push(...rows);
-            }
+            gpuCandidatePairs.push([i, j]);
           }
         }
+      }
+    }
+
+    const tBroadphase = performance.now();
+
+    // Narrowphase: GJK collision detection on candidate pairs
+    for (const [i, j] of gpuCandidatePairs) {
+      const manifold = collide3D(bodies[i], bodies[j]);
+      if (manifold) {
+        const rows = this.createContactRows3D(manifold, bodies[i], bodies[j]);
+        this.constraintRows.push(...rows);
       }
     }
 
@@ -708,8 +715,8 @@ export class GPUSolver3D {
     const tEnd = performance.now();
     this.lastTimings = {
       total: tEnd - t0,
-      broadphase: tCollision - t0,
-      narrowphase: 0,
+      broadphase: tBroadphase - t0,
+      narrowphase: tCollision - tBroadphase,
       warmstart: tInit - tCollision,
       bodyInit: 0,
       solverIters: 0,

@@ -197,6 +197,7 @@ export class GPUSolver2D {
 
     // ─── 1. CPU: Collision Detection (spatial hash broadphase) ─────
     constraintStore.clearContacts();
+    const gpu2dCandidatePairs: [number, number][] = [];
 
     {
       const n = bodies.length;
@@ -242,16 +243,22 @@ export class GPUSolver2D {
             const key = i < j ? `${i}-${j}` : `${j}-${i}`;
             if (this.ignorePairs.has(key)) continue;
             if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
-            const manifold = collide2D(a, b);
-            if (manifold) {
-              const rows = createContactConstraintRows(manifold, a, b, config.penaltyMin, Infinity, config.dt);
-              constraintStore.addRows(rows);
-            }
+            gpu2dCandidatePairs.push([i, j]);
           }
         }
       }
     }
 
+    const tBroadphase = performance.now();
+
+    // Narrowphase: SAT collision detection on candidate pairs
+    for (const [i, j] of gpu2dCandidatePairs) {
+      const manifold = collide2D(bodies[i], bodies[j]);
+      if (manifold) {
+        const rows = createContactConstraintRows(manifold, bodies[i], bodies[j], config.penaltyMin, Infinity, config.dt);
+        constraintStore.addRows(rows);
+      }
+    }
     constraintStore.warmstartContacts();
 
     const tCollision = performance.now();
@@ -623,8 +630,8 @@ export class GPUSolver2D {
     const tEnd = performance.now();
     this.lastTimings = {
       total: tEnd - t0,
-      broadphase: tCollision - t0,
-      narrowphase: 0,
+      broadphase: tBroadphase - t0,
+      narrowphase: tCollision - tBroadphase,
       warmstart: tInit - tCollision,
       bodyInit: 0,
       solverIters: 0,

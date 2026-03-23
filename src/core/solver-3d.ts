@@ -231,13 +231,13 @@ export class AVBDSolver3D {
     // 1. Clear contact rows, keep joint rows
     this.constraintRows = [...this.jointRows];
 
-    // 2. Broadphase (spatial hash) + narrowphase
+    // 2. Broadphase (spatial hash) — find candidate pairs
+    const candidatePairs3D: [number, number][] = [];
     {
       const n = bodies.length;
       const aabbs = new Array(n);
       for (let i = 0; i < n; i++) aabbs[i] = getAABB3D(bodies[i]);
 
-      // Cell size from average body extent
       let totalExtent = 0, dynCount = 0;
       for (let i = 0; i < n; i++) {
         if (bodies[i].type !== RigidBodyType.Fixed) {
@@ -280,22 +280,28 @@ export class AVBDSolver3D {
             const pk = i < j ? i * n + j : j * n + i;
             if (tested.has(pk)) continue;
             tested.add(pk);
-            const a = bodies[i], b = bodies[j];
-            if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
+            if (bodies[i].type === RigidBodyType.Fixed && bodies[j].type === RigidBodyType.Fixed) continue;
             const key = `${i}-${j}`;
             if (this.ignorePairs.has(key)) continue;
             if (!aabb3DOverlap(aabbs[i], aabbs[j])) continue;
-            const manifold = collide3D(a, b);
-            if (manifold) {
-              const rows = createContactRows3D(manifold, a, b, config.penaltyMin);
-              this.constraintRows.push(...rows);
-            }
+            candidatePairs3D.push([i, j]);
           }
         }
       }
     }
 
     const tBP = performance.now();
+
+    // Narrowphase: GJK collision detection on candidate pairs
+    for (const [i, j] of candidatePairs3D) {
+      const manifold = collide3D(bodies[i], bodies[j]);
+      if (manifold) {
+        const rows = createContactRows3D(manifold, bodies[i], bodies[j], config.penaltyMin);
+        this.constraintRows.push(...rows);
+      }
+    }
+
+    const tNP = performance.now();
 
     // 3. Warmstart
     for (const row of this.constraintRows) {
@@ -489,8 +495,8 @@ export class AVBDSolver3D {
     this.lastTimings = {
       total: tEnd - t0,
       broadphase: tBP - t0,
-      narrowphase: 0,
-      warmstart: tWS - tBP,
+      narrowphase: tNP - tBP,
+      warmstart: tWS - tNP,
       bodyInit: tBI - tWS,
       solverIters: tEnd - tBI,
       velocityRecover: 0,
