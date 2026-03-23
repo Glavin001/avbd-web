@@ -119,7 +119,7 @@ export const DEFAULT_SOLVER_CONFIG_2D: SolverConfig = {
   alpha: 0.99,
   gamma: 0.99,
   postStabilize: true,
-  penaltyMin: 1,
+  penaltyMin: 100,
   penaltyMax: 1e9,
   gravity: { x: 0, y: -9.81 },
 };
@@ -131,7 +131,7 @@ export const DEFAULT_SOLVER_CONFIG_3D: SolverConfig = {
   alpha: 0.99,
   gamma: 0.99,
   postStabilize: true,
-  penaltyMin: 1,
+  penaltyMin: 100,
   penaltyMax: 1e9,
   gravity: { x: 0, y: -9.81, z: 0 },
 };

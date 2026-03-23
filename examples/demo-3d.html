@@ -442,12 +442,12 @@
 
     // ── Game loop ────────────────────────────────────────────────────────────
 
-    function loop() {
+    async function loop() {
       requestAnimationFrame(loop);
 
-      // Step physics
+      // Step physics (GPU solver returns a Promise)
       if (world) {
-        world.step();
+        await world.step();
       }
 
       // Sync physics to meshes

@@ -117,7 +117,7 @@ export class AVBDSolver2D {
       const bodyB = bodies[manifold.bodyB];
       const rows = createContactConstraintRows(
         manifold, bodyA, bodyB,
-        config.penaltyMin, Infinity,
+        config.penaltyMin, Infinity, config.dt,
       );
       constraintStore.addRows(rows);
     }

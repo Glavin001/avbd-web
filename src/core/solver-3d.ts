@@ -260,6 +260,24 @@ export class AVBDSolver3D {
           if (!row.active || row.broken) continue;
           this.dualUpdate3D(row, dt);
         }
+
+        // Friction coupling: update friction bounds from normal lambdas.
+        // 3D contacts come in triplets: [normal, friction1, friction2].
+        for (let i = 0; i + 2 < this.constraintRows.length; i += 3) {
+          const normalRow = this.constraintRows[i];
+          if (normalRow.type !== ForceType.Contact || !normalRow.active) continue;
+          const fric1 = this.constraintRows[i + 1];
+          const fric2 = this.constraintRows[i + 2];
+          if (!fric1.active || !fric2.active) continue;
+          const bA = this.bodyStore.bodies[normalRow.bodyA];
+          const bB = this.bodyStore.bodies[normalRow.bodyB];
+          const mu = Math.sqrt(bA.friction * bB.friction);
+          const normalForce = Math.abs(normalRow.lambda);
+          fric1.fmin = -mu * normalForce;
+          fric1.fmax = mu * normalForce;
+          fric2.fmin = -mu * normalForce;
+          fric2.fmax = mu * normalForce;
+        }
       }
 
       // Velocity recovery at iteration N-1

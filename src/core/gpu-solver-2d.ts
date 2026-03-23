@@ -207,7 +207,7 @@ export class GPUSolver2D {
         if (!aabb2DOverlap(aabbA, bodyStore.getAABB(b))) continue;
         const manifold = collide2D(a, b);
         if (manifold) {
-          const rows = createContactConstraintRows(manifold, a, b, config.penaltyMin, Infinity);
+          const rows = createContactConstraintRows(manifold, a, b, config.penaltyMin, Infinity, config.dt);
           constraintStore.addRows(rows);
         }
       }

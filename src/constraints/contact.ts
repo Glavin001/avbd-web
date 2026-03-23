@@ -61,6 +61,7 @@ export function createContactConstraintRows(
   bodyB: Body2D,
   penaltyMin: number,
   stiffness: number = Infinity,
+  dt: number = 1 / 60,
 ): ConstraintRow[] {
   const rows: ConstraintRow[] = [];
   const mu = Math.sqrt(bodyA.friction * bodyB.friction);
@@ -93,7 +94,6 @@ export function createContactConstraintRows(
       if (vn < -0.5) { // Only apply restitution above a velocity threshold
         // Bias the constraint to target a separating velocity
         // c0 is modified to account for the desired post-collision velocity
-        const dt = 1 / 60; // Will be overridden by solver
         normalRow.c0 = normalRow.c + restitution * vn * dt;
       }
     }

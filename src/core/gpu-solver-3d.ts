@@ -26,7 +26,7 @@ import { collide3D, getAABB3D, aabb3DOverlap } from '../3d/collision-gjk.js';
 import { vec3Sub, vec3Scale, vec3Cross, vec3Length, vec3, quatMul, quatNormalize, quatFromAxisAngle } from './math.js';
 import { computeGraphColoring } from './graph-coloring.js';
 import { GPUContext } from './gpu-context.js';
-import { PRIMAL_UPDATE_3D_WGSL, DUAL_UPDATE_3D_WGSL } from '../shaders/embedded.js';
+import { PRIMAL_UPDATE_3D_WGSL, DUAL_UPDATE_3D_WGSL, FRICTION_COUPLING_3D_WGSL } from '../shaders/embedded.js';
 
 // ─── GPU Buffer Layout Constants ────────────────────────────────────────────
 
@@ -107,8 +107,11 @@ export class GPUSolver3D {
 
   private primalPipeline!: GPUComputePipeline;
   private dualPipeline!: GPUComputePipeline;
+  private frictionPipeline!: GPUComputePipeline;
   private primalBindGroupLayout!: GPUBindGroupLayout;
   private dualBindGroupLayout!: GPUBindGroupLayout;
+  private frictionBindGroupLayout!: GPUBindGroupLayout;
+  private frictionParamsBuffer!: GPUBuffer;
 
   private maxBodies = 0;
   private maxConstraints = 0;
@@ -159,9 +162,29 @@ export class GPUSolver3D {
       compute: { module: dualModule, entryPoint: 'main' },
     });
 
+    // Friction coupling pipeline: 2 bindings (params uniform + constraints read_write)
+    this.frictionBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+
+    const frictionModule = device.createShaderModule({ code: FRICTION_COUPLING_3D_WGSL });
+    this.frictionPipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.frictionBindGroupLayout] }),
+      compute: { module: frictionModule, entryPoint: 'main' },
+    });
+
     // Solver params uniform
     this.solverParamsBuffer = device.createBuffer({
       size: SOLVER_PARAMS_BYTES,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    // Friction params uniform (4 bytes for num_constraints)
+    this.frictionParamsBuffer = device.createBuffer({
+      size: 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -269,6 +292,12 @@ export class GPUSolver3D {
     const numBodies = bodies.length;
     const numConstraints = this.constraintRows.length;
 
+    // Build per-body constraint indirection (indices into original constraint array)
+    const { bodyRanges, constraintIndices } = this.buildConstraintIndirection(numBodies, numConstraints);
+
+    // Ensure GPU buffers are allocated BEFORE uploading data
+    this.ensureBuffers(numBodies, Math.max(numConstraints, 1), constraintIndices.length);
+
     // Upload body state (20 floats per body)
     const bodyData = new Float32Array(numBodies * BODY_STRIDE);
     for (let i = 0; i < numBodies; i++) {
@@ -316,11 +345,6 @@ export class GPUSolver3D {
       prevData[off + 13] = b.inertialRotation.z;
     }
     gpuWrite(device.queue, this.bodyPrevBuffer, 0, prevData);
-
-    // Build per-body constraint indirection (indices into original constraint array)
-    const { bodyRanges, constraintIndices } = this.buildConstraintIndirection(numBodies, numConstraints);
-
-    this.ensureBuffers(numBodies, Math.max(numConstraints, 1), constraintIndices.length);
 
     // Upload constraints in original order (28 floats = 112 bytes per row)
     if (numConstraints > 0) {
@@ -383,6 +407,9 @@ export class GPUSolver3D {
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
     const velocityRecoveryIter = config.iterations - 1;
 
+    // Push error scope to catch GPU validation errors
+    device.pushErrorScope('validation');
+
     // Buffer to snapshot body state at velocity recovery iteration (before stabilization)
     const bodyReadbackSize = numBodies * BODY_STRIDE * 4;
     let velRecoveryBuffer: GPUBuffer | null = null;
@@ -393,12 +420,19 @@ export class GPUSolver3D {
       });
     }
 
+    // Pre-write friction params (constant across iterations)
+    if (numConstraints > 0) {
+      gpuWrite(device.queue, this.frictionParamsBuffer, 0, new Uint32Array([numConstraints]));
+    }
+
     for (let iter = 0; iter < totalIterations; iter++) {
       const isStabilization = config.postStabilize && iter === totalIterations - 1;
 
-      const encoder = device.createCommandEncoder();
-
       // ─── 4a. Primal update: dispatch per color group ──────────
+      // Each color group gets its own submit to ensure writeBuffer data
+      // (params, indices) is correct for that dispatch. WebGPU writeBuffer
+      // calls are resolved before the NEXT submit, so we must submit
+      // after each group to avoid overwrites.
       for (const colorGroup of this.colorGroups) {
         if (colorGroup.bodyIndices.length === 0) continue;
 
@@ -421,17 +455,22 @@ export class GPUSolver3D {
           ],
         });
 
+        const encoder = device.createCommandEncoder();
         const pass = encoder.beginComputePass();
         pass.setPipeline(this.primalPipeline);
         pass.setBindGroup(0, bindGroup);
         pass.dispatchWorkgroups(Math.ceil(colorGroup.bodyIndices.length / WORKGROUP_SIZE));
         pass.end();
+        device.queue.submit([encoder.finish()]);
       }
 
-      // ─── 4b. Dual update: all constraints ─────────────────────
+      // ─── 4b. Dual update + friction coupling ─────────────────
       if (!isStabilization && numConstraints > 0) {
         this.writeParams(dt, gravity, config, numBodies, numConstraints, 0, false);
 
+        const encoder = device.createCommandEncoder();
+
+        // Dual: update all constraint lambdas
         const dualBindGroup = device.createBindGroup({
           layout: this.dualBindGroupLayout,
           entries: [
@@ -442,19 +481,45 @@ export class GPUSolver3D {
           ],
         });
 
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(this.dualPipeline);
-        pass.setBindGroup(0, dualBindGroup);
-        pass.dispatchWorkgroups(Math.ceil(numConstraints / WORKGROUP_SIZE));
-        pass.end();
+        const dualPass = encoder.beginComputePass();
+        dualPass.setPipeline(this.dualPipeline);
+        dualPass.setBindGroup(0, dualBindGroup);
+        dualPass.dispatchWorkgroups(Math.ceil(numConstraints / WORKGROUP_SIZE));
+        dualPass.end();
+
+        // Friction coupling: separate pass after dual guarantees all
+        // normal lambdas are finalized before updating friction bounds.
+        // 3D contacts produce triplets: [normal, friction1, friction2].
+        const numContactTriplets = Math.ceil(numConstraints / 3);
+        const frictionBindGroup = device.createBindGroup({
+          layout: this.frictionBindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: this.frictionParamsBuffer } },
+            { binding: 1, resource: { buffer: this.constraintBuffer } },
+          ],
+        });
+
+        const fricPass = encoder.beginComputePass();
+        fricPass.setPipeline(this.frictionPipeline);
+        fricPass.setBindGroup(0, frictionBindGroup);
+        fricPass.dispatchWorkgroups(Math.ceil(numContactTriplets / WORKGROUP_SIZE));
+        fricPass.end();
+
+        device.queue.submit([encoder.finish()]);
       }
 
       // Snapshot body state at velocity recovery iteration (before stabilization)
       if (iter === velocityRecoveryIter && velRecoveryBuffer) {
-        encoder.copyBufferToBuffer(this.bodyStateBuffer, 0, velRecoveryBuffer, 0, bodyReadbackSize);
+        const snapEncoder = device.createCommandEncoder();
+        snapEncoder.copyBufferToBuffer(this.bodyStateBuffer, 0, velRecoveryBuffer, 0, bodyReadbackSize);
+        device.queue.submit([snapEncoder.finish()]);
       }
+    }
 
-      device.queue.submit([encoder.finish()]);
+    // Check for GPU validation errors
+    const validationError = await device.popErrorScope();
+    if (validationError) {
+      console.error('GPU validation error:', validationError.message);
     }
 
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
@@ -736,8 +801,8 @@ export class GPUSolver3D {
 
   destroy(): void {
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
-      this.solverParamsBuffer, this.colorIndicesBuffer, this.bodyConstraintRangesBuffer,
-      this.constraintIndicesBuffer]) {
+      this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
+      this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer]) {
       if (buf) buf.destroy();
     }
   }

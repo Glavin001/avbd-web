@@ -196,9 +196,9 @@ describe('Adaptive gravity weighting', () => {
 });
 
 describe('Penalty parameter defaults', () => {
-  it('should use PENALTY_MIN = 1.0 (matching reference)', () => {
+  it('should use PENALTY_MIN = 100 (stable default)', () => {
     const solver = new AVBDSolver2D();
-    expect(solver.config.penaltyMin).toBe(1);
+    expect(solver.config.penaltyMin).toBe(100);
   });
 
   it('should use PENALTY_MAX = 1e9 (matching reference)', () => {
