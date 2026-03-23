@@ -282,18 +282,24 @@ export class AVBDSolver3D {
       body.prevRotation = { ...body.rotation };
 
       // Adaptive gravity weighting (from 2D reference solver):
-      // Bodies under support get less gravity in the inertial estimate,
-      // preventing artificial penetrations that cause explosive corrections.
+      // Bodies under support (nearly stationary) get less gravity in the inertial
+      // estimate, preventing artificial penetrations that cause explosive corrections.
+      // Only apply to slow-moving bodies to avoid creating artificial bounce on impact.
       let gravWeight = 1;
       if (gravMag > 0 && body.prevVelocity) {
-        const dvx = body.velocity.x - body.prevVelocity.x;
-        const dvy = body.velocity.y - body.prevVelocity.y;
-        const dvz = body.velocity.z - body.prevVelocity.z;
-        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
-        if (dvMag > 0.01) {
-          const gravDir = vec3Scale(gravity, 1 / gravMag);
-          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
-          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        const speed = vec3Length(body.velocity);
+        // Only reduce gravity for slow-moving bodies (supported/resting).
+        // Fast-moving bodies need full gravity to fall naturally.
+        if (speed < 0.5) {
+          const dvx = body.velocity.x - body.prevVelocity.x;
+          const dvy = body.velocity.y - body.prevVelocity.y;
+          const dvz = body.velocity.z - body.prevVelocity.z;
+          const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+          if (dvMag > 0.01) {
+            const gravDir = vec3Scale(gravity, 1 / gravMag);
+            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
+            gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+          }
         }
       }
       body.prevVelocity = { ...body.velocity };
@@ -380,6 +386,45 @@ export class AVBDSolver3D {
           const wLen = vec3Length(body.angularVelocity);
           if (wLen > MAX_ANG_VEL) {
             body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / wLen);
+          }
+        }
+
+        // Velocity-level restitution: correct recovered velocity along contact normals.
+        // Without this, the PBD position correction creates artificial bounce —
+        // the constraint pushes the body out of penetration, and velocity recovery
+        // captures this correction as an upward velocity.
+        for (const row of this.constraintRows) {
+          if (!row.active || row.broken) continue;
+          // Only apply to normal contact rows (unilateral, fmin=-Inf, fmax=0)
+          if (row.type !== ForceType.Contact || isFinite(row.fmin)) continue;
+          if (row.lambda >= -1e-6) continue; // Skip inactive contacts
+
+          const bAidx = row.bodyA;
+          const bBidx = row.bodyB;
+          // Extract contact normal from Jacobian (first 3 components for body A)
+          const n = vec3(row.jacobianA[0], row.jacobianA[1], row.jacobianA[2]);
+
+          // Apply restitution to body A
+          if (bAidx >= 0 && bodies[bAidx].type === RigidBodyType.Dynamic) {
+            const bA = bodies[bAidx];
+            const vnA = vec3Dot(bA.velocity, n);
+            if (vnA > 0) { // Separating velocity along normal (bounce)
+              const restitution = Math.max(bA.restitution, bodies[bBidx]?.restitution ?? 0);
+              // Remove the artificial bounce, add back restitution amount
+              const correction = vnA * (1 - restitution);
+              bA.velocity = vec3Sub(bA.velocity, vec3Scale(n, correction));
+            }
+          }
+
+          // Apply restitution to body B (opposite normal)
+          if (bBidx >= 0 && bodies[bBidx].type === RigidBodyType.Dynamic) {
+            const bB = bodies[bBidx];
+            const vnB = vec3Dot(bB.velocity, n);
+            if (vnB < 0) { // Separating in opposite direction
+              const restitution = Math.max(bodies[bAidx]?.restitution ?? 0, bB.restitution);
+              const correction = -vnB * (1 - restitution);
+              bB.velocity = vec3Add(bB.velocity, vec3Scale(n, correction));
+            }
           }
         }
       }

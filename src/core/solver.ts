@@ -177,20 +177,20 @@ export class AVBDSolver2D {
       body.prevPosition = { ...body.position };
       body.prevAngle = body.angle;
 
-      // Adaptive gravity weighting (from reference solver.cpp)
-      // Bodies under support get less gravity in the inertial estimate
-      // accelWeight = clamp(accel_along_gravity / |gravity|, 0, 1)
+      // Adaptive gravity weighting: only reduce gravity for slow-moving (supported)
+      // bodies. Fast-moving bodies need full gravity to avoid artificial bounce.
       let gravWeight = 1;
       if (gravMag > 0) {
-        const dvx = body.velocity.x - body.prevVelocity.x;
-        const dvy = body.velocity.y - body.prevVelocity.y;
-        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
-        // Only apply adaptive weighting when there's meaningful velocity change
-        if (dvMag > 0.01) {
-          const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
-          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
-          // sign(gravity) * accel — positive when accelerating with gravity
-          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        const speed = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+        if (speed < 0.5) {
+          const dvx = body.velocity.x - body.prevVelocity.x;
+          const dvy = body.velocity.y - body.prevVelocity.y;
+          const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
+          if (dvMag > 0.01) {
+            const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
+            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
+            gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+          }
         }
       }
 

@@ -118,6 +118,7 @@
   <div id="stats">
     <span class="label">FPS:</span> <span class="value" id="stat-fps">--</span><br>
     <span class="label">Bodies:</span> <span class="value" id="stat-bodies">0</span><br>
+    <span class="label">Step:</span> <span class="value" id="stat-step">--</span><br>
     <span class="label">Solver:</span> <span class="value" id="stat-solver">CPU</span>
   </div>
 
@@ -547,6 +548,8 @@
 
     const statFps = document.getElementById('stat-fps');
     const statBodies = document.getElementById('stat-bodies');
+    const statStep = document.getElementById('stat-step');
+    let stepTimeMs = 0;
 
     // ── Game loop ────────────────────────────────────────────────────────────
 
@@ -555,7 +558,9 @@
 
       // Step physics (GPU solver returns a Promise)
       if (world) {
+        const t0 = performance.now();
         await world.step();
+        stepTimeMs = performance.now() - t0;
       }
 
       // Sync physics to meshes
@@ -576,6 +581,7 @@
         lastFpsTime = now;
         statFps.textContent = currentFps;
         statBodies.textContent = bodyMeshPairs.length;
+        statStep.textContent = stepTimeMs.toFixed(1) + ' ms';
       }
     }
 

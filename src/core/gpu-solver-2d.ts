@@ -239,17 +239,20 @@ export class GPUSolver2D {
       body.prevPosition = { ...body.position };
       body.prevAngle = body.angle;
 
-      // Adaptive gravity weighting (from CPU reference solver)
+      // Adaptive gravity weighting: only for slow-moving bodies to avoid artificial bounce
       const gravMag = vec2Length(gravity);
       let gravWeight = 1;
       if (gravMag > 0) {
-        const dvx = body.velocity.x - body.prevVelocity.x;
-        const dvy = body.velocity.y - body.prevVelocity.y;
-        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
-        if (dvMag > 0.01) {
-          const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
-          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
-          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        const speed = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+        if (speed < 0.5) {
+          const dvx = body.velocity.x - body.prevVelocity.x;
+          const dvy = body.velocity.y - body.prevVelocity.y;
+          const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
+          if (dvMag > 0.01) {
+            const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
+            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
+            gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+          }
         }
       }
 

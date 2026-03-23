@@ -261,17 +261,21 @@ export class GPUSolver3D {
       body.prevPosition = { ...body.position };
       body.prevRotation = { ...body.rotation };
 
-      // Adaptive gravity weighting (from CPU reference solver)
+      // Adaptive gravity weighting: only reduce gravity for slow-moving (supported)
+      // bodies. Fast-moving bodies need full gravity to avoid artificial bounce on impact.
       let gravWeight = 1;
       if (gravMag > 0) {
-        const dvx = body.velocity.x - body.prevVelocity.x;
-        const dvy = body.velocity.y - body.prevVelocity.y;
-        const dvz = body.velocity.z - body.prevVelocity.z;
-        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
-        if (dvMag > 0.01) {
-          const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag, z: gravity.z / gravMag };
-          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
-          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        const speed = vec3Length(body.velocity);
+        if (speed < 0.5) {
+          const dvx = body.velocity.x - body.prevVelocity.x;
+          const dvy = body.velocity.y - body.prevVelocity.y;
+          const dvz = body.velocity.z - body.prevVelocity.z;
+          const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+          if (dvMag > 0.01) {
+            const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag, z: gravity.z / gravMag };
+            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
+            gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+          }
         }
       }
 
