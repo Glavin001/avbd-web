@@ -50,11 +50,12 @@ fn collider_half_ext(idx: u32) -> vec2<f32> {
 }
 
 fn collider_radius(idx: u32) -> f32 {
-  return bitcast<f32>(collider_info[idx * 8u + 3u]);
+  // Layout: [shape(0), halfExtX(1), halfExtY(2), halfExtZ(3), radius(4), friction(5), ...]
+  return bitcast<f32>(collider_info[idx * 8u + 4u]);
 }
 
 fn collider_friction(idx: u32) -> f32 {
-  return bitcast<f32>(collider_info[idx * 8u + 4u]);
+  return bitcast<f32>(collider_info[idx * 8u + 5u]);
 }
 
 // ─── Contact output helpers ─────────────────────────────────────────────────

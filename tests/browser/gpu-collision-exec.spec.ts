@@ -88,10 +88,7 @@ test.describe('GPU Collision 2D: Constraint Generation', () => {
     });
     expect(r.isGPU).toBe(true);
     expect(r.nc).toBeGreaterThan(0);
-    // Note: circle settles lower than expected due to GPU narrowphase contact
-    // normal computation for box-circle. Critical check is nc > 0 (collision detected).
-    expect(r.y).toBeGreaterThan(-1.0);
-    expect(r.y).toBeLessThan(5);
+    expect(r.y).toBeGreaterThan(0.3);
   });
 
   test('box-box stacked generates constraints', async ({ page }) => {
@@ -153,9 +150,8 @@ test.describe('GPU Collision 2D: Constraint Generation', () => {
     });
     expect(r.isGPU).toBe(true);
     expect(r.nc).toBeGreaterThanOrEqual(2);
-    // Circles have known slight penetration in GPU narrowphase
-    expect(r.y1).toBeGreaterThan(-1.0);
-    expect(r.y2).toBeGreaterThan(-1.0);
+    expect(r.y1).toBeGreaterThan(0.3);
+    expect(r.y2).toBeGreaterThan(0.3);
   });
 
   test('5-box stack generates many constraints', async ({ page }) => {
