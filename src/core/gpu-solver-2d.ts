@@ -71,6 +71,7 @@ export class GPUSolver2D {
 
   private gpu: GPUContext;
   private initialized = false;
+  private _stepping = false;
 
   // GPU resources
   private bodyStateBuffer!: GPUBuffer;
@@ -80,6 +81,12 @@ export class GPUSolver2D {
   private colorIndicesBuffer!: GPUBuffer;
   private bodyConstraintRangesBuffer!: GPUBuffer;
   private constraintIndicesBuffer!: GPUBuffer;
+
+  // Persistent staging buffers for readback (grown in ensureBuffers)
+  private _bodyStagingBuffer: GPUBuffer | null = null;
+  private _crStagingBuffer: GPUBuffer | null = null;
+  private _velRecoveryStagingBuffer: GPUBuffer | null = null;
+  private _stagingMapped = false;
 
   private primalPipeline!: GPUComputePipeline;
   private dualPipeline!: GPUComputePipeline;
@@ -185,7 +192,24 @@ export class GPUSolver2D {
    */
   async step(): Promise<void> {
     if (!this.initialized) await this.init();
+    // Prevent concurrent step() calls — with async GPU readback, rAF at top of loop
+    // can overlap, causing staging buffer race conditions.
+    if (this._stepping) return;
+    this._stepping = true;
+    try {
+      await this._stepImpl();
+    } finally {
+      this._stepping = false;
+      if (this._stagingMapped) {
+        try { this._bodyStagingBuffer?.unmap(); } catch { /* already unmapped */ }
+        try { this._crStagingBuffer?.unmap(); } catch { /* already unmapped */ }
+        try { this._velRecoveryStagingBuffer?.unmap(); } catch { /* already unmapped */ }
+        this._stagingMapped = false;
+      }
+    }
+  }
 
+  private async _stepImpl(): Promise<void> {
     const t0 = performance.now();
     const { config, bodyStore, constraintStore, gpu } = this;
     const dt = config.dt;
@@ -427,15 +451,9 @@ export class GPUSolver2D {
     // Push error scope to catch GPU validation errors
     device.pushErrorScope('validation');
 
-    // Buffer to snapshot body state at velocity recovery iteration (before stabilization)
+    // Use persistent velRecovery staging buffer (allocated in ensureBuffers)
     const bodyReadbackSize = numBodies * BODY_STRIDE * 4;
-    let velRecoveryBuffer: GPUBuffer | null = null;
-    if (config.postStabilize) {
-      velRecoveryBuffer = device.createBuffer({
-        size: bodyReadbackSize,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-    }
+    const velRecoveryBuffer = config.postStabilize ? this._velRecoveryStagingBuffer : null;
 
     // Pre-write friction params (constant across iterations)
     if (numConstraints > 0) {
@@ -542,48 +560,41 @@ export class GPUSolver2D {
     const tDispatch = performance.now();
 
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
-    // Readback final body state (post-stabilization positions)
-    const bodyStagingBuffer = device.createBuffer({
-      size: bodyReadbackSize,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
+    // Persistent staging buffers (allocated in ensureBuffers, reused across frames)
+    const bodyStagingBuffer = this._bodyStagingBuffer!;
+    const crStagingBuffer = (numConstraints > 0) ? this._crStagingBuffer : null;
     const copyEncoder = device.createCommandEncoder();
     copyEncoder.copyBufferToBuffer(this.bodyStateBuffer, 0, bodyStagingBuffer, 0, bodyReadbackSize);
-
-    // Readback constraints (for lambda/penalty warmstarting)
-    let crStagingBuffer: GPUBuffer | null = null;
-    if (numConstraints > 0) {
+    if (crStagingBuffer && numConstraints > 0) {
       const crReadbackSize = numConstraints * CONSTRAINT_STRIDE * 4;
-      crStagingBuffer = device.createBuffer({
-        size: crReadbackSize,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-      });
       copyEncoder.copyBufferToBuffer(this.constraintBuffer, 0, crStagingBuffer, 0, crReadbackSize);
     }
 
     device.queue.submit([copyEncoder.finish()]);
 
-    // Map ALL staging buffers in parallel — single GPU fence wait instead of serial ones
+    // Map ALL staging buffers in parallel — single GPU fence wait
     const mapPromises: Promise<void>[] = [bodyStagingBuffer.mapAsync(GPUMapMode.READ)];
     if (velRecoveryBuffer) mapPromises.push(velRecoveryBuffer.mapAsync(GPUMapMode.READ));
-    if (crStagingBuffer) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
+    if (crStagingBuffer && numConstraints > 0) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
     await Promise.all(mapPromises);
+    this._stagingMapped = true;
 
-    const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange().slice(0));
-    bodyStagingBuffer.unmap();
-    bodyStagingBuffer.destroy();
+    // Read directly from mapped ranges (no .slice(0) copy — we read inline before unmap)
+    const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange());
 
     let velRecoveryResult: Float32Array | null = null;
     if (velRecoveryBuffer) {
-      velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange().slice(0));
-      velRecoveryBuffer.unmap();
-      velRecoveryBuffer.destroy();
+      velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange());
     }
 
     // ─── 6. CPU: Apply Results ────────────────────────────────────
     // Use pre-stabilization positions for velocity recovery (matching CPU solver),
     // but final (post-stabilization) positions for body state
     const velSource = velRecoveryResult ?? bodyResult;
+
+    const MAX_LINEAR_VELOCITY = 100;
+    const MAX_ANGULAR_VELOCITY = 50;
+    const invDt = 1 / dt;
 
     for (let i = 0; i < numBodies; i++) {
       const body = bodies[i];
@@ -594,38 +605,39 @@ export class GPUSolver2D {
       body.position.y = bodyResult[off + 1];
       body.angle = bodyResult[off + 2];
 
-      // BDF1 velocity recovery from pre-stabilization positions
-      const MAX_LINEAR_VELOCITY = 100;
-      const MAX_ANGULAR_VELOCITY = 50;
-      body.velocity = {
-        x: (velSource[off + 0] - body.prevPosition.x) / dt,
-        y: (velSource[off + 1] - body.prevPosition.y) / dt,
-      };
-      // Clamp recovered linear velocity
-      const vMag = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+      // BDF1 velocity recovery from pre-stabilization positions (no object allocation)
+      let vx = (velSource[off + 0] - body.prevPosition.x) * invDt;
+      let vy = (velSource[off + 1] - body.prevPosition.y) * invDt;
+      const vMag = Math.sqrt(vx * vx + vy * vy);
       if (vMag > MAX_LINEAR_VELOCITY) {
         const scale = MAX_LINEAR_VELOCITY / vMag;
-        body.velocity.x *= scale;
-        body.velocity.y *= scale;
+        vx *= scale;
+        vy *= scale;
       }
-      body.angularVelocity = (velSource[off + 2] - body.prevAngle) / dt;
-      // Clamp recovered angular velocity
-      body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
-        Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
+      body.velocity.x = vx;
+      body.velocity.y = vy;
+
+      let av = (velSource[off + 2] - body.prevAngle) * invDt;
+      if (av > MAX_ANGULAR_VELOCITY) av = MAX_ANGULAR_VELOCITY;
+      else if (av < -MAX_ANGULAR_VELOCITY) av = -MAX_ANGULAR_VELOCITY;
+      body.angularVelocity = av;
     }
 
-    // Readback constraint lambdas for warmstarting (already mapped via Promise.all above)
+    // Readback constraint lambdas for warmstarting
     if (crStagingBuffer && numConstraints > 0) {
-      const crResult = new DataView(crStagingBuffer.getMappedRange().slice(0));
-      crStagingBuffer.unmap();
-      crStagingBuffer.destroy();
-
+      const crResult = new DataView(crStagingBuffer.getMappedRange());
       for (let i = 0; i < numConstraints; i++) {
         const byteOff = i * CONSTRAINT_STRIDE * 4;
         rows[i].lambda = crResult.getFloat32(byteOff + 88, true);
         rows[i].penalty = crResult.getFloat32(byteOff + 92, true);
       }
     }
+
+    // Unmap all persistent staging buffers (must happen after all reads)
+    bodyStagingBuffer.unmap();
+    if (crStagingBuffer && numConstraints > 0) crStagingBuffer.unmap();
+    if (velRecoveryBuffer) velRecoveryBuffer.unmap();
+    this._stagingMapped = false;
 
     const tEnd = performance.now();
     this.lastTimings = {
@@ -701,6 +713,8 @@ export class GPUSolver2D {
     const device = this.gpu.device;
     const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
 
+    const MAP_READ_DST = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
+
     if (numBodies > this.maxBodies) {
       this.maxBodies = Math.max(numBodies, this.maxBodies * 2, 64);
       if (this.bodyStateBuffer) this.bodyStateBuffer.destroy();
@@ -712,12 +726,26 @@ export class GPUSolver2D {
       this.bodyPrevBuffer = device.createBuffer({ size: this.maxBodies * BODY_PREV_STRIDE * 4, usage: STORAGE });
       this.bodyConstraintRangesBuffer = device.createBuffer({ size: this.maxBodies * 2 * 4, usage: STORAGE });
       this.colorIndicesBuffer = device.createBuffer({ size: this.maxBodies * 4, usage: STORAGE });
+
+      // Persistent staging buffers for readback (body state + velocity recovery snapshot)
+      const bodyStagingSize = this.maxBodies * BODY_STRIDE * 4;
+      if (this._bodyStagingBuffer) this._bodyStagingBuffer.destroy();
+      this._bodyStagingBuffer = device.createBuffer({ size: bodyStagingSize, usage: MAP_READ_DST });
+      if (this._velRecoveryStagingBuffer) this._velRecoveryStagingBuffer.destroy();
+      this._velRecoveryStagingBuffer = device.createBuffer({ size: bodyStagingSize, usage: MAP_READ_DST });
     }
 
     if (numConstraints > this.maxConstraints) {
       this.maxConstraints = Math.max(numConstraints, this.maxConstraints * 2, 64);
       if (this.constraintBuffer) this.constraintBuffer.destroy();
       this.constraintBuffer = device.createBuffer({ size: this.maxConstraints * CONSTRAINT_STRIDE * 4, usage: STORAGE });
+
+      // Persistent constraint staging buffer for readback
+      if (this._crStagingBuffer) this._crStagingBuffer.destroy();
+      this._crStagingBuffer = device.createBuffer({
+        size: this.maxConstraints * CONSTRAINT_STRIDE * 4,
+        usage: MAP_READ_DST,
+      });
     }
 
     const ciCount = Math.max(numConstraintIndices, 1);
@@ -731,8 +759,12 @@ export class GPUSolver2D {
   destroy(): void {
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
       this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
-      this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer]) {
+      this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer,
+      this._bodyStagingBuffer, this._crStagingBuffer, this._velRecoveryStagingBuffer]) {
       if (buf) buf.destroy();
     }
+    this._bodyStagingBuffer = null;
+    this._crStagingBuffer = null;
+    this._velRecoveryStagingBuffer = null;
   }
 }

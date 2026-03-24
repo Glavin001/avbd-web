@@ -369,21 +369,21 @@ describe('Multi-step physics stability', () => {
 // would cause runtime errors in the browser (detached buffers, etc.)
 
 describe('GPU solver staging buffer safety', () => {
-  it('staging buffers should use safe per-frame create/destroy pattern', async () => {
+  it('persistent staging buffers have error recovery in finally block', async () => {
     const fs = await import('fs');
     const source = fs.readFileSync(new URL('../src/core/gpu-solver-3d.ts', import.meta.url), 'utf-8');
 
-    // Staging buffers should be created per-frame (not persistent class fields)
-    // This prevents state corruption from concurrent async step() calls
-    expect(source).toContain('bodyStagingBuffer.destroy()');
-    expect(source).toContain('crStagingBuffer.destroy()');
+    // Persistent staging buffers need error recovery so they don't stay mapped
+    expect(source).toContain('_stagingMapped');
+    // The finally block should unmap staging buffers on error
+    expect(source).toContain('_bodyStagingBuffer?.unmap()');
+    expect(source).toContain('_crStagingBuffer?.unmap()');
   });
 
   it('step() should have concurrency guard', async () => {
     const fs = await import('fs');
     const source = fs.readFileSync(new URL('../src/core/gpu-solver-3d.ts', import.meta.url), 'utf-8');
 
-    // The step() method should guard against concurrent calls
     expect(source).toContain('_stepping');
     expect(source).toContain('finally');
   });
@@ -392,10 +392,27 @@ describe('GPU solver staging buffer safety', () => {
     const fs = await import('fs');
     const source = fs.readFileSync(new URL('../src/core/gpu-solver-3d.ts', import.meta.url), 'utf-8');
 
-    // Should throw validation errors so callers can display them
     expect(source).toContain("throw new Error('GPU validation error:");
-    // Should NOT silently console.error validation errors
     expect(source).not.toContain("console.error('GPU validation error:");
+  });
+
+  it('reads from mapped range before unmap (no read-after-unmap)', async () => {
+    const fs = await import('fs');
+    const source = fs.readFileSync(new URL('../src/core/gpu-solver-3d.ts', import.meta.url), 'utf-8');
+
+    // Body positions must be read from mapped range before unmap
+    const bodyReadMatch = source.match(
+      /bodyStagingBuffer\.getMappedRange\(\)([\s\S]*?)bodyStagingBuffer\.unmap\(\)/
+    );
+    expect(bodyReadMatch).not.toBeNull();
+    expect(bodyReadMatch![1]).toContain('body.position');
+
+    // Constraint lambdas must be read before unmap
+    const crReadMatch = source.match(
+      /crStagingBuffer\.getMappedRange\(\)([\s\S]*?)crStagingBuffer\.unmap\(\)/
+    );
+    expect(crReadMatch).not.toBeNull();
+    expect(crReadMatch![1]).toContain('lambda');
   });
 });
 
