@@ -13,6 +13,8 @@ export interface GPUContextOptions {
 export class GPUContext {
   device!: GPUDevice;
   adapter!: GPUAdapter;
+  /** Callback invoked when the GPU device is lost. Set by consumers to handle device loss. */
+  onDeviceLost: ((message: string) => void) | null = null;
   private pipelines: Map<string, GPUComputePipeline> = new Map();
   private buffers: Map<string, GPUBuffer> = new Map();
   private bindGroups: Map<string, GPUBindGroup> = new Map();
@@ -45,6 +47,7 @@ export class GPUContext {
 
     device.lost.then((info) => {
       console.error('WebGPU device lost:', info.message);
+      ctx.onDeviceLost?.(info.message);
     });
 
     return ctx;

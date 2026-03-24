@@ -533,10 +533,10 @@ export class GPUSolver2D {
       }
     }
 
-    // Check for GPU validation errors
+    // Check for GPU validation errors — throw so callers can display them
     const validationError = await device.popErrorScope();
     if (validationError) {
-      console.error('GPU validation error:', validationError.message);
+      throw new Error('GPU validation error: ' + validationError.message);
     }
 
     const tDispatch = performance.now();

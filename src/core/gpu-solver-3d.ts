@@ -144,12 +144,6 @@ export class GPUSolver3D {
   private _crUploadView: DataView | null = null;
   private _colorUpload: Uint32Array | null = null;
 
-  // Staging buffers for readback (persistent, grown in ensureBuffers)
-  private _bodyStagingBuffer: GPUBuffer | null = null;
-  private _bodyStagingSize = 0;
-  private _crStagingBuffer: GPUBuffer | null = null;
-  private _crStagingSize = 0;
-
   // Cached bind groups (invalidated when buffers grow)
   private _primalBindGroup: GPUBindGroup | null = null;
   private _dualBindGroup: GPUBindGroup | null = null;
@@ -787,27 +781,26 @@ export class GPUSolver3D {
       }
     }
 
-    // Check for GPU validation errors
+    // Check for GPU validation errors — throw so callers can display them
     const validationError = await device.popErrorScope();
     if (validationError) {
-      console.error('GPU validation error:', validationError.message);
+      throw new Error('GPU validation error: ' + validationError.message);
     }
 
     const tDispatch = performance.now();
 
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
-    // Use persistent staging buffers (allocated in ensureBuffers, avoid per-frame create/destroy)
-    const bodyStagingBuffer = this._bodyStagingBuffer!;
+    // Per-frame staging buffers (safe for async game loops — no state conflicts)
+    const MAP_READ_DST = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
+    const bodyStagingBuffer = device.createBuffer({ size: bodyReadbackSize, usage: MAP_READ_DST });
     const copyEncoder = device.createCommandEncoder();
     copyEncoder.copyBufferToBuffer(this.bodyStateBuffer, 0, bodyStagingBuffer, 0, bodyReadbackSize);
 
     let crStagingBuffer: GPUBuffer | null = null;
     if (numConstraints > 0) {
       const crReadbackSize = numConstraints * CONSTRAINT_STRIDE * 4;
-      crStagingBuffer = this._crStagingBuffer;
-      if (crStagingBuffer) {
-        copyEncoder.copyBufferToBuffer(this.constraintBuffer, 0, crStagingBuffer, 0, crReadbackSize);
-      }
+      crStagingBuffer = device.createBuffer({ size: crReadbackSize, usage: MAP_READ_DST });
+      copyEncoder.copyBufferToBuffer(this.constraintBuffer, 0, crStagingBuffer, 0, crReadbackSize);
     }
 
     device.queue.submit([copyEncoder.finish()]);
@@ -815,15 +808,19 @@ export class GPUSolver3D {
     // Map ALL staging buffers in parallel — single GPU fence wait instead of 3 serial ones
     const mapPromises: Promise<void>[] = [bodyStagingBuffer.mapAsync(GPUMapMode.READ)];
     if (velRecoveryBuffer) mapPromises.push(velRecoveryBuffer.mapAsync(GPUMapMode.READ));
-    if (crStagingBuffer && numConstraints > 0) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
+    if (crStagingBuffer) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
     await Promise.all(mapPromises);
 
-    // Read body results directly from mapped range (avoid .slice(0) deep copy)
-    const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange());
+    const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange().slice(0));
+    bodyStagingBuffer.unmap();
+    bodyStagingBuffer.destroy();
 
     let velRecoveryResult: Float32Array | null = null;
     if (velRecoveryBuffer) {
-      velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange());
+      velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange().slice(0));
+      velRecoveryBuffer.unmap();
+      velRecoveryBuffer.destroy();
+      velRecoveryBuffer = null;
     }
 
     // ─── 6. CPU: Apply Results ────────────────────────────────────
@@ -887,24 +884,17 @@ export class GPUSolver3D {
       body.angularVelocity.z = wz;
     }
 
-    // Unmap staging buffers (persistent — do NOT destroy)
-    bodyStagingBuffer.unmap();
-    if (velRecoveryBuffer) {
-      velRecoveryBuffer.unmap();
-      velRecoveryBuffer.destroy(); // vel recovery is still per-frame since size depends on postStabilize
-    }
-
-    // Readback constraint lambdas for warmstarting (already mapped via Promise.all above)
+    // Readback constraint lambdas for warmstarting
     if (crStagingBuffer && numConstraints > 0) {
-      const crResult = new DataView(crStagingBuffer.getMappedRange());
+      const crResult = new DataView(crStagingBuffer.getMappedRange().slice(0));
+      crStagingBuffer.unmap();
+      crStagingBuffer.destroy();
 
       for (let i = 0; i < numConstraints; i++) {
         const byteOff = i * CONSTRAINT_STRIDE * 4;
         this.constraintRows[i].lambda = crResult.getFloat32(byteOff + 120, true);
         this.constraintRows[i].penalty = crResult.getFloat32(byteOff + 124, true);
       }
-
-      crStagingBuffer.unmap(); // persistent — do NOT destroy; must unmap AFTER reading
     }
 
     const tEnd = performance.now();
@@ -1100,7 +1090,6 @@ export class GPUSolver3D {
   private ensureBuffers(numBodies: number, numConstraints: number, numConstraintIndices: number): void {
     const device = this.gpu.device;
     const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
-    const MAP_READ_DST = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
 
     if (numBodies > this.maxBodies) {
       this.maxBodies = Math.max(numBodies, this.maxBodies * 2, 64);
@@ -1119,11 +1108,6 @@ export class GPUSolver3D {
       this._prevUpload = new Float32Array(this.maxBodies * BODY_PREV_STRIDE);
       this._colorUpload = new Uint32Array(this.maxBodies);
 
-      // Persistent body staging buffer for readback
-      if (this._bodyStagingBuffer) this._bodyStagingBuffer.destroy();
-      this._bodyStagingSize = this.maxBodies * BODY_STRIDE * 4;
-      this._bodyStagingBuffer = device.createBuffer({ size: this._bodyStagingSize, usage: MAP_READ_DST });
-
       // Invalidate cached bind groups (buffers changed)
       this._primalBindGroup = null;
       this._dualBindGroup = null;
@@ -1138,11 +1122,6 @@ export class GPUSolver3D {
       // Reusable constraint upload buffer
       this._crUpload = new ArrayBuffer(this.maxConstraints * CONSTRAINT_STRIDE * 4);
       this._crUploadView = new DataView(this._crUpload);
-
-      // Persistent constraint staging buffer for readback
-      if (this._crStagingBuffer) this._crStagingBuffer.destroy();
-      this._crStagingSize = this.maxConstraints * CONSTRAINT_STRIDE * 4;
-      this._crStagingBuffer = device.createBuffer({ size: this._crStagingSize, usage: MAP_READ_DST });
 
       // Invalidate cached bind groups (constraint buffer changed)
       this._primalBindGroup = null;
@@ -1211,11 +1190,8 @@ export class GPUSolver3D {
   destroy(): void {
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
       this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
-      this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer,
-      this._bodyStagingBuffer, this._crStagingBuffer]) {
+      this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer]) {
       if (buf) buf.destroy();
     }
-    this._bodyStagingBuffer = null;
-    this._crStagingBuffer = null;
   }
 }
