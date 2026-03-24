@@ -869,7 +869,10 @@ export class GPUSolver3D {
     fv[4] = config.penaltyMin;
     fv[5] = config.penaltyMax;
     fv[6] = config.beta;
-    fv[7] = config.alpha;
+    // Per-iteration alpha (reference: solver.cpp):
+    // Normal iterations: alpha=1.0 → C0*(1-1)=0, only J·dp (position changes)
+    // Stabilization: alpha=0.0 → C0*(1-0)=C0, full violation correction
+    fv[7] = isStabilization ? 0.0 : 1.0;
     uv[8] = numBodies;
     uv[9] = numConstraints;
     uv[10] = numBodiesInGroup;

@@ -395,9 +395,11 @@ export class AVBDSolver2D {
 
       // Evaluate constraint (Taylor-series linearization)
       // C = C0*(1-alpha) + J_A*dp_A + J_B*dp_B
-      // The (1-alpha) factor prevents over-correction of pre-existing penetrations.
-      // Reference: manifold.cpp — C = C0 * (1 - alpha) + J*dq
-      let cEval = row.c0 * (1 - this.config.alpha);
+      // Per-iteration alpha (reference: solver.cpp):
+      //   Normal iterations: alpha=1.0 → C0 term vanishes, only J·dp
+      //   Stabilization: alpha=0.0 → full C0 correction
+      const iterAlpha = isStabilization ? 0.0 : 1.0;
+      let cEval = row.c0 * (1 - iterAlpha);
       if (row.bodyA >= 0) {
         const bA = this.bodyStore.bodies[row.bodyA];
         cEval += row.jacobianA[0] * (bA.position.x - bA.prevPosition.x)
@@ -461,8 +463,8 @@ export class AVBDSolver2D {
     const bodies = this.bodyStore.bodies;
 
     // Re-evaluate constraint value with current positions
-    // C = C0*(1-alpha) + J*dp (same linearization as primal)
-    let cEval = row.c0 * (1 - this.config.alpha);
+    // C = J*dp (dual only runs on non-stabilization iterations, so alpha=1.0)
+    let cEval = 0; // C0*(1-1.0) = 0
     if (row.bodyA >= 0) {
       const bA = bodies[row.bodyA];
       cEval += row.jacobianA[0] * (bA.position.x - bA.prevPosition.x)

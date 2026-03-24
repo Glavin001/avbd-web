@@ -405,7 +405,7 @@ export class AVBDSolver3D {
       // Primal update
       for (const body of bodies) {
         if (body.type === RigidBodyType.Fixed) continue;
-        this.primalUpdate3D(body, dt);
+        this.primalUpdate3D(body, dt, isStab);
       }
 
       // Dual update (skip on stabilization)
@@ -521,7 +521,7 @@ export class AVBDSolver3D {
     };
   }
 
-  private primalUpdate3D(body: Body3D, dt: number): void {
+  private primalUpdate3D(body: Body3D, dt: number, isStabilization = false): void {
     const dt2 = dt * dt;
     const n = 6;
 
@@ -564,8 +564,11 @@ export class AVBDSolver3D {
       else continue;
 
       // Evaluate linearized constraint: C = C0*(1-alpha) + J*dp
-      // The (1-alpha) factor prevents over-correction of pre-existing violations.
-      let cEval = row.c0 * (1 - this.config.alpha);
+      // Per-iteration alpha (reference: solver.cpp):
+      //   Normal iterations: alpha=1.0 → C0 term vanishes, only J·dp
+      //   Stabilization: alpha=0.0 → full C0 correction
+      const iterAlpha = isStabilization ? 0.0 : 1.0;
+      let cEval = row.c0 * (1 - iterAlpha);
       if (row.bodyA >= 0) {
         const bA = this.bodyStore.bodies[row.bodyA];
         const dpA = vec3Sub(bA.position, bA.prevPosition);
@@ -635,7 +638,8 @@ export class AVBDSolver3D {
   }
 
   private dualUpdate3D(row: ConstraintRow3D, dt: number): void {
-    let cEval = row.c0 * (1 - this.config.alpha);
+    // Dual only runs on non-stabilization iterations, so alpha=1.0 → C0 term vanishes
+    let cEval = 0; // C0*(1-1.0) = 0
     if (row.bodyA >= 0) {
       const bA = this.bodyStore.bodies[row.bodyA];
       const dpA = vec3Sub(bA.position, bA.prevPosition);

@@ -695,7 +695,10 @@ export class GPUSolver2D {
     fv[3] = config.penaltyMin;
     fv[4] = config.penaltyMax;
     fv[5] = config.beta;
-    fv[6] = config.alpha;
+    // Per-iteration alpha (reference: solver.cpp):
+    // Normal iterations: alpha=1.0 → C0*(1-1)=0, only J·dp (position changes)
+    // Stabilization: alpha=0.0 → C0*(1-0)=C0, full violation correction
+    fv[6] = isStabilization ? 0.0 : 1.0;
     uv[7] = numBodies;
     uv[8] = numConstraints;
     uv[9] = numBodiesInGroup;
