@@ -40,6 +40,8 @@ export interface WorldConfig {
   postStabilize?: boolean;
   /** Timestep (default: 1/60) */
   dt?: number;
+  /** Use GPU-accelerated collision detection (default: true when GPU available) */
+  useGPUCollision?: boolean;
 }
 
 export class World {
@@ -60,6 +62,7 @@ export class World {
       gamma: config.gamma ?? DEFAULT_SOLVER_CONFIG_2D.gamma,
       postStabilize: config.postStabilize ?? DEFAULT_SOLVER_CONFIG_2D.postStabilize,
       dt: config.dt ?? DEFAULT_SOLVER_CONFIG_2D.dt,
+      useGPUCollision: config.useGPUCollision,
     };
 
     // Always create CPU solver (used for step() and as fallback)

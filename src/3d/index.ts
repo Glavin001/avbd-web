@@ -31,6 +31,8 @@ export interface WorldConfig3D {
   dt?: number;
   /** Opt-in: use CPU solver instead of GPU. Default: false (GPU). */
   useCPU?: boolean;
+  /** Use GPU-accelerated collision detection (default: true when GPU available) */
+  useGPUCollision?: boolean;
 }
 
 export class World3D {
@@ -47,6 +49,7 @@ export class World3D {
       gamma: config.gamma ?? DEFAULT_SOLVER_CONFIG_3D.gamma,
       postStabilize: config.postStabilize ?? DEFAULT_SOLVER_CONFIG_3D.postStabilize,
       dt: config.dt ?? DEFAULT_SOLVER_CONFIG_3D.dt,
+      useGPUCollision: config.useGPUCollision,
     };
 
     if (config.useCPU) {
