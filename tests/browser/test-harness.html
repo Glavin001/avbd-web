@@ -1359,6 +1359,529 @@
       };
     });
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // GPU Collision Execution Tests — Constraint Generation Validation
+    // These tests verify that the GPU collision pipeline actually generates
+    // constraints by running real WebGPU shaders and checking numConstraints.
+    // A stride mismatch (the critical bug) causes 0 constraints → fall-through.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── 2D Constraint Generation: Box on Ground ─────────────────────────
+    await window.runTest('gpuExec2d_constraints_boxOnGround', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), body);
+
+      // Step until box reaches ground
+      for (let i = 0; i < 30; i++) await world.step();
+      const t = world.lastTimings;
+      const pos = body.translation();
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) > 0,
+        y: pos.y,
+        aboveGround: pos.y > 0.3,
+        finite: isFinite(pos.y),
+      };
+    });
+
+    // ─── 2D Constraint Generation: No Constraints When Separated ─────────
+    await window.runTest('gpuExec2d_noConstraints_separated', async () => {
+      const world = new AVBD.World({ x: 0, y: 0 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 100));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), body);
+      await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? -1,
+        noConstraints: (t?.numConstraints ?? -1) === 0,
+      };
+    });
+
+    // ─── 2D Constraint Generation: Circle on Ground ──────────────────────
+    await window.runTest('gpuExec2d_constraints_circleOnGround', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1));
+      world.createCollider(AVBD.ColliderDesc.ball(0.5).setFriction(0.5), body);
+      for (let i = 0; i < 30; i++) await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) > 0,
+        y: body.translation().y,
+        aboveGround: body.translation().y > 0.3,
+      };
+    });
+
+    // ─── 2D Constraint Generation: Box-Box dynamic ───────────────────────
+    await window.runTest('gpuExec2d_constraints_boxBox', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      // Ground
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+      // Two boxes stacked
+      const b1 = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b1);
+      const b2 = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 2.2));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b2);
+      for (let i = 0; i < 60; i++) await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        // Should have contacts from b1-ground AND b2-b1
+        hasConstraints: (t?.numConstraints ?? 0) >= 2,
+        y1: b1.translation().y, y2: b2.translation().y,
+        ordered: b2.translation().y > b1.translation().y,
+        bothAboveGround: b1.translation().y > 0.3 && b2.translation().y > 0.3,
+      };
+    });
+
+    // ─── 2D Constraint Generation: Box-Circle ────────────────────────────
+    await window.runTest('gpuExec2d_constraints_boxCircle', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+      // Box on ground
+      const box = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), box);
+      // Circle on top
+      const circ = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 2.2));
+      world.createCollider(AVBD.ColliderDesc.ball(0.5).setFriction(0.5), circ);
+      for (let i = 0; i < 60; i++) await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) >= 2,
+        boxY: box.translation().y, circY: circ.translation().y,
+        bothAbove: box.translation().y > 0.3 && circ.translation().y > 0.3,
+      };
+    });
+
+    // ─── 2D Constraint Generation: Circle-Circle ─────────────────────────
+    await window.runTest('gpuExec2d_constraints_circleCircle', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+      const c1 = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1));
+      world.createCollider(AVBD.ColliderDesc.ball(0.5).setFriction(0.5), c1);
+      const c2 = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 2.2));
+      world.createCollider(AVBD.ColliderDesc.ball(0.5).setFriction(0.5), c2);
+      for (let i = 0; i < 60; i++) await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) >= 2,
+        y1: c1.translation().y, y2: c2.translation().y,
+        bothAbove: c1.translation().y > 0.3 && c2.translation().y > 0.3,
+      };
+    });
+
+    // ─── 2D Constraint Generation: 5-box stack ──────────────────────────
+    await window.runTest('gpuExec2d_constraints_multiBody', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.8));
+      const bodies = [];
+      for (let i = 0; i < 5; i++) {
+        const b = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1 + i * 1.1));
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.8), b);
+        bodies.push(b);
+      }
+      for (let i = 0; i < 120; i++) await world.step();
+      const t = world.lastTimings;
+      const ys = bodies.map(b => b.translation().y);
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        // 5 boxes = at least 5 contacts × 2 rows = 10 constraints
+        hasEnoughConstraints: (t?.numConstraints ?? 0) >= 8,
+        ys,
+        allAbove: ys.every(y => y > 0.3),
+        allFinite: ys.every(y => isFinite(y)),
+      };
+    });
+
+    // ─── 2D Constraint Generation: Single body, no ground ────────────────
+    await window.runTest('gpuExec2d_noConstraints_singleBody', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      const b = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 5));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), b);
+      await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? -1,
+        noConstraints: (t?.numConstraints ?? -1) === 0,
+      };
+    });
+
+    // ─── 2D Physics: No NaN with many bodies ─────────────────────────────
+    await window.runTest('gpuExec2d_noNaN_manyBodies', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(20, 0.5).setFriction(0.5));
+      const bodies = [];
+      for (let i = 0; i < 20; i++) {
+        const b = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation((i % 5) * 1.5 - 3, 1.5 + Math.floor(i / 5) * 1.5));
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b);
+        bodies.push(b);
+      }
+      for (let i = 0; i < 60; i++) await world.step();
+      const positions = bodies.map(b => b.translation());
+      return {
+        isGPU: world.isGPU,
+        allFinite: positions.every(p => isFinite(p.x) && isFinite(p.y)),
+        noneBelow: positions.every(p => p.y > -10),
+        count: positions.length,
+      };
+    });
+
+    // ─── 2D Physics: Fast box doesn't explode ────────────────────────────
+    await window.runTest('gpuExec2d_noBounceExplosion', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+      const b = world.createRigidBody(
+        AVBD.RigidBodyDesc.dynamic().setTranslation(0, 10).setLinvel(0, -20));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b);
+      let maxY = -Infinity;
+      for (let i = 0; i < 120; i++) {
+        await world.step();
+        maxY = Math.max(maxY, b.translation().y);
+      }
+      const finalY = b.translation().y;
+      return {
+        isGPU: world.isGPU,
+        maxY, finalY,
+        bounded: maxY < 20,
+        settled: finalY > 0.3 && finalY < 5,
+        finite: isFinite(finalY),
+      };
+    });
+
+    // ─── 2D GPU vs CPU Parity: Constraint counts ────────────────────────
+    await window.runTest('gpuExec2d_parity_constraintCount', async () => {
+      const gpuWorld = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: false });
+      function setup(w) {
+        w.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+        const b = w.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1));
+        w.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b);
+        return b;
+      }
+      const gpuBody = setup(gpuWorld);
+      const cpuBody = setup(cpuWorld);
+      for (let i = 0; i < 30; i++) {
+        await gpuWorld.step();
+        cpuWorld.stepCPU();
+      }
+      const gpuT = gpuWorld.lastTimings;
+      const cpuT = cpuWorld.lastTimings;
+      return {
+        isGPU: gpuWorld.isGPU,
+        gpuConstraints: gpuT?.numConstraints ?? 0,
+        cpuConstraints: cpuT?.numConstraints ?? 0,
+        gpuHasConstraints: (gpuT?.numConstraints ?? 0) > 0,
+        cpuHasConstraints: (cpuT?.numConstraints ?? 0) > 0,
+        bothHaveConstraints: (gpuT?.numConstraints ?? 0) > 0 && (cpuT?.numConstraints ?? 0) > 0,
+        gpuY: gpuBody.translation().y,
+        cpuY: cpuBody.translation().y,
+        bothAbove: gpuBody.translation().y > 0.3 && cpuBody.translation().y > 0.3,
+      };
+    });
+
+    // ─── 2D Stress: 100 bodies ───────────────────────────────────────────
+    await window.runTest('gpuExec2d_stress_100bodies', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 8, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(30, 0.5).setFriction(0.5));
+      const bodies = [];
+      for (let i = 0; i < 100; i++) {
+        const row = Math.floor(i / 10);
+        const col = i % 10;
+        const b = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(col * 1.5 - 7.5, 1.5 + row * 1.5));
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b);
+        bodies.push(b);
+      }
+      for (let i = 0; i < 30; i++) await world.step();
+      const positions = bodies.map(b => b.translation());
+      return {
+        isGPU: world.isGPU,
+        allFinite: positions.every(p => isFinite(p.x) && isFinite(p.y)),
+        noneBelow: positions.every(p => p.y > -10),
+        count: 100,
+      };
+    });
+
+    // ─── 2D Determinism: Same setup twice ────────────────────────────────
+    await window.runTest('gpuExec2d_deterministic', async () => {
+      function makeWorld() {
+        const w = new AVBD.World({ x: 0, y: -9.81 },
+          { iterations: 10, useGPUCollision: true });
+        w.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+        const b = w.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3));
+        w.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b);
+        return { w, b };
+      }
+      const { w: w1, b: b1 } = makeWorld();
+      const { w: w2, b: b2 } = makeWorld();
+      for (let i = 0; i < 30; i++) {
+        await w1.step();
+        await w2.step();
+      }
+      const p1 = b1.translation(), p2 = b2.translation();
+      const diff = Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2);
+      return {
+        isGPU: w1.isGPU,
+        x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
+        diff,
+        deterministic: diff < 1e-6,
+      };
+    });
+
+    // ─── 2D Timings: Pipeline stages reported ────────────────────────────
+    await window.runTest('gpuExec2d_timings', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5));
+      const b = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.1));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), b);
+      for (let i = 0; i < 5; i++) await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        hasTimings: t !== null,
+        total: t?.total ?? -1,
+        broadphase: t?.broadphase ?? -1,
+        narrowphase: t?.narrowphase ?? -1,
+        numBodies: t?.numBodies ?? 0,
+        numConstraints: t?.numConstraints ?? 0,
+      };
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 3D GPU Collision Execution Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── 3D Constraint Generation: Box on Ground ─────────────────────────
+    await window.runTest('gpuExec3d_constraints_boxOnGround', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.1, 0));
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), body);
+      for (let i = 0; i < 30; i++) await world.step();
+      const t = world.lastTimings;
+      const pos = body.translation();
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) > 0,
+        y: pos.y,
+        aboveGround: pos.y > 0.3,
+        finite: isFinite(pos.y),
+      };
+    });
+
+    // ─── 3D Constraint Generation: Sphere on Ground ──────────────────────
+    await window.runTest('gpuExec3d_constraints_sphereOnGround', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.1, 0));
+      world.createCollider(AVBD3D.ColliderDesc.ball(0.5).setFriction(0.5), body);
+      for (let i = 0; i < 30; i++) await world.step();
+      const t = world.lastTimings;
+      const pos = body.translation();
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) > 0,
+        y: pos.y,
+        aboveGround: pos.y > 0.3,
+        finite: isFinite(pos.y),
+      };
+    });
+
+    // ─── 3D Constraint Generation: Box-Box stacked ───────────────────────
+    await window.runTest('gpuExec3d_constraints_boxBox', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const b1 = world.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.1, 0));
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), b1);
+      const b2 = world.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 2.2, 0));
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), b2);
+      for (let i = 0; i < 20; i++) await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) >= 3,
+        y1: b1.translation().y, y2: b2.translation().y,
+        ordered: b2.translation().y > b1.translation().y,
+        bothAbove: b1.translation().y > 0.3 && b2.translation().y > 0.3,
+      };
+    });
+
+    // ─── 3D Constraint Generation: Box-Sphere ────────────────────────────
+    await window.runTest('gpuExec3d_constraints_boxSphere', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const box = world.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.1, 0));
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), box);
+      const sph = world.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 2.2, 0));
+      world.createCollider(AVBD3D.ColliderDesc.ball(0.5).setFriction(0.5), sph);
+      for (let i = 0; i < 20; i++) await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) >= 3,
+        boxY: box.translation().y, sphY: sph.translation().y,
+        bothAbove: box.translation().y > 0.3 && sph.translation().y > 0.3,
+      };
+    });
+
+    // ─── 3D Constraint Generation: Sphere-Sphere ─────────────────────────
+    await window.runTest('gpuExec3d_constraints_sphereSphere', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const s1 = world.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.1, 0));
+      world.createCollider(AVBD3D.ColliderDesc.ball(0.5).setFriction(0.5), s1);
+      const s2 = world.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 2.2, 0));
+      world.createCollider(AVBD3D.ColliderDesc.ball(0.5).setFriction(0.5), s2);
+      for (let i = 0; i < 20; i++) await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? 0,
+        hasConstraints: (t?.numConstraints ?? 0) >= 3,
+        y1: s1.translation().y, y2: s2.translation().y,
+        bothAbove: s1.translation().y > 0.3 && s2.translation().y > 0.3,
+      };
+    });
+
+    // ─── 3D Constraint Generation: No constraints separated ──────────────
+    await window.runTest('gpuExec3d_noConstraints_separated', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const world = new AVBD3D.World({ x: 0, y: 0, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10));
+      const b = world.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 100, 0));
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5), b);
+      await world.step();
+      const t = world.lastTimings;
+      return {
+        isGPU: world.isGPU,
+        numConstraints: t?.numConstraints ?? -1,
+        noConstraints: (t?.numConstraints ?? -1) === 0,
+      };
+    });
+
+    // ─── 3D Physics: No NaN ──────────────────────────────────────────────
+    await window.runTest('gpuExec3d_noNaN', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 8, useGPUCollision: true });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const bodies = [];
+      for (let i = 0; i < 6; i++) {
+        const b = world.createRigidBody(
+          AVBD3D.RigidBodyDesc.dynamic().setTranslation((i % 3) * 1.5 - 1.5, 1.5 + Math.floor(i / 3) * 1.5, 0));
+        world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), b);
+        bodies.push(b);
+      }
+      for (let i = 0; i < 20; i++) await world.step();
+      const positions = bodies.map(b => b.translation());
+      return {
+        isGPU: world.isGPU,
+        allFinite: positions.every(p => isFinite(p.x) && isFinite(p.y) && isFinite(p.z)),
+        noneBelow: positions.every(p => p.y > -10),
+      };
+    });
+
+    // ─── 3D Physics: Quaternion normalized ───────────────────────────────
+    await window.runTest('gpuExec3d_quatNormalized', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10));
+      const b = world.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 3, 0));
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5), b);
+      for (let i = 0; i < 20; i++) await world.step();
+      const q = b.rotation();
+      const mag = Math.sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+      return {
+        isGPU: world.isGPU,
+        qw: q.w, qx: q.x, qy: q.y, qz: q.z,
+        magnitude: mag,
+        normalized: Math.abs(mag - 1.0) < 0.01,
+      };
+    });
+
+    // ─── 3D GPU vs CPU Parity: constraint counts ─────────────────────────
+    await window.runTest('gpuExec3d_parity_constraintCount', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+      const gpuWorld = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+      const cpuWorld = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: false });
+      function setup(w) {
+        w.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+        const b = w.createRigidBody(AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 1.1, 0));
+        w.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), b);
+        return b;
+      }
+      const gpuBody = setup(gpuWorld);
+      const cpuBody = setup(cpuWorld);
+      for (let i = 0; i < 15; i++) {
+        await gpuWorld.step();
+        await cpuWorld.step();
+      }
+      const gpuT = gpuWorld.lastTimings;
+      const cpuT = cpuWorld.lastTimings;
+      return {
+        isGPU: gpuWorld.isGPU,
+        gpuConstraints: gpuT?.numConstraints ?? 0,
+        cpuConstraints: cpuT?.numConstraints ?? 0,
+        bothHaveConstraints: (gpuT?.numConstraints ?? 0) > 0 && (cpuT?.numConstraints ?? 0) > 0,
+        gpuY: gpuBody.translation().y,
+        cpuY: cpuBody.translation().y,
+        bothAbove: gpuBody.translation().y > 0.3 && cpuBody.translation().y > 0.3,
+      };
+    });
+
     // Signal completion
     window.testResults._complete = true;
     document.getElementById('status').textContent = 'Tests complete';

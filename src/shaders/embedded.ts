@@ -3507,7 +3507,7 @@ struct SortParams {
 @group(0) @binding(4) var<storage, read_write> vals_out: array<u32>;
 @group(0) @binding(5) var<storage, read_write> histogram: array<u32>;
 
-var<workgroup> local_hist: array<u32, 256>;  // 16 digits * 16 padding-safe slots? No, just 16 * WG reduction
+var<workgroup> local_hist: array<atomic<u32>, 256>;  // Must be atomic for atomicAdd/atomicLoad
 var<workgroup> shared_keys: array<u32, 256>;
 
 // ─── Pass 1: Histogram ──────────────────────────────────────────────────────
@@ -3520,7 +3520,7 @@ fn radix_histogram(
 ) {
   // Clear local histogram (16 bins, each thread clears one if tid < 16)
   if (lid.x < RADIX) {
-    local_hist[lid.x] = 0u;
+    atomicStore(&local_hist[lid.x], 0u);
   }
   workgroupBarrier();
 

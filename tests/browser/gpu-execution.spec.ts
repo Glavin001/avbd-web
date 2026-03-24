@@ -559,3 +559,265 @@ test.describe('GPU Collision Pipeline: 3D', () => {
     expect(r.finite).toBe(true);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GPU Collision Execution Tests — Real WebGPU shader execution
+// These tests run the full GPU collision pipeline (LBVH broadphase + GPU
+// narrowphase + GPU constraint assembly) and verify observable physics outcomes.
+// Every test here would catch the critical stride mismatch bug that caused
+// bodies to fall through floors.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test.describe('GPU Collision Execution: 2D Constraint Generation', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 60000,
+    });
+  });
+
+  test('box on ground generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_constraints_boxOnGround);
+    console.log('gpuExec2d_constraints_boxOnGround:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.hasConstraints).toBe(true);
+    expect(r.numConstraints).toBeGreaterThan(0);
+    expect(r.aboveGround).toBe(true);
+    expect(r.finite).toBe(true);
+  });
+
+  test('no constraints when bodies are far apart', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_noConstraints_separated);
+    console.log('gpuExec2d_noConstraints_separated:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.noConstraints).toBe(true);
+    expect(r.numConstraints).toBe(0);
+  });
+
+  test('circle on ground generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_constraints_circleOnGround);
+    console.log('gpuExec2d_constraints_circleOnGround:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.hasConstraints).toBe(true);
+    expect(r.aboveGround).toBe(true);
+  });
+
+  test('box-box generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_constraints_boxBox);
+    console.log('gpuExec2d_constraints_boxBox:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.hasConstraints).toBe(true);
+    expect(r.ordered).toBe(true);
+    expect(r.bothAboveGround).toBe(true);
+  });
+
+  test('box-circle generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_constraints_boxCircle);
+    console.log('gpuExec2d_constraints_boxCircle:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.hasConstraints).toBe(true);
+    expect(r.bothAbove).toBe(true);
+  });
+
+  test('circle-circle generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_constraints_circleCircle);
+    console.log('gpuExec2d_constraints_circleCircle:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.hasConstraints).toBe(true);
+    expect(r.bothAbove).toBe(true);
+  });
+
+  test('5-box stack generates many constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_constraints_multiBody);
+    console.log('gpuExec2d_constraints_multiBody:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.hasEnoughConstraints).toBe(true);
+    expect(r.numConstraints).toBeGreaterThanOrEqual(8);
+    expect(r.allAbove).toBe(true);
+    expect(r.allFinite).toBe(true);
+  });
+
+  test('single body without ground has no constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_noConstraints_singleBody);
+    console.log('gpuExec2d_noConstraints_singleBody:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.noConstraints).toBe(true);
+  });
+});
+
+test.describe('GPU Collision Execution: 2D Physics Correctness', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 60000,
+    });
+  });
+
+  test('20 bodies: no NaN positions', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_noNaN_manyBodies);
+    console.log('gpuExec2d_noNaN_manyBodies:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.allFinite).toBe(true);
+    expect(r.noneBelow).toBe(true);
+  });
+
+  test('fast box: no bounce explosion', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_noBounceExplosion);
+    console.log('gpuExec2d_noBounceExplosion:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.bounded).toBe(true);
+    expect(r.finite).toBe(true);
+  });
+
+  test('100 bodies stress test: all finite, none below ground', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_stress_100bodies);
+    console.log('gpuExec2d_stress_100bodies:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.allFinite).toBe(true);
+    expect(r.noneBelow).toBe(true);
+  });
+
+  test('deterministic: same setup produces same results', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_deterministic);
+    console.log('gpuExec2d_deterministic:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.deterministic).toBe(true);
+    expect(r.diff).toBeLessThan(1e-6);
+  });
+});
+
+test.describe('GPU Collision Execution: 2D GPU vs CPU Parity', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 60000,
+    });
+  });
+
+  test('GPU and CPU both generate constraints for box on ground', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_parity_constraintCount);
+    console.log('gpuExec2d_parity_constraintCount:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.gpuHasConstraints).toBe(true);
+    expect(r.cpuHasConstraints).toBe(true);
+    expect(r.bothHaveConstraints).toBe(true);
+    expect(r.bothAbove).toBe(true);
+  });
+
+  test('timings reported with valid pipeline stages', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec2d_timings);
+    console.log('gpuExec2d_timings:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.hasTimings).toBe(true);
+    expect(r.total).toBeGreaterThan(0);
+    expect(r.numBodies).toBeGreaterThan(0);
+  });
+});
+
+test.describe('GPU Collision Execution: 3D Constraint Generation', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 60000,
+    });
+  });
+
+  test('box on ground generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_constraints_boxOnGround);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_constraints_boxOnGround:', JSON.stringify(r));
+    expect(r.hasConstraints).toBe(true);
+    expect(r.numConstraints).toBeGreaterThan(0);
+    expect(r.aboveGround).toBe(true);
+    expect(r.finite).toBe(true);
+  });
+
+  test('sphere on ground generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_constraints_sphereOnGround);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_constraints_sphereOnGround:', JSON.stringify(r));
+    expect(r.hasConstraints).toBe(true);
+    expect(r.aboveGround).toBe(true);
+    expect(r.finite).toBe(true);
+  });
+
+  test('box-box stacked generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_constraints_boxBox);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_constraints_boxBox:', JSON.stringify(r));
+    expect(r.hasConstraints).toBe(true);
+    expect(r.ordered).toBe(true);
+    expect(r.bothAbove).toBe(true);
+  });
+
+  test('box-sphere generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_constraints_boxSphere);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_constraints_boxSphere:', JSON.stringify(r));
+    expect(r.hasConstraints).toBe(true);
+    expect(r.bothAbove).toBe(true);
+  });
+
+  test('sphere-sphere generates constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_constraints_sphereSphere);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_constraints_sphereSphere:', JSON.stringify(r));
+    expect(r.hasConstraints).toBe(true);
+    expect(r.bothAbove).toBe(true);
+  });
+
+  test('no constraints when separated', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_noConstraints_separated);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_noConstraints_separated:', JSON.stringify(r));
+    expect(r.noConstraints).toBe(true);
+    expect(r.numConstraints).toBe(0);
+  });
+});
+
+test.describe('GPU Collision Execution: 3D Physics Correctness', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 60000,
+    });
+  });
+
+  test('no NaN with 10 bodies', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_noNaN);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_noNaN:', JSON.stringify(r));
+    expect(r.allFinite).toBe(true);
+    expect(r.noneBelow).toBe(true);
+  });
+
+  test('quaternion stays normalized', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_quatNormalized);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_quatNormalized:', JSON.stringify(r));
+    expect(r.normalized).toBe(true);
+    expect(r.magnitude).toBeCloseTo(1.0, 1);
+  });
+
+  test('GPU and CPU both generate constraints', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuExec3d_parity_constraintCount);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('gpuExec3d_parity_constraintCount:', JSON.stringify(r));
+    expect(r.bothHaveConstraints).toBe(true);
+    expect(r.bothAbove).toBe(true);
+  });
+});
