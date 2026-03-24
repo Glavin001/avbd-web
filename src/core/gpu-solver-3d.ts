@@ -881,13 +881,14 @@ export class GPUSolver3D {
     // Readback constraint lambdas for warmstarting (already mapped via Promise.all above)
     if (crStagingBuffer && numConstraints > 0) {
       const crResult = new DataView(crStagingBuffer.getMappedRange());
-      crStagingBuffer.unmap(); // persistent — do NOT destroy
 
       for (let i = 0; i < numConstraints; i++) {
         const byteOff = i * CONSTRAINT_STRIDE * 4;
         this.constraintRows[i].lambda = crResult.getFloat32(byteOff + 120, true);
         this.constraintRows[i].penalty = crResult.getFloat32(byteOff + 124, true);
       }
+
+      crStagingBuffer.unmap(); // persistent — do NOT destroy; must unmap AFTER reading
     }
 
     const tEnd = performance.now();
