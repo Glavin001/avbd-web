@@ -321,7 +321,7 @@ describe('AVBDSolver2D', () => {
       expect(solver.config.dt).toBeCloseTo(1 / 60);
       expect(solver.config.beta).toBe(100000);
       expect(solver.config.alpha).toBe(0.99);
-      expect(solver.config.gamma).toBe(0.99);
+      expect(solver.config.gamma).toBe(0.999);
       expect(solver.config.postStabilize).toBe(true);
     });
 

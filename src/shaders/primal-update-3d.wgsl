@@ -10,6 +10,7 @@ struct SolverParams {
   penalty_min: f32,
   penalty_max: f32,
   beta: f32,
+  alpha: f32,
   num_bodies: u32,
   num_constraints: u32,
   num_bodies_in_group: u32,
@@ -184,8 +185,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       J[3] = cr.jacobian_b_ang.x; J[4] = cr.jacobian_b_ang.y; J[5] = cr.jacobian_b_ang.z;
     }
 
-    // Full Taylor-series constraint evaluation: C = C0 + J_A·dp_A + J_B·dp_B
-    var c_eval = cr.c0;
+    // Full Taylor-series constraint evaluation: C = C0*(1-alpha) + J_A·dp_A + J_B·dp_B
+    var c_eval = cr.c0 * (1.0 - params.alpha);
     if (cr.body_a >= 0) {
       let ba = u32(cr.body_a) * 20u;
       let bap = u32(cr.body_a) * 14u;
