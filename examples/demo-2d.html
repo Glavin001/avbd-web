@@ -105,6 +105,44 @@
     #stats .val { color: #4fc3f7; }
     #stats .gpu { color: #66bb6a; font-weight: bold; }
     #stats .cpu { color: #ffa726; font-weight: bold; }
+
+    #error-overlay {
+      display: none;
+      position: fixed;
+      bottom: 12px;
+      left: 12px;
+      right: 12px;
+      max-height: 40vh;
+      overflow-y: auto;
+      background: rgba(140, 20, 20, 0.92);
+      color: #fdd;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-family: 'Courier New', monospace;
+      line-height: 1.5;
+      z-index: 100;
+      border: 1px solid #f44;
+      word-break: break-word;
+    }
+    #error-overlay .error-title {
+      color: #ff6b6b;
+      font-weight: bold;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+    #error-overlay .error-entry {
+      border-top: 1px solid rgba(255,100,100,0.3);
+      padding-top: 4px;
+      margin-top: 4px;
+    }
+    #error-overlay .error-dismiss {
+      float: right;
+      cursor: pointer;
+      color: #faa;
+      font-size: 14px;
+      padding: 0 6px;
+    }
   </style>
 </head>
 <body>
@@ -139,7 +177,31 @@
   <canvas id="canvas" width="900" height="600"></canvas>
   <div id="stats"></div>
 
+  <div id="error-overlay">
+    <span class="error-dismiss" onclick="this.parentElement.style.display='none'">&times;</span>
+    <div class="error-title">Errors</div>
+    <div id="error-log"></div>
+  </div>
+
   <script type="module">
+    // ── Error display (visible without dev tools, mobile-friendly) ────────────
+    const _errorOverlay = document.getElementById('error-overlay');
+    const _errorLog = document.getElementById('error-log');
+    let _errorCount = 0;
+    const _MAX_ERRORS = 20;
+    function showError(msg) {
+      if (_errorCount >= _MAX_ERRORS) return;
+      _errorCount++;
+      _errorOverlay.style.display = 'block';
+      const div = document.createElement('div');
+      div.className = 'error-entry';
+      div.textContent = (_errorCount > 1 ? `[${_errorCount}] ` : '') + msg;
+      _errorLog.appendChild(div);
+      _errorOverlay.scrollTop = _errorOverlay.scrollHeight;
+    }
+    window.addEventListener('error', (e) => showError(e.message || String(e)));
+    window.addEventListener('unhandledrejection', (e) => showError(e.reason?.message || String(e.reason)));
+
     import AVBD from '../src/2d/index.ts';
 
     // ====================================================================
@@ -196,11 +258,12 @@
     // ====================================================================
 
     let gpuStatus = 'CPU';
+    AVBD.onError = (msg) => showError(msg);
     try {
       await AVBD.init();
       gpuStatus = 'GPU';
     } catch (err) {
-      console.warn('WebGPU not available, falling back to CPU:', err.message);
+      showError('WebGPU init failed: ' + err.message + ' — using CPU solver');
     }
 
     // ====================================================================
@@ -882,10 +945,11 @@
         });
       }
 
-      // Try GPU, fall back to CPU
+      // Try GPU, fall back to CPU on failure
       try {
         await world.step();
-      } catch {
+      } catch (e) {
+        showError('GPU step failed: ' + e.message + ' — falling back to CPU');
         world.stepCPU();
         gpuMode = false;
       }

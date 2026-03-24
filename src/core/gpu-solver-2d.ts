@@ -27,6 +27,8 @@ import { collide2D } from '../2d/collision-sat.js';
 import { aabb2DOverlap, vec2Scale, vec2Length } from './math.js';
 import { computeGraphColoring } from './graph-coloring.js';
 import { GPUContext } from './gpu-context.js';
+import { GpuCollisionPipeline } from './gpu-collision-pipeline.js';
+import { COLLISION_MARGIN } from './types.js';
 import { PRIMAL_UPDATE_2D_WGSL, DUAL_UPDATE_WGSL, FRICTION_COUPLING_WGSL } from '../shaders/embedded.js';
 
 // ─── GPU Buffer Layout Constants ────────────────────────────────────────────
@@ -71,6 +73,12 @@ export class GPUSolver2D {
 
   private gpu: GPUContext;
   private initialized = false;
+  private _stepping = false;
+
+  // GPU collision pipeline (LBVH broadphase + GPU narrowphase + constraint assembly)
+  private collisionPipeline: GpuCollisionPipeline | null = null;
+  private _collisionConstraintStaging: GPUBuffer | null = null;
+  private _collisionConstraintStagingSize = 0;
 
   // GPU resources
   private bodyStateBuffer!: GPUBuffer;
@@ -80,6 +88,12 @@ export class GPUSolver2D {
   private colorIndicesBuffer!: GPUBuffer;
   private bodyConstraintRangesBuffer!: GPUBuffer;
   private constraintIndicesBuffer!: GPUBuffer;
+
+  // Persistent staging buffers for readback (grown in ensureBuffers)
+  private _bodyStagingBuffer: GPUBuffer | null = null;
+  private _crStagingBuffer: GPUBuffer | null = null;
+  private _velRecoveryStagingBuffer: GPUBuffer | null = null;
+  private _stagingMapped = false;
 
   private primalPipeline!: GPUComputePipeline;
   private dualPipeline!: GPUComputePipeline;
@@ -178,6 +192,11 @@ export class GPUSolver2D {
     });
 
     this.initialized = true;
+
+    // Initialize GPU collision pipeline if enabled
+    if (this.config.useGPUCollision !== false) {
+      this.collisionPipeline = new GpuCollisionPipeline(this.gpu, '2d');
+    }
   }
 
   /**
@@ -185,7 +204,24 @@ export class GPUSolver2D {
    */
   async step(): Promise<void> {
     if (!this.initialized) await this.init();
+    // Prevent concurrent step() calls — with async GPU readback, rAF at top of loop
+    // can overlap, causing staging buffer race conditions.
+    if (this._stepping) return;
+    this._stepping = true;
+    try {
+      await this._stepImpl();
+    } finally {
+      this._stepping = false;
+      if (this._stagingMapped) {
+        try { this._bodyStagingBuffer?.unmap(); } catch { /* already unmapped */ }
+        try { this._crStagingBuffer?.unmap(); } catch { /* already unmapped */ }
+        try { this._velRecoveryStagingBuffer?.unmap(); } catch { /* already unmapped */ }
+        this._stagingMapped = false;
+      }
+    }
+  }
 
+  private async _stepImpl(): Promise<void> {
     const t0 = performance.now();
     const { config, bodyStore, constraintStore, gpu } = this;
     const dt = config.dt;
@@ -195,73 +231,109 @@ export class GPUSolver2D {
 
     if (bodies.length === 0) return;
 
-    // ─── 1. CPU: Collision Detection (spatial hash broadphase) ─────
+    // ─── 1. Collision Detection ─────────────────────────────────
     constraintStore.clearContacts();
-    const gpu2dCandidatePairs: [number, number][] = [];
 
-    {
-      const n = bodies.length;
-      const aabbs = new Array(n);
-      for (let i = 0; i < n; i++) aabbs[i] = bodyStore.getAABB(bodies[i]);
+    if (this.collisionPipeline) {
+      // GPU collision path: LBVH broadphase + GPU narrowphase + constraint assembly
+      this.ensureBuffers(bodies.length, 1, 1);
 
-      let totalExtent = 0, dynCount = 0;
-      for (let i = 0; i < n; i++) {
-        if (bodies[i].type === RigidBodyType.Dynamic) {
-          totalExtent += (aabbs[i].maxX - aabbs[i].minX) + (aabbs[i].maxY - aabbs[i].minY);
-          dynCount++;
-        }
+      // Upload pre-init body state for collision detection
+      const collBodyData = new Float32Array(bodies.length * BODY_STRIDE);
+      for (let i = 0; i < bodies.length; i++) {
+        const b = bodies[i];
+        const off = i * BODY_STRIDE;
+        collBodyData[off + 0] = b.position.x;
+        collBodyData[off + 1] = b.position.y;
+        collBodyData[off + 2] = b.angle;
+        collBodyData[off + 3] = b.velocity.x;
+        collBodyData[off + 4] = b.velocity.y;
+        collBodyData[off + 5] = b.angularVelocity as number;
+        collBodyData[off + 6] = b.mass;
+        collBodyData[off + 7] = b.inertia;
       }
-      const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 2)) * 2 : 1, 0.5);
-      const invCell = 1 / cellSize;
+      gpuWrite(device.queue, this.bodyStateBuffer, 0, collBodyData);
 
-      const grid = new Map<number, number[]>();
-      for (let i = 0; i < n; i++) {
-        const a = aabbs[i];
-        const x0 = Math.floor(a.minX * invCell), x1 = Math.floor(a.maxX * invCell);
-        const y0 = Math.floor(a.minY * invCell), y1 = Math.floor(a.maxY * invCell);
-        for (let cx = x0; cx <= x1; cx++) {
-          for (let cy = y0; cy <= y1; cy++) {
-            const k = (cx + 0x8000) * 0x10000 + (cy + 0x8000);
-            let cell = grid.get(k);
-            if (!cell) { cell = []; grid.set(k, cell); }
-            cell.push(i);
+      this.collisionPipeline.uploadBodyData2D(bodies, this.bodyStateBuffer);
+      const sceneBounds = this.collisionPipeline.computeSceneBounds2D(bodies);
+
+      const collResult = await this.collisionPipeline.runFullPipeline(
+        bodies.length, this.bodyStateBuffer, sceneBounds,
+        COLLISION_MARGIN, dt, config.penaltyMin, config.alpha,
+      );
+
+      if (collResult.numConstraints > 0) {
+        const gpuRows = await this.readbackGpuConstraints2D(
+          collResult.constraintBuffer, collResult.numConstraints,
+        );
+        constraintStore.addRows(gpuRows);
+      }
+    } else {
+      // CPU collision path: spatial hash broadphase + SAT narrowphase
+      const gpu2dCandidatePairs: [number, number][] = [];
+
+      {
+        const n = bodies.length;
+        const aabbs = new Array(n);
+        for (let i = 0; i < n; i++) aabbs[i] = bodyStore.getAABB(bodies[i]);
+
+        let totalExtent = 0, dynCount = 0;
+        for (let i = 0; i < n; i++) {
+          if (bodies[i].type === RigidBodyType.Dynamic) {
+            totalExtent += (aabbs[i].maxX - aabbs[i].minX) + (aabbs[i].maxY - aabbs[i].minY);
+            dynCount++;
+          }
+        }
+        const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 2)) * 2 : 1, 0.5);
+        const invCell = 1 / cellSize;
+
+        const grid = new Map<number, number[]>();
+        for (let i = 0; i < n; i++) {
+          const a = aabbs[i];
+          const x0 = Math.floor(a.minX * invCell), x1 = Math.floor(a.maxX * invCell);
+          const y0 = Math.floor(a.minY * invCell), y1 = Math.floor(a.maxY * invCell);
+          for (let cx = x0; cx <= x1; cx++) {
+            for (let cy = y0; cy <= y1; cy++) {
+              const k = (cx + 0x8000) * 0x10000 + (cy + 0x8000);
+              let cell = grid.get(k);
+              if (!cell) { cell = []; grid.set(k, cell); }
+              cell.push(i);
+            }
+          }
+        }
+
+        const tested = new Set<number>();
+        for (const cell of grid.values()) {
+          for (let ci = 0; ci < cell.length; ci++) {
+            const i = cell[ci];
+            for (let cj = ci + 1; cj < cell.length; cj++) {
+              const j = cell[cj];
+              const pk = i < j ? i * n + j : j * n + i;
+              if (tested.has(pk)) continue;
+              tested.add(pk);
+              const a = bodies[i], b = bodies[j];
+              if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
+              const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+              if (this.ignorePairs.has(key)) continue;
+              if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
+              gpu2dCandidatePairs.push([i, j]);
+            }
           }
         }
       }
 
-      const tested = new Set<number>();
-      for (const cell of grid.values()) {
-        for (let ci = 0; ci < cell.length; ci++) {
-          const i = cell[ci];
-          for (let cj = ci + 1; cj < cell.length; cj++) {
-            const j = cell[cj];
-            const pk = i < j ? i * n + j : j * n + i;
-            if (tested.has(pk)) continue;
-            tested.add(pk);
-            const a = bodies[i], b = bodies[j];
-            if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
-            const key = i < j ? `${i}-${j}` : `${j}-${i}`;
-            if (this.ignorePairs.has(key)) continue;
-            if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
-            gpu2dCandidatePairs.push([i, j]);
-          }
+      for (const [i, j] of gpu2dCandidatePairs) {
+        const manifold = collide2D(bodies[i], bodies[j]);
+        if (manifold) {
+          const rows = createContactConstraintRows(manifold, bodies[i], bodies[j], config.penaltyMin, Infinity, config.dt);
+          constraintStore.addRows(rows);
         }
-      }
-    }
-
-    const tBroadphase = performance.now();
-
-    // Narrowphase: SAT collision detection on candidate pairs
-    for (const [i, j] of gpu2dCandidatePairs) {
-      const manifold = collide2D(bodies[i], bodies[j]);
-      if (manifold) {
-        const rows = createContactConstraintRows(manifold, bodies[i], bodies[j], config.penaltyMin, Infinity, config.dt);
-        constraintStore.addRows(rows);
       }
     }
     constraintStore.warmstartContacts();
 
-    const tCollision = performance.now();
+    const tBroadphase = performance.now();
+    const tCollision = tBroadphase;
 
     // ─── 2. CPU: Warmstart & Initialize ───────────────────────────
     for (const row of constraintStore.rows) {
@@ -435,15 +507,9 @@ export class GPUSolver2D {
     // Push error scope to catch GPU validation errors
     device.pushErrorScope('validation');
 
-    // Buffer to snapshot body state at velocity recovery iteration (before stabilization)
+    // Use persistent velRecovery staging buffer (allocated in ensureBuffers)
     const bodyReadbackSize = numBodies * BODY_STRIDE * 4;
-    let velRecoveryBuffer: GPUBuffer | null = null;
-    if (config.postStabilize) {
-      velRecoveryBuffer = device.createBuffer({
-        size: bodyReadbackSize,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-    }
+    const velRecoveryBuffer = config.postStabilize ? this._velRecoveryStagingBuffer : null;
 
     // Pre-write friction params (constant across iterations)
     if (numConstraints > 0) {
@@ -541,57 +607,50 @@ export class GPUSolver2D {
       }
     }
 
-    // Check for GPU validation errors
+    // Check for GPU validation errors — throw so callers can display them
     const validationError = await device.popErrorScope();
     if (validationError) {
-      console.error('GPU validation error:', validationError.message);
+      throw new Error('GPU validation error: ' + validationError.message);
     }
 
     const tDispatch = performance.now();
 
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
-    // Readback final body state (post-stabilization positions)
-    const bodyStagingBuffer = device.createBuffer({
-      size: bodyReadbackSize,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
+    // Persistent staging buffers (allocated in ensureBuffers, reused across frames)
+    const bodyStagingBuffer = this._bodyStagingBuffer!;
+    const crStagingBuffer = (numConstraints > 0) ? this._crStagingBuffer : null;
     const copyEncoder = device.createCommandEncoder();
     copyEncoder.copyBufferToBuffer(this.bodyStateBuffer, 0, bodyStagingBuffer, 0, bodyReadbackSize);
-
-    // Readback constraints (for lambda/penalty warmstarting)
-    let crStagingBuffer: GPUBuffer | null = null;
-    if (numConstraints > 0) {
+    if (crStagingBuffer && numConstraints > 0) {
       const crReadbackSize = numConstraints * CONSTRAINT_STRIDE * 4;
-      crStagingBuffer = device.createBuffer({
-        size: crReadbackSize,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-      });
       copyEncoder.copyBufferToBuffer(this.constraintBuffer, 0, crStagingBuffer, 0, crReadbackSize);
     }
 
     device.queue.submit([copyEncoder.finish()]);
 
-    // Map ALL staging buffers in parallel — single GPU fence wait instead of serial ones
+    // Map ALL staging buffers in parallel — single GPU fence wait
     const mapPromises: Promise<void>[] = [bodyStagingBuffer.mapAsync(GPUMapMode.READ)];
     if (velRecoveryBuffer) mapPromises.push(velRecoveryBuffer.mapAsync(GPUMapMode.READ));
-    if (crStagingBuffer) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
+    if (crStagingBuffer && numConstraints > 0) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
     await Promise.all(mapPromises);
+    this._stagingMapped = true;
 
-    const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange().slice(0));
-    bodyStagingBuffer.unmap();
-    bodyStagingBuffer.destroy();
+    // Read directly from mapped ranges (no .slice(0) copy — we read inline before unmap)
+    const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange());
 
     let velRecoveryResult: Float32Array | null = null;
     if (velRecoveryBuffer) {
-      velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange().slice(0));
-      velRecoveryBuffer.unmap();
-      velRecoveryBuffer.destroy();
+      velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange());
     }
 
     // ─── 6. CPU: Apply Results ────────────────────────────────────
     // Use pre-stabilization positions for velocity recovery (matching CPU solver),
     // but final (post-stabilization) positions for body state
     const velSource = velRecoveryResult ?? bodyResult;
+
+    const MAX_LINEAR_VELOCITY = 100;
+    const MAX_ANGULAR_VELOCITY = 50;
+    const invDt = 1 / dt;
 
     for (let i = 0; i < numBodies; i++) {
       const body = bodies[i];
@@ -602,38 +661,39 @@ export class GPUSolver2D {
       body.position.y = bodyResult[off + 1];
       body.angle = bodyResult[off + 2];
 
-      // BDF1 velocity recovery from pre-stabilization positions
-      const MAX_LINEAR_VELOCITY = 100;
-      const MAX_ANGULAR_VELOCITY = 50;
-      body.velocity = {
-        x: (velSource[off + 0] - body.prevPosition.x) / dt,
-        y: (velSource[off + 1] - body.prevPosition.y) / dt,
-      };
-      // Clamp recovered linear velocity
-      const vMag = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+      // BDF1 velocity recovery from pre-stabilization positions (no object allocation)
+      let vx = (velSource[off + 0] - body.prevPosition.x) * invDt;
+      let vy = (velSource[off + 1] - body.prevPosition.y) * invDt;
+      const vMag = Math.sqrt(vx * vx + vy * vy);
       if (vMag > MAX_LINEAR_VELOCITY) {
         const scale = MAX_LINEAR_VELOCITY / vMag;
-        body.velocity.x *= scale;
-        body.velocity.y *= scale;
+        vx *= scale;
+        vy *= scale;
       }
-      body.angularVelocity = (velSource[off + 2] - body.prevAngle) / dt;
-      // Clamp recovered angular velocity
-      body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
-        Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
+      body.velocity.x = vx;
+      body.velocity.y = vy;
+
+      let av = (velSource[off + 2] - body.prevAngle) * invDt;
+      if (av > MAX_ANGULAR_VELOCITY) av = MAX_ANGULAR_VELOCITY;
+      else if (av < -MAX_ANGULAR_VELOCITY) av = -MAX_ANGULAR_VELOCITY;
+      body.angularVelocity = av;
     }
 
-    // Readback constraint lambdas for warmstarting (already mapped via Promise.all above)
+    // Readback constraint lambdas for warmstarting
     if (crStagingBuffer && numConstraints > 0) {
-      const crResult = new DataView(crStagingBuffer.getMappedRange().slice(0));
-      crStagingBuffer.unmap();
-      crStagingBuffer.destroy();
-
+      const crResult = new DataView(crStagingBuffer.getMappedRange());
       for (let i = 0; i < numConstraints; i++) {
         const byteOff = i * CONSTRAINT_STRIDE * 4;
         rows[i].lambda = crResult.getFloat32(byteOff + 88, true);
         rows[i].penalty = crResult.getFloat32(byteOff + 92, true);
       }
     }
+
+    // Unmap all persistent staging buffers (must happen after all reads)
+    bodyStagingBuffer.unmap();
+    if (crStagingBuffer && numConstraints > 0) crStagingBuffer.unmap();
+    if (velRecoveryBuffer) velRecoveryBuffer.unmap();
+    this._stagingMapped = false;
 
     const tEnd = performance.now();
     this.lastTimings = {
@@ -650,6 +710,78 @@ export class GPUSolver2D {
       numBodies: bodies.length,
       numConstraints: constraintStore.rows.length,
     };
+  }
+
+  /** Read back GPU constraint buffer and parse into ConstraintRow[] */
+  private async readbackGpuConstraints2D(
+    constraintBuffer: GPUBuffer,
+    numConstraints: number,
+  ): Promise<ConstraintRow[]> {
+    const device = this.gpu.device;
+    const byteSize = numConstraints * CONSTRAINT_STRIDE * 4;
+
+    // Ensure staging buffer is large enough
+    if (byteSize > this._collisionConstraintStagingSize) {
+      this._collisionConstraintStaging?.destroy();
+      this._collisionConstraintStagingSize = byteSize;
+      this._collisionConstraintStaging = device.createBuffer({
+        size: byteSize,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    const staging = this._collisionConstraintStaging!;
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(constraintBuffer, 0, staging, 0, byteSize);
+    device.queue.submit([enc.finish()]);
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const mapped = staging.getMappedRange();
+    const view = new DataView(mapped);
+
+    const rows: ConstraintRow[] = [];
+    for (let i = 0; i < numConstraints; i++) {
+      const off = i * CONSTRAINT_STRIDE * 4;
+      rows.push({
+        bodyA: view.getInt32(off + 0, true),
+        bodyB: view.getInt32(off + 4, true),
+        type: view.getUint32(off + 8, true),
+        jacobianA: [
+          view.getFloat32(off + 16, true),
+          view.getFloat32(off + 20, true),
+          view.getFloat32(off + 24, true),
+        ],
+        jacobianB: [
+          view.getFloat32(off + 32, true),
+          view.getFloat32(off + 36, true),
+          view.getFloat32(off + 40, true),
+        ],
+        hessianDiagA: [
+          view.getFloat32(off + 48, true),
+          view.getFloat32(off + 52, true),
+          view.getFloat32(off + 56, true),
+        ],
+        hessianDiagB: [
+          view.getFloat32(off + 64, true),
+          view.getFloat32(off + 68, true),
+          view.getFloat32(off + 72, true),
+        ],
+        c: view.getFloat32(off + 80, true),
+        c0: view.getFloat32(off + 84, true),
+        alpha: 0,
+        lambda: view.getFloat32(off + 88, true),
+        penalty: view.getFloat32(off + 92, true),
+        stiffness: view.getFloat32(off + 96, true),
+        fmin: view.getFloat32(off + 100, true),
+        fmax: view.getFloat32(off + 104, true),
+        fractureThreshold: 0,
+        active: view.getUint32(off + 108, true) !== 0,
+        broken: false,
+      });
+    }
+
+    staging.unmap();
+    return rows;
   }
 
   /** Build per-body constraint index lists for indirection on GPU */
@@ -713,6 +845,8 @@ export class GPUSolver2D {
     const device = this.gpu.device;
     const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
 
+    const MAP_READ_DST = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
+
     if (numBodies > this.maxBodies) {
       this.maxBodies = Math.max(numBodies, this.maxBodies * 2, 64);
       if (this.bodyStateBuffer) this.bodyStateBuffer.destroy();
@@ -724,12 +858,26 @@ export class GPUSolver2D {
       this.bodyPrevBuffer = device.createBuffer({ size: this.maxBodies * BODY_PREV_STRIDE * 4, usage: STORAGE });
       this.bodyConstraintRangesBuffer = device.createBuffer({ size: this.maxBodies * 2 * 4, usage: STORAGE });
       this.colorIndicesBuffer = device.createBuffer({ size: this.maxBodies * 4, usage: STORAGE });
+
+      // Persistent staging buffers for readback (body state + velocity recovery snapshot)
+      const bodyStagingSize = this.maxBodies * BODY_STRIDE * 4;
+      if (this._bodyStagingBuffer) this._bodyStagingBuffer.destroy();
+      this._bodyStagingBuffer = device.createBuffer({ size: bodyStagingSize, usage: MAP_READ_DST });
+      if (this._velRecoveryStagingBuffer) this._velRecoveryStagingBuffer.destroy();
+      this._velRecoveryStagingBuffer = device.createBuffer({ size: bodyStagingSize, usage: MAP_READ_DST });
     }
 
     if (numConstraints > this.maxConstraints) {
       this.maxConstraints = Math.max(numConstraints, this.maxConstraints * 2, 64);
       if (this.constraintBuffer) this.constraintBuffer.destroy();
       this.constraintBuffer = device.createBuffer({ size: this.maxConstraints * CONSTRAINT_STRIDE * 4, usage: STORAGE });
+
+      // Persistent constraint staging buffer for readback
+      if (this._crStagingBuffer) this._crStagingBuffer.destroy();
+      this._crStagingBuffer = device.createBuffer({
+        size: this.maxConstraints * CONSTRAINT_STRIDE * 4,
+        usage: MAP_READ_DST,
+      });
     }
 
     const ciCount = Math.max(numConstraintIndices, 1);
@@ -743,8 +891,16 @@ export class GPUSolver2D {
   destroy(): void {
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
       this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
-      this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer]) {
+      this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer,
+      this._bodyStagingBuffer, this._crStagingBuffer, this._velRecoveryStagingBuffer,
+      this._collisionConstraintStaging]) {
       if (buf) buf.destroy();
     }
+    this._bodyStagingBuffer = null;
+    this._crStagingBuffer = null;
+    this._velRecoveryStagingBuffer = null;
+    this._collisionConstraintStaging = null;
+    this.collisionPipeline?.destroy();
+    this.collisionPipeline = null;
   }
 }

@@ -110,6 +110,9 @@ export interface SolverConfig {
   penaltyMax: number;
   /** Gravity vector */
   gravity: Vec2 | Vec3;
+  /** Use GPU-accelerated collision detection (LBVH broadphase + GPU narrowphase).
+   *  Default: true when GPU is available, false for CPU-only mode. */
+  useGPUCollision?: boolean;
 }
 
 export const DEFAULT_SOLVER_CONFIG_2D: SolverConfig = {
