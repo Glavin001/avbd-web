@@ -363,19 +363,35 @@ export class AVBDSolver3D {
       }
       body.prevVelocity = { ...body.velocity };
 
+      // Inertial target uses FULL gravity (the optimization objective target).
+      // Reference: solver.cpp — body->inertialLin = pos + vel*dt + gravity*dt²
       body.inertialPosition = {
-        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
-        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
-        z: body.position.z + body.velocity.z * dt + gravity.z * body.gravityScale * gravWeight * dt * dt,
+        x: body.prevPosition.x + body.velocity.x * dt + gravity.x * body.gravityScale * dt * dt,
+        y: body.prevPosition.y + body.velocity.y * dt + gravity.y * body.gravityScale * dt * dt,
+        z: body.prevPosition.z + body.velocity.z * dt + gravity.z * body.gravityScale * dt * dt,
       };
       // Inertial rotation: integrate angular velocity
       const wLen = vec3Length(body.angularVelocity);
       if (wLen > 1e-10) {
         const axis = vec3Scale(body.angularVelocity, 1 / wLen);
         const dq = quatFromAxisAngle(axis, wLen * dt);
-        body.inertialRotation = quatNormalize(quatMul(dq, body.rotation));
+        body.inertialRotation = quatNormalize(quatMul(dq, body.prevRotation));
       } else {
-        body.inertialRotation = { ...body.rotation };
+        body.inertialRotation = { ...body.prevRotation };
+      }
+
+      // Move body to predicted position (initial guess for solver).
+      // Uses adaptive gravity weight so resting bodies don't over-predict penetration.
+      // Reference: solver.cpp — body->positionLin = pos + vel*dt + gravity*accelWeight*dt²
+      body.position = {
+        x: body.prevPosition.x + body.velocity.x * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
+        y: body.prevPosition.y + body.velocity.y * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+        z: body.prevPosition.z + body.velocity.z * dt + gravity.z * body.gravityScale * gravWeight * dt * dt,
+      };
+      if (wLen > 1e-10) {
+        const axis = vec3Scale(body.angularVelocity, 1 / wLen);
+        const dq = quatFromAxisAngle(axis, wLen * dt);
+        body.rotation = quatNormalize(quatMul(dq, body.prevRotation));
       }
     }
 
@@ -547,8 +563,9 @@ export class AVBDSolver3D {
       else if (row.bodyB === body.index) J = row.jacobianB;
       else continue;
 
-      // Evaluate linearized constraint
-      let cEval = row.c0;
+      // Evaluate linearized constraint: C = C0*(1-alpha) + J*dp
+      // The (1-alpha) factor prevents over-correction of pre-existing violations.
+      let cEval = row.c0 * (1 - this.config.alpha);
       if (row.bodyA >= 0) {
         const bA = this.bodyStore.bodies[row.bodyA];
         const dpA = vec3Sub(bA.position, bA.prevPosition);
@@ -570,7 +587,11 @@ export class AVBDSolver3D {
         for (let k = 0; k < 6; k++) cEval += row.jacobianB[k] * dthetaB[k];
       }
 
-      let f = row.penalty * cEval + row.lambda;
+      // For soft constraints (finite stiffness), zero lambda in primal update.
+      // Only hard constraints (infinite stiffness) use warmstarted lambda.
+      // Reference: solver.cpp "lambda = isinf(stiffness[i]) ? force->lambda[i] : 0.0f"
+      const lambdaForPrimal = isFinite(row.stiffness) ? 0 : row.lambda;
+      let f = row.penalty * cEval + lambdaForPrimal;
       f = Math.max(row.fmin, Math.min(row.fmax, f));
 
       // RHS += J * f
@@ -614,7 +635,7 @@ export class AVBDSolver3D {
   }
 
   private dualUpdate3D(row: ConstraintRow3D, dt: number): void {
-    let cEval = row.c0;
+    let cEval = row.c0 * (1 - this.config.alpha);
     if (row.bodyA >= 0) {
       const bA = this.bodyStore.bodies[row.bodyA];
       const dpA = vec3Sub(bA.position, bA.prevPosition);
@@ -638,16 +659,10 @@ export class AVBDSolver3D {
 
     row.lambda = Math.max(row.fmin, Math.min(row.fmax, row.penalty * cEval + row.lambda));
     // Conditional penalty ramp: only when lambda is interior (not at bounds).
-    // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
-    // should stay low to avoid stiff angular springs that cause spinning instability.
-    const isFrictionRow = row.type === ForceType.Contact && isFinite(row.fmin);
-    if (!isFrictionRow && row.lambda > row.fmin && row.lambda < row.fmax) {
-      // Cap the per-iteration penalty increase to prevent exponential growth
-      // that causes explosive forces in many-body scenes (pyramids, stacks).
-      // Allow at most 50% growth per iteration (1.5^10 ≈ 57x max per step).
-      const increment = this.config.beta * Math.abs(cEval);
-      const maxIncrement = row.penalty * 0.5;
-      row.penalty += Math.min(increment, maxIncrement);
+    // For normal contacts: ramp when active. For friction: ramp when not sliding.
+    // Reference: manifold.cpp — penalty += beta * |C| when active/sticking
+    if (row.lambda > row.fmin && row.lambda < row.fmax) {
+      row.penalty += this.config.beta * Math.abs(cEval);
     }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) row.penalty = row.stiffness;

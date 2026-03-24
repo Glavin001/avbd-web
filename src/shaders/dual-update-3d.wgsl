@@ -14,6 +14,7 @@ struct SolverParams {
   penalty_min: f32,
   penalty_max: f32,
   beta: f32,
+  alpha: f32,
   num_bodies: u32,
   num_constraints: u32,
   num_bodies_in_group: u32,
@@ -54,8 +55,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var cr = constraints[idx];
   if (cr.is_active == 0u) { return; }
 
-  // Re-evaluate linearized constraint: C = C0 + J_A·dp_A + J_B·dp_B
-  var c_eval = cr.c0;
+  // Re-evaluate linearized constraint: C = C0*(1-alpha) + J_A·dp_A + J_B·dp_B
+  var c_eval = cr.c0 * (1.0 - params.alpha);
 
   if (cr.body_a >= 0) {
     let ba = u32(cr.body_a) * 20u;
@@ -111,16 +112,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   new_lambda = clamp(new_lambda, cr.fmin, cr.fmax);
   cr.lambda = new_lambda;
 
-  // Conditional penalty ramp: only when constraint is interior.
-  // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
-  // should stay low to avoid stiff angular springs that cause spinning instability.
-  // Normal contact rows have fmin=-inf; friction rows have finite Coulomb bounds.
-  let is_friction = cr.force_type == 0u && cr.fmin > -1e30;
-  if (!is_friction && cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
-    // Cap per-iteration penalty increase to prevent explosive forces in many-body scenes
-    let increment = params.beta * abs(c_eval);
-    let max_increment = cr.penalty * 0.5;
-    cr.penalty += min(increment, max_increment);
+  // Conditional penalty ramp: only when constraint is interior (not at bounds).
+  // For normal contacts: ramp when active. For friction: ramp when not sliding.
+  // Reference: manifold.cpp — penalty += beta * |C| when active/sticking
+  if (cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
+    cr.penalty += params.beta * abs(c_eval);
   }
   cr.penalty = clamp(cr.penalty, params.penalty_min, params.penalty_max);
   if (cr.penalty > cr.stiffness) {

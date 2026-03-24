@@ -265,12 +265,22 @@ export class AVBDSolver2D {
         omega *= dampFactor;
       }
 
-      // Compute inertial target with adaptive gravity
+      // Inertial target uses FULL gravity (the optimization objective target).
+      // Reference: solver.cpp — body->inertialLin = pos + vel*dt + gravity*dt²
       body.inertialPosition = {
-        x: body.position.x + vx * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
-        y: body.position.y + vy * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+        x: body.prevPosition.x + vx * dt + gravity.x * body.gravityScale * dt * dt,
+        y: body.prevPosition.y + vy * dt + gravity.y * body.gravityScale * dt * dt,
       };
-      body.inertialAngle = body.angle + omega * dt;
+      body.inertialAngle = body.prevAngle + omega * dt;
+
+      // Move body to predicted position (initial guess for solver).
+      // Uses adaptive gravity weight so resting bodies don't over-predict penetration.
+      // Reference: solver.cpp — body->positionLin = pos + vel*dt + gravity*accelWeight*dt²
+      body.position = {
+        x: body.prevPosition.x + vx * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
+        y: body.prevPosition.y + vy * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+      };
+      body.angle = body.prevAngle + omega * dt;
 
       // Save velocity for next frame's adaptive gravity
       body.prevVelocity = { ...body.velocity };
@@ -385,7 +395,9 @@ export class AVBDSolver2D {
 
       // Evaluate constraint (Taylor-series linearization)
       // C = C0*(1-alpha) + J_A*dp_A + J_B*dp_B
-      let cEval = row.c0;
+      // The (1-alpha) factor prevents over-correction of pre-existing penetrations.
+      // Reference: manifold.cpp — C = C0 * (1 - alpha) + J*dq
+      let cEval = row.c0 * (1 - this.config.alpha);
       if (row.bodyA >= 0) {
         const bA = this.bodyStore.bodies[row.bodyA];
         cEval += row.jacobianA[0] * (bA.position.x - bA.prevPosition.x)
@@ -449,7 +461,8 @@ export class AVBDSolver2D {
     const bodies = this.bodyStore.bodies;
 
     // Re-evaluate constraint value with current positions
-    let cEval = row.c0;
+    // C = C0*(1-alpha) + J*dp (same linearization as primal)
+    let cEval = row.c0 * (1 - this.config.alpha);
     if (row.bodyA >= 0) {
       const bA = bodies[row.bodyA];
       cEval += row.jacobianA[0] * (bA.position.x - bA.prevPosition.x)
@@ -479,14 +492,11 @@ export class AVBDSolver2D {
     }
 
     // Conditional penalty ramping: only ramp when constraint is interior (not at bounds).
-    // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
-    // should stay low to avoid creating stiff angular springs that cause spinning instability.
-    // Normal contact rows have fmin=-Infinity; friction rows have finite Coulomb bounds.
-    const isFrictionRow = row.type === ForceType.Contact && isFinite(row.fmin);
-    if (!isFrictionRow && row.lambda > row.fmin && row.lambda < row.fmax) {
-      const increment = this.config.beta * Math.abs(cEval);
-      const maxIncrement = row.penalty * 0.5;
-      row.penalty += Math.min(increment, maxIncrement);
+    // For normal contacts: ramp when lambda < 0 (contact active, not at fmax=0 bound).
+    // For friction: ramp when NOT sliding (interior of friction cone).
+    // Reference: manifold.cpp — penalty += beta * |C| when active/sticking
+    if (row.lambda > row.fmin && row.lambda < row.fmax) {
+      row.penalty += this.config.beta * Math.abs(cEval);
     }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) {

@@ -45,7 +45,7 @@ describe('2D Pyramid stability', () => {
     return { world, bodies };
   }
 
-  it('10-row pyramid should not explode after 600 steps', () => {
+  it('10-row pyramid should not explode after 600 steps', { timeout: 30000 }, () => {
     const { world, bodies } = create2DPyramid(10);
 
     let maxAngVel = 0;

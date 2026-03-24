@@ -10,10 +10,12 @@ struct SolverParams {
   penalty_min: f32,
   penalty_max: f32,
   beta: f32,
+  alpha: f32,
   num_bodies: u32,
   num_constraints: u32,
   num_bodies_in_group: u32,
   is_stabilization: u32,
+  _pad: u32,
 }
 
 struct ConstraintRow {
@@ -128,8 +130,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       H_diag = cr.hessian_diag_b.xyz;
     }
 
-    // Evaluate linearized constraint: C = C0 + J_A·dp_A + J_B·dp_B
-    var c_eval = cr.c0;
+    // Evaluate linearized constraint: C = C0*(1-alpha) + J_A·dp_A + J_B·dp_B
+    var c_eval = cr.c0 * (1.0 - params.alpha);
     if (cr.body_a >= 0) {
       let ba_base = u32(cr.body_a) * 8u;
       c_eval += cr.jacobian_a.x * (body_state[ba_base + 0u] - body_prev[ba_base + 0u])
