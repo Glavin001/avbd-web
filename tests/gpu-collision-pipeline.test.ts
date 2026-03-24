@@ -287,6 +287,56 @@ describe('3D GPU Constraint Buffer Layout', () => {
   });
 });
 
+// ─── Shader Stride Consistency Tests ─────────────────────────────────────────
+// These tests verify that WGSL shaders read buffers at the correct strides,
+// matching the TypeScript upload code. A stride mismatch causes the shader to
+// read garbage data from the wrong body, breaking collision detection entirely.
+
+describe('Collider Info Stride Consistency', () => {
+  it('2D morton codes shader uses stride 8 for collider_info', () => {
+    // The TypeScript upload uses COLLIDER_INFO_STRIDE = 8 u32s per body.
+    // The shader MUST read with the same stride, or it reads garbage for body >= 1.
+    // The ci_base variable must use stride 8 (not 4, which was the original bug).
+    expect(MORTON_CODES_2D_WGSL).toContain('ci_base    = idx * 8u');
+  });
+
+  it('3D morton codes shader uses stride 8 for collider_info', () => {
+    expect(MORTON_CODES_3D_WGSL).toContain('idx * 8u');
+    expect(MORTON_CODES_3D_WGSL).not.toMatch(/idx \* 4u/);
+  });
+
+  it('2D narrowphase shader uses stride 8 for collider_info', () => {
+    expect(NARROWPHASE_2D_WGSL).toContain('idx * 8u');
+  });
+
+  it('3D narrowphase shader uses stride 8 for collider_info', () => {
+    expect(NARROWPHASE_3D_WGSL).toContain('idx * 8u');
+  });
+
+  it('2D constraint assembly reads body_state with BODY_STRIDE=8', () => {
+    // 2D assembly doesn't read collider_info directly, but uses BODY_STRIDE for body_state
+    expect(CONSTRAINT_ASSEMBLY_2D_WGSL).toContain('BODY_STRIDE: u32 = 8u');
+  });
+
+  it('all collision shaders agree on body state stride', () => {
+    // 2D body state stride = 8 floats
+    expect(MORTON_CODES_2D_WGSL).toContain('idx * 8u');
+    expect(CONSTRAINT_ASSEMBLY_2D_WGSL).toContain('BODY_STRIDE: u32 = 8u');
+
+    // 3D body state stride = 20 floats
+    expect(MORTON_CODES_3D_WGSL).toContain('idx * 20u');
+    expect(CONSTRAINT_ASSEMBLY_3D_WGSL).toContain('BODY_STRIDE: u32 = 20u');
+  });
+
+  it('radius is at collider_info offset 4, not offset 3', () => {
+    // Collider info layout: [shapeType(0), halfExtX(1), halfExtY(2), halfExtZ(3), radius(4), ...]
+    // The 2D shader must read radius from offset 4, not 3
+    expect(MORTON_CODES_2D_WGSL).toContain('ci_base + 4u');
+    // 3D shader should also read radius from offset 4
+    expect(MORTON_CODES_3D_WGSL).toContain('ci_base + 4u');
+  });
+});
+
 // ─── Config Tests ────────────────────────────────────────────────────────────
 
 describe('useGPUCollision Config', () => {

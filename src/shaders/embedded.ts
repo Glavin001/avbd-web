@@ -1207,7 +1207,7 @@ struct Params {
 // Body state: 8 floats per body [x, y, angle, vx, vy, omega, mass, inertia]
 @group(0) @binding(0) var<storage, read> body_state: array<f32>;
 
-// Collider info: 4 values per body [shape_type(u32), halfExtentX, halfExtentY, radius]
+// Collider info: 8 u32s per body [shape_type, halfExtX, halfExtY, halfExtZ, radius, friction, restitution, bodyType]
 @group(0) @binding(1) var<storage, read> collider_info: array<u32>;
 
 @group(0) @binding(2) var<uniform> params: Params;
@@ -1248,12 +1248,12 @@ fn morton_codes_2d(@builtin(global_invocation_id) gid: vec3u) {
   let py    = body_state[base + 1u];
   let angle = body_state[base + 2u];
 
-  // Read collider info
-  let ci_base    = idx * 4u;
+  // Read collider info (8 u32s per body, matching COLLIDER_INFO_STRIDE)
+  let ci_base    = idx * 8u;
   let shape_type = collider_info[ci_base + 0u];
   let half_ext_x = bitcast<f32>(collider_info[ci_base + 1u]);
   let half_ext_y = bitcast<f32>(collider_info[ci_base + 2u]);
-  let radius     = bitcast<f32>(collider_info[ci_base + 3u]);
+  let radius     = bitcast<f32>(collider_info[ci_base + 4u]);
 
   // Compute AABB
   var aabb_min_x: f32;
