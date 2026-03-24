@@ -26,6 +26,7 @@ import { collide3D } from '../3d/collision-gjk.js';
 import { vec3Sub, vec3Scale, vec3Cross, vec3Dot, vec3Length, vec3, quatMul, quatNormalize, quatFromAxisAngle } from './math.js';
 import { computeGraphColoring } from './graph-coloring.js';
 import { GPUContext } from './gpu-context.js';
+import { GpuCollisionPipeline } from './gpu-collision-pipeline.js';
 import { PRIMAL_UPDATE_3D_WGSL, DUAL_UPDATE_3D_WGSL, FRICTION_COUPLING_3D_WGSL } from '../shaders/embedded.js';
 
 // ─── GPU Buffer Layout Constants ────────────────────────────────────────────
@@ -96,6 +97,11 @@ export class GPUSolver3D {
 
   /** Guard against concurrent step() calls (async game loops can overlap) */
   private _stepping = false;
+
+  // GPU collision pipeline (LBVH broadphase + GPU narrowphase + constraint assembly)
+  private collisionPipeline: GpuCollisionPipeline | null = null;
+  private _collisionConstraintStaging: GPUBuffer | null = null;
+  private _collisionConstraintStagingSize = 0;
 
   /** Contact cache for warmstarting between frames (body pair key → cached lambdas/penalties) */
   private contactCache: Map<number, { normalLambda: number; normalPenalty: number; fric1Lambda: number; fric1Penalty: number; fric2Lambda: number; fric2Penalty: number; age: number }> = new Map();
@@ -237,6 +243,11 @@ export class GPUSolver3D {
     });
 
     this.initialized = true;
+
+    // Initialize GPU collision pipeline if enabled
+    if (this.config.useGPUCollision !== false) {
+      this.collisionPipeline = new GpuCollisionPipeline(this.gpu, '3d');
+    }
   }
 
   /**
@@ -275,171 +286,195 @@ export class GPUSolver3D {
 
     if (bodies.length === 0) return;
 
-    // ─── 1. CPU: Cache previous contacts, then collision detect ────
-    // Cache lambda/penalty from previous frame's contact rows
+    // ─── 1. Collision Detection ─────────────────────────────────
     this.cacheContacts();
     this.constraintRows = [...this.jointRows];
 
-    // Spatial hash broadphase: O(n) average instead of O(n²)
-    // Uses flat typed arrays to avoid per-frame object allocations
-    let numPairs = 0;
-    {
-      const n = bodies.length;
+    if (this.collisionPipeline) {
+      // GPU collision path: LBVH broadphase + GPU narrowphase + constraint assembly
+      this.ensureBuffers(bodies.length, 1, 1);
 
-      // Ensure flat AABB arrays are large enough
-      if (this._aabbMinX.length < n) {
-        const cap = Math.max(n, 64);
-        this._aabbMinX = new Float64Array(cap);
-        this._aabbMinY = new Float64Array(cap);
-        this._aabbMinZ = new Float64Array(cap);
-        this._aabbMaxX = new Float64Array(cap);
-        this._aabbMaxY = new Float64Array(cap);
-        this._aabbMaxZ = new Float64Array(cap);
-      }
-      const minX = this._aabbMinX, minY = this._aabbMinY, minZ = this._aabbMinZ;
-      const maxX = this._aabbMaxX, maxY = this._aabbMaxY, maxZ = this._aabbMaxZ;
-
-      // Compute AABBs inline into flat arrays (avoid getAABB3D object allocation)
-      let totalExtent = 0, dynCount = 0;
-      for (let i = 0; i < n; i++) {
+      // Upload pre-init body state for collision detection
+      const collBodyData = this._bodyUpload!;
+      for (let i = 0; i < bodies.length; i++) {
         const b = bodies[i];
-        if (b.colliderShape === ColliderShapeType3D.Ball) {
-          const r = b.radius;
-          minX[i] = b.position.x - r; maxX[i] = b.position.x + r;
-          minY[i] = b.position.y - r; maxY[i] = b.position.y + r;
-          minZ[i] = b.position.z - r; maxZ[i] = b.position.z + r;
-        } else {
-          // Cuboid: compute rotated extents inline
-          const he = b.halfExtents;
-          const q = b.rotation;
-          // Rotation matrix columns from quaternion (inline quatRotateVec3)
-          const x2 = q.x + q.x, y2 = q.y + q.y, z2 = q.z + q.z;
-          const wx2 = q.w * x2, wy2 = q.w * y2, wz2 = q.w * z2;
-          const xx2 = q.x * x2, xy2 = q.x * y2, xz2 = q.x * z2;
-          const yy2 = q.y * y2, yz2 = q.y * z2, zz2 = q.z * z2;
-          // Column 0 (rotated x-axis)
-          const r00 = 1 - yy2 - zz2, r10 = xy2 + wz2, r20 = xz2 - wy2;
-          // Column 1 (rotated y-axis)
-          const r01 = xy2 - wz2, r11 = 1 - xx2 - zz2, r21 = yz2 + wx2;
-          // Column 2 (rotated z-axis)
-          const r02 = xz2 + wy2, r12 = yz2 - wx2, r22 = 1 - xx2 - yy2;
-          const ex = Math.abs(r00) * he.x + Math.abs(r01) * he.y + Math.abs(r02) * he.z;
-          const ey = Math.abs(r10) * he.x + Math.abs(r11) * he.y + Math.abs(r12) * he.z;
-          const ez = Math.abs(r20) * he.x + Math.abs(r21) * he.y + Math.abs(r22) * he.z;
-          minX[i] = b.position.x - ex; maxX[i] = b.position.x + ex;
-          minY[i] = b.position.y - ey; maxY[i] = b.position.y + ey;
-          minZ[i] = b.position.z - ez; maxZ[i] = b.position.z + ez;
-        }
-        if (b.type !== RigidBodyType.Fixed) {
-          totalExtent += (maxX[i] - minX[i]) + (maxY[i] - minY[i]) + (maxZ[i] - minZ[i]);
-          dynCount++;
-        }
+        const off = i * BODY_STRIDE;
+        collBodyData[off + 0] = b.position.x;
+        collBodyData[off + 1] = b.position.y;
+        collBodyData[off + 2] = b.position.z;
+        collBodyData[off + 3] = b.rotation.w;
+        collBodyData[off + 4] = b.rotation.x;
+        collBodyData[off + 5] = b.rotation.y;
+        collBodyData[off + 6] = b.rotation.z;
+        collBodyData[off + 7] = b.velocity.x;
+        collBodyData[off + 8] = b.velocity.y;
+        collBodyData[off + 9] = b.velocity.z;
+        collBodyData[off + 10] = b.angularVelocity.x;
+        collBodyData[off + 11] = b.angularVelocity.y;
+        collBodyData[off + 12] = b.angularVelocity.z;
+        collBodyData[off + 13] = b.mass;
+        collBodyData[off + 14] = b.inertia.x;
+        collBodyData[off + 15] = b.inertia.y;
+        collBodyData[off + 16] = b.inertia.z;
       }
-      const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 3)) * 2 : 1, 0.5);
-      const invCell = 1 / cellSize;
+      gpuWrite(device.queue, this.bodyStateBuffer, 0, collBodyData);
 
-      // Spatial hash grid using Map (keys are cell hashes, values are body index arrays)
-      // We reuse the Map across iterations but clear it each frame
-      const grid = new Map<number, number[]>();
+      this.collisionPipeline.uploadBodyData3D(bodies, this.bodyStateBuffer);
+      const sceneBounds = this.collisionPipeline.computeSceneBounds3D(bodies);
 
-      for (let i = 0; i < n; i++) {
-        const x0 = Math.floor(minX[i] * invCell), x1 = Math.floor(maxX[i] * invCell);
-        const y0 = Math.floor(minY[i] * invCell), y1 = Math.floor(maxY[i] * invCell);
-        const z0 = Math.floor(minZ[i] * invCell), z1 = Math.floor(maxZ[i] * invCell);
-        for (let cx = x0; cx <= x1; cx++) {
-          for (let cy = y0; cy <= y1; cy++) {
-            for (let cz = z0; cz <= z1; cz++) {
-              const k = ((cx + 0x400) * 0x100000) + ((cy + 0x400) * 0x800) + (cz + 0x400);
-              let cell = grid.get(k);
-              if (!cell) { cell = []; grid.set(k, cell); }
-              cell.push(i);
+      const collResult = await this.collisionPipeline.runFullPipeline(
+        bodies.length, this.bodyStateBuffer, sceneBounds,
+        COLLISION_MARGIN, dt, config.penaltyMin, config.alpha,
+      );
+
+      if (collResult.numConstraints > 0) {
+        const gpuRows = await this.readbackGpuConstraints3D(
+          collResult.constraintBuffer, collResult.numConstraints,
+        );
+        this.constraintRows.push(...gpuRows);
+      }
+    } else {
+      // CPU collision path: spatial hash broadphase + GJK/EPA narrowphase
+      let numPairs = 0;
+      {
+        const n = bodies.length;
+
+        if (this._aabbMinX.length < n) {
+          const cap = Math.max(n, 64);
+          this._aabbMinX = new Float64Array(cap);
+          this._aabbMinY = new Float64Array(cap);
+          this._aabbMinZ = new Float64Array(cap);
+          this._aabbMaxX = new Float64Array(cap);
+          this._aabbMaxY = new Float64Array(cap);
+          this._aabbMaxZ = new Float64Array(cap);
+        }
+        const minX = this._aabbMinX, minY = this._aabbMinY, minZ = this._aabbMinZ;
+        const maxX = this._aabbMaxX, maxY = this._aabbMaxY, maxZ = this._aabbMaxZ;
+
+        let totalExtent = 0, dynCount = 0;
+        for (let i = 0; i < n; i++) {
+          const b = bodies[i];
+          if (b.colliderShape === ColliderShapeType3D.Ball) {
+            const r = b.radius;
+            minX[i] = b.position.x - r; maxX[i] = b.position.x + r;
+            minY[i] = b.position.y - r; maxY[i] = b.position.y + r;
+            minZ[i] = b.position.z - r; maxZ[i] = b.position.z + r;
+          } else {
+            const he = b.halfExtents;
+            const q = b.rotation;
+            const x2 = q.x + q.x, y2 = q.y + q.y, z2 = q.z + q.z;
+            const wx2 = q.w * x2, wy2 = q.w * y2, wz2 = q.w * z2;
+            const xx2 = q.x * x2, xy2 = q.x * y2, xz2 = q.x * z2;
+            const yy2 = q.y * y2, yz2 = q.y * z2, zz2 = q.z * z2;
+            const r00 = 1 - yy2 - zz2, r10 = xy2 + wz2, r20 = xz2 - wy2;
+            const r01 = xy2 - wz2, r11 = 1 - xx2 - zz2, r21 = yz2 + wx2;
+            const r02 = xz2 + wy2, r12 = yz2 - wx2, r22 = 1 - xx2 - yy2;
+            const ex = Math.abs(r00) * he.x + Math.abs(r01) * he.y + Math.abs(r02) * he.z;
+            const ey = Math.abs(r10) * he.x + Math.abs(r11) * he.y + Math.abs(r12) * he.z;
+            const ez = Math.abs(r20) * he.x + Math.abs(r21) * he.y + Math.abs(r22) * he.z;
+            minX[i] = b.position.x - ex; maxX[i] = b.position.x + ex;
+            minY[i] = b.position.y - ey; maxY[i] = b.position.y + ey;
+            minZ[i] = b.position.z - ez; maxZ[i] = b.position.z + ez;
+          }
+          if (b.type !== RigidBodyType.Fixed) {
+            totalExtent += (maxX[i] - minX[i]) + (maxY[i] - minY[i]) + (maxZ[i] - minZ[i]);
+            dynCount++;
+          }
+        }
+        const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 3)) * 2 : 1, 0.5);
+        const invCell = 1 / cellSize;
+
+        const grid = new Map<number, number[]>();
+        for (let i = 0; i < n; i++) {
+          const x0 = Math.floor(minX[i] * invCell), x1 = Math.floor(maxX[i] * invCell);
+          const y0 = Math.floor(minY[i] * invCell), y1 = Math.floor(maxY[i] * invCell);
+          const z0 = Math.floor(minZ[i] * invCell), z1 = Math.floor(maxZ[i] * invCell);
+          for (let cx = x0; cx <= x1; cx++) {
+            for (let cy = y0; cy <= y1; cy++) {
+              for (let cz = z0; cz <= z1; cz++) {
+                const k = ((cx + 0x400) * 0x100000) + ((cy + 0x400) * 0x800) + (cz + 0x400);
+                let cell = grid.get(k);
+                if (!cell) { cell = []; grid.set(k, cell); }
+                cell.push(i);
+              }
+            }
+          }
+        }
+
+        const maxPairsEstimate = n * 8;
+        const hashCap = maxPairsEstimate * 2;
+        if (this._testedKeys.length < hashCap) {
+          this._testedKeys = new Int32Array(hashCap);
+          this._testedUsed = new Uint8Array(hashCap);
+        }
+        const testedKeys = this._testedKeys;
+        const testedUsed = this._testedUsed;
+        testedUsed.fill(0);
+
+        if (this._pairBuf.length < maxPairsEstimate * 2) {
+          this._pairBuf = new Int32Array(maxPairsEstimate * 2);
+        }
+        const pairBuf = this._pairBuf;
+        numPairs = 0;
+        const hasIgnorePairs = this.ignorePairs.size > 0;
+
+        for (const cell of grid.values()) {
+          const len = cell.length;
+          for (let ci = 0; ci < len; ci++) {
+            const i = cell[ci];
+            for (let cj = ci + 1; cj < len; cj++) {
+              const j = cell[cj];
+              const lo = i < j ? i : j;
+              const hi = i < j ? j : i;
+              const pk = lo * 65537 + hi;
+
+              let slot = ((pk * 2654435761) >>> 0) % hashCap;
+              let found = false;
+              while (testedUsed[slot]) {
+                if (testedKeys[slot] === pk) { found = true; break; }
+                slot = (slot + 1) % hashCap;
+              }
+              if (found) continue;
+              testedKeys[slot] = pk;
+              testedUsed[slot] = 1;
+
+              if (bodies[i].type === RigidBodyType.Fixed && bodies[j].type === RigidBodyType.Fixed) continue;
+              if (hasIgnorePairs) {
+                const key = `${i}-${j}`;
+                if (this.ignorePairs.has(key)) continue;
+              }
+              if (minX[i] > maxX[j] || maxX[i] < minX[j] ||
+                  minY[i] > maxY[j] || maxY[i] < minY[j] ||
+                  minZ[i] > maxZ[j] || maxZ[i] < minZ[j]) continue;
+
+              if (numPairs * 2 >= pairBuf.length) {
+                const newBuf = new Int32Array(pairBuf.length * 2);
+                newBuf.set(pairBuf);
+                this._pairBuf = newBuf;
+              }
+              this._pairBuf[numPairs * 2] = i;
+              this._pairBuf[numPairs * 2 + 1] = j;
+              numPairs++;
             }
           }
         }
       }
 
-      // Pair dedup using open-addressing hash table (avoid Set overhead)
-      const maxPairsEstimate = n * 8; // reasonable upper bound
-      const hashCap = maxPairsEstimate * 2; // load factor ~0.5
-      if (this._testedKeys.length < hashCap) {
-        this._testedKeys = new Int32Array(hashCap);
-        this._testedUsed = new Uint8Array(hashCap);
-      }
-      const testedKeys = this._testedKeys;
-      const testedUsed = this._testedUsed;
-      testedUsed.fill(0); // clear
-
-      // Ensure pair buffer is large enough
-      if (this._pairBuf.length < maxPairsEstimate * 2) {
-        this._pairBuf = new Int32Array(maxPairsEstimate * 2);
-      }
       const pairBuf = this._pairBuf;
-      numPairs = 0;
-      const hasIgnorePairs = this.ignorePairs.size > 0;
-
-      for (const cell of grid.values()) {
-        const len = cell.length;
-        for (let ci = 0; ci < len; ci++) {
-          const i = cell[ci];
-          for (let cj = ci + 1; cj < len; cj++) {
-            const j = cell[cj];
-            // Pair key for dedup (canonical order)
-            const lo = i < j ? i : j;
-            const hi = i < j ? j : i;
-            const pk = lo * 65537 + hi; // unique for lo < hi < 65536
-
-            // Open-addressing probe
-            let slot = ((pk * 2654435761) >>> 0) % hashCap;
-            let found = false;
-            while (testedUsed[slot]) {
-              if (testedKeys[slot] === pk) { found = true; break; }
-              slot = (slot + 1) % hashCap;
-            }
-            if (found) continue;
-            testedKeys[slot] = pk;
-            testedUsed[slot] = 1;
-
-            if (bodies[i].type === RigidBodyType.Fixed && bodies[j].type === RigidBodyType.Fixed) continue;
-            if (hasIgnorePairs) {
-              const key = `${i}-${j}`;
-              if (this.ignorePairs.has(key)) continue;
-            }
-            // Inline AABB overlap check using flat arrays
-            if (minX[i] > maxX[j] || maxX[i] < minX[j] ||
-                minY[i] > maxY[j] || maxY[i] < minY[j] ||
-                minZ[i] > maxZ[j] || maxZ[i] < minZ[j]) continue;
-
-            // Grow pair buffer if needed
-            if (numPairs * 2 >= pairBuf.length) {
-              const newBuf = new Int32Array(pairBuf.length * 2);
-              newBuf.set(pairBuf);
-              this._pairBuf = newBuf;
-            }
-            this._pairBuf[numPairs * 2] = i;
-            this._pairBuf[numPairs * 2 + 1] = j;
-            numPairs++;
-          }
+      for (let pi = 0; pi < numPairs; pi++) {
+        const i = pairBuf[pi * 2], j = pairBuf[pi * 2 + 1];
+        const manifold = collide3D(bodies[i], bodies[j]);
+        if (manifold) {
+          const rows = this.createContactRows3D(manifold, bodies[i], bodies[j]);
+          this.constraintRows.push(...rows);
         }
       }
     }
 
     const tBroadphase = performance.now();
-
-    // Narrowphase: GJK collision detection on candidate pairs
-    const pairBuf = this._pairBuf;
-    for (let pi = 0; pi < numPairs; pi++) {
-      const i = pairBuf[pi * 2], j = pairBuf[pi * 2 + 1];
-      const manifold = collide3D(bodies[i], bodies[j]);
-      if (manifold) {
-        const rows = this.createContactRows3D(manifold, bodies[i], bodies[j]);
-        this.constraintRows.push(...rows);
-      }
-    }
-
-    const tCollision = performance.now();
+    const tCollision = tBroadphase;
 
     // ─── 2. CPU: Warmstart & Initialize ───────────────────────────
-    // Apply cached warmstart values to new contact rows
     this.warmstartContacts();
 
     for (const row of this.constraintRows) {
@@ -934,6 +969,85 @@ export class GPUSolver3D {
     };
   }
 
+  /** Read back GPU constraint buffer and parse into ConstraintRow3D[] */
+  private async readbackGpuConstraints3D(
+    constraintBuffer: GPUBuffer,
+    numConstraints: number,
+  ): Promise<ConstraintRow3D[]> {
+    const device = this.gpu.device;
+    const byteSize = numConstraints * CONSTRAINT_STRIDE * 4;
+
+    if (byteSize > this._collisionConstraintStagingSize) {
+      this._collisionConstraintStaging?.destroy();
+      this._collisionConstraintStagingSize = byteSize;
+      this._collisionConstraintStaging = device.createBuffer({
+        size: byteSize,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    const staging = this._collisionConstraintStaging!;
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(constraintBuffer, 0, staging, 0, byteSize);
+    device.queue.submit([enc.finish()]);
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const mapped = staging.getMappedRange();
+    const view = new DataView(mapped);
+
+    const rows: ConstraintRow3D[] = [];
+    for (let i = 0; i < numConstraints; i++) {
+      const off = i * CONSTRAINT_STRIDE * 4; // 36 floats * 4 bytes = 144 bytes per row
+      rows.push({
+        bodyA: view.getInt32(off + 0, true),
+        bodyB: view.getInt32(off + 4, true),
+        type: view.getUint32(off + 8, true),
+        // jacobianA: [lin.x, lin.y, lin.z, ang.x, ang.y, ang.z]
+        jacobianA: [
+          view.getFloat32(off + 16, true),  // lin.x
+          view.getFloat32(off + 20, true),  // lin.y
+          view.getFloat32(off + 24, true),  // lin.z
+          view.getFloat32(off + 32, true),  // ang.x
+          view.getFloat32(off + 36, true),  // ang.y
+          view.getFloat32(off + 40, true),  // ang.z
+        ],
+        jacobianB: [
+          view.getFloat32(off + 48, true),  // lin.x
+          view.getFloat32(off + 52, true),  // lin.y
+          view.getFloat32(off + 56, true),  // lin.z
+          view.getFloat32(off + 64, true),  // ang.x
+          view.getFloat32(off + 68, true),  // ang.y
+          view.getFloat32(off + 72, true),  // ang.z
+        ],
+        // Hessian: only angular components (linear is 0)
+        hessianDiagA: [
+          0, 0, 0,
+          view.getFloat32(off + 80, true),
+          view.getFloat32(off + 84, true),
+          view.getFloat32(off + 88, true),
+        ],
+        hessianDiagB: [
+          0, 0, 0,
+          view.getFloat32(off + 96, true),
+          view.getFloat32(off + 100, true),
+          view.getFloat32(off + 104, true),
+        ],
+        c: view.getFloat32(off + 112, true),
+        c0: view.getFloat32(off + 116, true),
+        lambda: view.getFloat32(off + 120, true),
+        penalty: view.getFloat32(off + 124, true),
+        stiffness: view.getFloat32(off + 128, true),
+        fmin: view.getFloat32(off + 132, true),
+        fmax: view.getFloat32(off + 136, true),
+        active: view.getUint32(off + 140, true) !== 0,
+        broken: false,
+      });
+    }
+
+    staging.unmap();
+    return rows;
+  }
+
   /** Create 3D contact constraint rows from a manifold */
   private createContactRows3D(
     manifold: { bodyA: number; bodyB: number; normal: Vec3; contacts: { position: Vec3; depth: number }[] },
@@ -1230,11 +1344,15 @@ export class GPUSolver3D {
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
       this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
       this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer,
-      this._bodyStagingBuffer, this._crStagingBuffer, this._velRecoveryStagingBuffer]) {
+      this._bodyStagingBuffer, this._crStagingBuffer, this._velRecoveryStagingBuffer,
+      this._collisionConstraintStaging]) {
       if (buf) buf.destroy();
     }
     this._bodyStagingBuffer = null;
     this._crStagingBuffer = null;
     this._velRecoveryStagingBuffer = null;
+    this._collisionConstraintStaging = null;
+    this.collisionPipeline?.destroy();
+    this.collisionPipeline = null;
   }
 }

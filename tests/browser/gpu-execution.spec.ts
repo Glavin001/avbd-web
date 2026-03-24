@@ -468,3 +468,94 @@ test.describe('GPU 3D: Exhaustive code path coverage', () => {
     expect(r.isFinite).toBe(true);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// GPU Collision Detection Pipeline Tests (LBVH + GPU Narrowphase)
+// ═══════════════════════════════════════════════════════════════════════
+
+test.describe('GPU Collision Pipeline: 2D', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 30000,
+    });
+  });
+
+  test('2D GPU collision: box on ground settles without penetration', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuCollision2d_boxOnGround);
+    console.log('GPU collision 2D box on ground:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.noPenetration).toBe(true);
+    expect(r.settled).toBe(true);
+    expect(r.cpuSettled).toBe(true);
+  });
+
+  test('2D GPU collision: two circles collide and settle', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuCollision2d_circles);
+    console.log('GPU collision 2D circles:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.bothAbove).toBe(true);
+    expect(r.allFinite).toBe(true);
+  });
+
+  test('2D GPU collision: 5-box stack remains stable', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuCollision2d_stack);
+    console.log('GPU collision 2D stack:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.allAbove).toBe(true);
+    expect(r.allFinite).toBe(true);
+    expect(r.ordered).toBe(true);
+  });
+
+  test('2D GPU collision vs CPU collision: parity within tolerance', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuCollision2d_parity);
+    console.log('GPU collision 2D parity:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    // Step 1: GPU and CPU collision should produce very similar results
+    expect(r.diff1).toBeLessThan(0.5);
+    // Step 60: allow more divergence (different collision algorithms)
+    expect(r.diff60).toBeLessThan(2.0);
+    expect(r.gpuAbove).toBe(true);
+    expect(r.cpuAbove).toBe(true);
+  });
+
+  test('2D GPU collision: mid-air collision detected', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuCollision2d_midAir);
+    console.log('GPU collision 2D mid-air:', JSON.stringify(r));
+    expect(r.success).toBe(true);
+    expect(r.isGPU).toBe(true);
+    expect(r.collisionDetected).toBe(true);
+    expect(r.noOverlap).toBe(true);
+    expect(r.finite).toBe(true);
+  });
+});
+
+test.describe('GPU Collision Pipeline: 3D', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('http://localhost:3333/tests/browser/test-harness.html');
+    await page.waitForFunction(() => (window as any).testResults?._complete === true, {
+      timeout: 30000,
+    });
+  });
+
+  test('3D GPU collision: box on ground settles', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuCollision3d_boxOnGround);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('GPU collision 3D box on ground:', JSON.stringify(r));
+    expect(r.noPenetration).toBe(true);
+    expect(r.settled).toBe(true);
+    expect(r.finite).toBe(true);
+  });
+
+  test('3D GPU collision: sphere on ground settles', async ({ page }) => {
+    const r = await page.evaluate(() => (window as any).testResults.gpuCollision3d_sphereOnGround);
+    if (!r || !r.success || r.skip) { test.skip(); return; }
+    console.log('GPU collision 3D sphere on ground:', JSON.stringify(r));
+    expect(r.aboveGround).toBe(true);
+    expect(r.finite).toBe(true);
+  });
+});

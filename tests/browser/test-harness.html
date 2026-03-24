@@ -1148,6 +1148,217 @@
       };
     });
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // GPU Collision Detection Pipeline Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ─── 2D GPU Collision: box on ground (verifies LBVH + narrowphase) ───
+    await window.runTest('gpuCollision2d_boxOnGround', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, useGPUCollision: true });
+      const worldCpu = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, useGPUCollision: false });
+
+      function setup(w) {
+        w.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+        const body = w.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3));
+        w.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), body);
+        return body;
+      }
+
+      const gpuBody = setup(world);
+      const cpuBody = setup(worldCpu);
+
+      let gpuMinY = Infinity;
+      let cpuMinY = Infinity;
+      for (let i = 0; i < 120; i++) {
+        await world.step();
+        worldCpu.stepCPU();
+        gpuMinY = Math.min(gpuMinY, gpuBody.translation().y);
+        cpuMinY = Math.min(cpuMinY, cpuBody.translation().y);
+      }
+
+      const gpuFinal = gpuBody.translation();
+      const cpuFinal = cpuBody.translation();
+      return {
+        isGPU: world.isGPU,
+        gpuMinY, cpuMinY,
+        gpuFinalY: gpuFinal.y,
+        cpuFinalY: cpuFinal.y,
+        noPenetration: gpuMinY > 0.3,
+        settled: gpuFinal.y > 0.7 && gpuFinal.y < 2.5,
+        cpuSettled: cpuFinal.y > 0.7 && cpuFinal.y < 2.5,
+      };
+    });
+
+    // ─── 2D GPU Collision: circle-circle ────────────────────────────────
+    await window.runTest('gpuCollision2d_circles', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, useGPUCollision: true });
+
+      // Ground
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+
+      // Two circles side by side
+      const b1 = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(-0.5, 3));
+      world.createCollider(AVBD.ColliderDesc.ball(0.5).setFriction(0.5), b1);
+      const b2 = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0.5, 4));
+      world.createCollider(AVBD.ColliderDesc.ball(0.5).setFriction(0.5), b2);
+
+      for (let i = 0; i < 120; i++) await world.step();
+
+      const p1 = b1.translation(), p2 = b2.translation();
+      return {
+        isGPU: world.isGPU,
+        y1: p1.y, y2: p2.y,
+        bothAbove: p1.y > 0.4 && p2.y > 0.4,
+        allFinite: isFinite(p1.x) && isFinite(p1.y) && isFinite(p2.x) && isFinite(p2.y),
+      };
+    });
+
+    // ─── 2D GPU Collision: 5-box stack ──────────────────────────────────
+    await window.runTest('gpuCollision2d_stack', async () => {
+      const world = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, useGPUCollision: true });
+
+      world.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+
+      const bodies = [];
+      for (let i = 0; i < 5; i++) {
+        const b = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 1.5 + i * 1.1));
+        world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b);
+        bodies.push(b);
+      }
+
+      for (let i = 0; i < 180; i++) await world.step();
+
+      const ys = bodies.map(b => b.translation().y);
+      const allAbove = ys.every(y => y > 0.4);
+      const allFinite = ys.every(y => isFinite(y));
+      // Check rough ordering (higher bodies have higher y)
+      let ordered = true;
+      for (let i = 1; i < ys.length; i++) {
+        if (ys[i] < ys[i-1] - 0.3) ordered = false;
+      }
+
+      return { isGPU: world.isGPU, ys, allAbove, allFinite, ordered };
+    });
+
+    // ─── 3D GPU Collision: box on ground ────────────────────────────────
+    await window.runTest('gpuCollision3d_boxOnGround', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const body = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 3, 0)
+      );
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(0.5, 0.5, 0.5).setFriction(0.5), body);
+
+      let minY = Infinity;
+      for (let i = 0; i < 120; i++) {
+        await world.step();
+        minY = Math.min(minY, body.translation().y);
+      }
+
+      const pos = body.translation();
+      return {
+        isGPU: true,
+        minY,
+        finalY: pos.y,
+        noPenetration: minY > 0.3,
+        settled: pos.y > 0.5 && pos.y < 3.0,
+        finite: isFinite(pos.x) && isFinite(pos.y) && isFinite(pos.z),
+      };
+    });
+
+    // ─── 3D GPU Collision: sphere on ground ─────────────────────────────
+    await window.runTest('gpuCollision3d_sphereOnGround', async () => {
+      try { await AVBD3D.init(); } catch(e) { return { skip: true }; }
+
+      const world = new AVBD3D.World({ x: 0, y: -9.81, z: 0 },
+        { iterations: 10, useGPUCollision: true });
+
+      world.createCollider(AVBD3D.ColliderDesc.cuboid(10, 0.5, 10).setFriction(0.5));
+      const sphere = world.createRigidBody(
+        AVBD3D.RigidBodyDesc.dynamic().setTranslation(0, 3, 0)
+      );
+      world.createCollider(AVBD3D.ColliderDesc.ball(0.5).setFriction(0.5), sphere);
+
+      for (let i = 0; i < 120; i++) await world.step();
+      const pos = sphere.translation();
+      return {
+        isGPU: true,
+        y: pos.y,
+        aboveGround: pos.y > 0.4,
+        finite: isFinite(pos.x) && isFinite(pos.y) && isFinite(pos.z),
+      };
+    });
+
+    // ─── 2D GPU Collision vs CPU Collision parity ───────────────────────
+    await window.runTest('gpuCollision2d_parity', async () => {
+      const gpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, useGPUCollision: true });
+      const cpuWorld = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, useGPUCollision: false });
+
+      function setup(w) {
+        w.createCollider(AVBD.ColliderDesc.cuboid(10, 0.5).setFriction(0.5));
+        const b = w.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(0, 3));
+        w.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5).setFriction(0.5), b);
+        return b;
+      }
+
+      const gpuBody = setup(gpuWorld);
+      const cpuBody = setup(cpuWorld);
+
+      // Step 1 parity
+      await gpuWorld.step();
+      cpuWorld.stepCPU();
+      const gp1 = gpuBody.translation(), cp1 = cpuBody.translation();
+      const diff1 = Math.sqrt((gp1.x - cp1.x) ** 2 + (gp1.y - cp1.y) ** 2);
+
+      // Step to 60
+      for (let i = 1; i < 60; i++) {
+        await gpuWorld.step();
+        cpuWorld.stepCPU();
+      }
+      const gp60 = gpuBody.translation(), cp60 = cpuBody.translation();
+      const diff60 = Math.sqrt((gp60.x - cp60.x) ** 2 + (gp60.y - cp60.y) ** 2);
+
+      return {
+        isGPU: gpuWorld.isGPU,
+        diff1, diff60,
+        gpuY: gp60.y, cpuY: cp60.y,
+        gpuAbove: gp60.y > 0.4,
+        cpuAbove: cp60.y > 0.4,
+      };
+    });
+
+    // ─── 2D GPU Collision: mid-air collision between two boxes ──────────
+    await window.runTest('gpuCollision2d_midAir', async () => {
+      const world = new AVBD.World({ x: 0, y: 0 }, { iterations: 10, useGPUCollision: true });
+
+      // Two boxes heading toward each other
+      const b1 = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(-3, 0).setLinvel(5, 0));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), b1);
+      const b2 = world.createRigidBody(AVBD.RigidBodyDesc.dynamic().setTranslation(3, 0).setLinvel(-5, 0));
+      world.createCollider(AVBD.ColliderDesc.cuboid(0.5, 0.5), b2);
+
+      let collisionDetected = false;
+      for (let i = 0; i < 60; i++) {
+        await world.step();
+        const p1 = b1.translation(), p2 = b2.translation();
+        const gap = p2.x - p1.x;
+        if (gap < 1.5) collisionDetected = true;
+      }
+
+      const p1 = b1.translation(), p2 = b2.translation();
+      const noOverlap = p2.x - p1.x > 0.5;
+      return {
+        isGPU: world.isGPU,
+        collisionDetected, noOverlap,
+        finite: isFinite(p1.x) && isFinite(p2.x),
+        x1: p1.x, x2: p2.x,
+      };
+    });
+
     // Signal completion
     window.testResults._complete = true;
     document.getElementById('status').textContent = 'Tests complete';

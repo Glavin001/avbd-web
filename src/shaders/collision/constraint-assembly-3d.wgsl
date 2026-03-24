@@ -116,11 +116,11 @@ fn write_constraint_3d(row_idx: u32,
   constraint_buffer[base + 6u] = jA_lin.z;
   constraint_buffer[base + 7u] = 0.0;
 
-  // Jacobian A angular (vec4, .w stores mu for friction coupling in normal row)
+  // Jacobian A angular (vec4)
   constraint_buffer[base + 8u] = jA_ang.x;
   constraint_buffer[base + 9u] = jA_ang.y;
   constraint_buffer[base + 10u] = jA_ang.z;
-  constraint_buffer[base + 11u] = mu;
+  constraint_buffer[base + 11u] = 0.0;
 
   // Jacobian B linear (vec4)
   constraint_buffer[base + 12u] = jB_lin.x;
@@ -128,11 +128,11 @@ fn write_constraint_3d(row_idx: u32,
   constraint_buffer[base + 14u] = jB_lin.z;
   constraint_buffer[base + 15u] = 0.0;
 
-  // Jacobian B angular (vec4)
+  // Jacobian B angular (vec4, .w stores mu for friction coupling)
   constraint_buffer[base + 16u] = jB_ang.x;
   constraint_buffer[base + 17u] = jB_ang.y;
   constraint_buffer[base + 18u] = jB_ang.z;
-  constraint_buffer[base + 19u] = 0.0;
+  constraint_buffer[base + 19u] = mu;
 
   // Hessian diag A angular (vec4)
   constraint_buffer[base + 20u] = hA_ang.x;

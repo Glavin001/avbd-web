@@ -27,6 +27,8 @@ import { collide2D } from '../2d/collision-sat.js';
 import { aabb2DOverlap, vec2Scale, vec2Length } from './math.js';
 import { computeGraphColoring } from './graph-coloring.js';
 import { GPUContext } from './gpu-context.js';
+import { GpuCollisionPipeline } from './gpu-collision-pipeline.js';
+import { COLLISION_MARGIN } from './types.js';
 import { PRIMAL_UPDATE_2D_WGSL, DUAL_UPDATE_WGSL, FRICTION_COUPLING_WGSL } from '../shaders/embedded.js';
 
 // ─── GPU Buffer Layout Constants ────────────────────────────────────────────
@@ -72,6 +74,11 @@ export class GPUSolver2D {
   private gpu: GPUContext;
   private initialized = false;
   private _stepping = false;
+
+  // GPU collision pipeline (LBVH broadphase + GPU narrowphase + constraint assembly)
+  private collisionPipeline: GpuCollisionPipeline | null = null;
+  private _collisionConstraintStaging: GPUBuffer | null = null;
+  private _collisionConstraintStagingSize = 0;
 
   // GPU resources
   private bodyStateBuffer!: GPUBuffer;
@@ -185,6 +192,11 @@ export class GPUSolver2D {
     });
 
     this.initialized = true;
+
+    // Initialize GPU collision pipeline if enabled
+    if (this.config.useGPUCollision !== false) {
+      this.collisionPipeline = new GpuCollisionPipeline(this.gpu, '2d');
+    }
   }
 
   /**
@@ -219,73 +231,109 @@ export class GPUSolver2D {
 
     if (bodies.length === 0) return;
 
-    // ─── 1. CPU: Collision Detection (spatial hash broadphase) ─────
+    // ─── 1. Collision Detection ─────────────────────────────────
     constraintStore.clearContacts();
-    const gpu2dCandidatePairs: [number, number][] = [];
 
-    {
-      const n = bodies.length;
-      const aabbs = new Array(n);
-      for (let i = 0; i < n; i++) aabbs[i] = bodyStore.getAABB(bodies[i]);
+    if (this.collisionPipeline) {
+      // GPU collision path: LBVH broadphase + GPU narrowphase + constraint assembly
+      this.ensureBuffers(bodies.length, 1, 1);
 
-      let totalExtent = 0, dynCount = 0;
-      for (let i = 0; i < n; i++) {
-        if (bodies[i].type === RigidBodyType.Dynamic) {
-          totalExtent += (aabbs[i].maxX - aabbs[i].minX) + (aabbs[i].maxY - aabbs[i].minY);
-          dynCount++;
-        }
+      // Upload pre-init body state for collision detection
+      const collBodyData = new Float32Array(bodies.length * BODY_STRIDE);
+      for (let i = 0; i < bodies.length; i++) {
+        const b = bodies[i];
+        const off = i * BODY_STRIDE;
+        collBodyData[off + 0] = b.position.x;
+        collBodyData[off + 1] = b.position.y;
+        collBodyData[off + 2] = b.angle;
+        collBodyData[off + 3] = b.velocity.x;
+        collBodyData[off + 4] = b.velocity.y;
+        collBodyData[off + 5] = b.angularVelocity as number;
+        collBodyData[off + 6] = b.mass;
+        collBodyData[off + 7] = b.inertia;
       }
-      const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 2)) * 2 : 1, 0.5);
-      const invCell = 1 / cellSize;
+      gpuWrite(device.queue, this.bodyStateBuffer, 0, collBodyData);
 
-      const grid = new Map<number, number[]>();
-      for (let i = 0; i < n; i++) {
-        const a = aabbs[i];
-        const x0 = Math.floor(a.minX * invCell), x1 = Math.floor(a.maxX * invCell);
-        const y0 = Math.floor(a.minY * invCell), y1 = Math.floor(a.maxY * invCell);
-        for (let cx = x0; cx <= x1; cx++) {
-          for (let cy = y0; cy <= y1; cy++) {
-            const k = (cx + 0x8000) * 0x10000 + (cy + 0x8000);
-            let cell = grid.get(k);
-            if (!cell) { cell = []; grid.set(k, cell); }
-            cell.push(i);
+      this.collisionPipeline.uploadBodyData2D(bodies, this.bodyStateBuffer);
+      const sceneBounds = this.collisionPipeline.computeSceneBounds2D(bodies);
+
+      const collResult = await this.collisionPipeline.runFullPipeline(
+        bodies.length, this.bodyStateBuffer, sceneBounds,
+        COLLISION_MARGIN, dt, config.penaltyMin, config.alpha,
+      );
+
+      if (collResult.numConstraints > 0) {
+        const gpuRows = await this.readbackGpuConstraints2D(
+          collResult.constraintBuffer, collResult.numConstraints,
+        );
+        constraintStore.addRows(gpuRows);
+      }
+    } else {
+      // CPU collision path: spatial hash broadphase + SAT narrowphase
+      const gpu2dCandidatePairs: [number, number][] = [];
+
+      {
+        const n = bodies.length;
+        const aabbs = new Array(n);
+        for (let i = 0; i < n; i++) aabbs[i] = bodyStore.getAABB(bodies[i]);
+
+        let totalExtent = 0, dynCount = 0;
+        for (let i = 0; i < n; i++) {
+          if (bodies[i].type === RigidBodyType.Dynamic) {
+            totalExtent += (aabbs[i].maxX - aabbs[i].minX) + (aabbs[i].maxY - aabbs[i].minY);
+            dynCount++;
+          }
+        }
+        const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 2)) * 2 : 1, 0.5);
+        const invCell = 1 / cellSize;
+
+        const grid = new Map<number, number[]>();
+        for (let i = 0; i < n; i++) {
+          const a = aabbs[i];
+          const x0 = Math.floor(a.minX * invCell), x1 = Math.floor(a.maxX * invCell);
+          const y0 = Math.floor(a.minY * invCell), y1 = Math.floor(a.maxY * invCell);
+          for (let cx = x0; cx <= x1; cx++) {
+            for (let cy = y0; cy <= y1; cy++) {
+              const k = (cx + 0x8000) * 0x10000 + (cy + 0x8000);
+              let cell = grid.get(k);
+              if (!cell) { cell = []; grid.set(k, cell); }
+              cell.push(i);
+            }
+          }
+        }
+
+        const tested = new Set<number>();
+        for (const cell of grid.values()) {
+          for (let ci = 0; ci < cell.length; ci++) {
+            const i = cell[ci];
+            for (let cj = ci + 1; cj < cell.length; cj++) {
+              const j = cell[cj];
+              const pk = i < j ? i * n + j : j * n + i;
+              if (tested.has(pk)) continue;
+              tested.add(pk);
+              const a = bodies[i], b = bodies[j];
+              if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
+              const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+              if (this.ignorePairs.has(key)) continue;
+              if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
+              gpu2dCandidatePairs.push([i, j]);
+            }
           }
         }
       }
 
-      const tested = new Set<number>();
-      for (const cell of grid.values()) {
-        for (let ci = 0; ci < cell.length; ci++) {
-          const i = cell[ci];
-          for (let cj = ci + 1; cj < cell.length; cj++) {
-            const j = cell[cj];
-            const pk = i < j ? i * n + j : j * n + i;
-            if (tested.has(pk)) continue;
-            tested.add(pk);
-            const a = bodies[i], b = bodies[j];
-            if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
-            const key = i < j ? `${i}-${j}` : `${j}-${i}`;
-            if (this.ignorePairs.has(key)) continue;
-            if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
-            gpu2dCandidatePairs.push([i, j]);
-          }
+      for (const [i, j] of gpu2dCandidatePairs) {
+        const manifold = collide2D(bodies[i], bodies[j]);
+        if (manifold) {
+          const rows = createContactConstraintRows(manifold, bodies[i], bodies[j], config.penaltyMin, Infinity, config.dt);
+          constraintStore.addRows(rows);
         }
-      }
-    }
-
-    const tBroadphase = performance.now();
-
-    // Narrowphase: SAT collision detection on candidate pairs
-    for (const [i, j] of gpu2dCandidatePairs) {
-      const manifold = collide2D(bodies[i], bodies[j]);
-      if (manifold) {
-        const rows = createContactConstraintRows(manifold, bodies[i], bodies[j], config.penaltyMin, Infinity, config.dt);
-        constraintStore.addRows(rows);
       }
     }
     constraintStore.warmstartContacts();
 
-    const tCollision = performance.now();
+    const tBroadphase = performance.now();
+    const tCollision = tBroadphase;
 
     // ─── 2. CPU: Warmstart & Initialize ───────────────────────────
     for (const row of constraintStore.rows) {
@@ -664,6 +712,78 @@ export class GPUSolver2D {
     };
   }
 
+  /** Read back GPU constraint buffer and parse into ConstraintRow[] */
+  private async readbackGpuConstraints2D(
+    constraintBuffer: GPUBuffer,
+    numConstraints: number,
+  ): Promise<ConstraintRow[]> {
+    const device = this.gpu.device;
+    const byteSize = numConstraints * CONSTRAINT_STRIDE * 4;
+
+    // Ensure staging buffer is large enough
+    if (byteSize > this._collisionConstraintStagingSize) {
+      this._collisionConstraintStaging?.destroy();
+      this._collisionConstraintStagingSize = byteSize;
+      this._collisionConstraintStaging = device.createBuffer({
+        size: byteSize,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    const staging = this._collisionConstraintStaging!;
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(constraintBuffer, 0, staging, 0, byteSize);
+    device.queue.submit([enc.finish()]);
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const mapped = staging.getMappedRange();
+    const view = new DataView(mapped);
+
+    const rows: ConstraintRow[] = [];
+    for (let i = 0; i < numConstraints; i++) {
+      const off = i * CONSTRAINT_STRIDE * 4;
+      rows.push({
+        bodyA: view.getInt32(off + 0, true),
+        bodyB: view.getInt32(off + 4, true),
+        type: view.getUint32(off + 8, true),
+        jacobianA: [
+          view.getFloat32(off + 16, true),
+          view.getFloat32(off + 20, true),
+          view.getFloat32(off + 24, true),
+        ],
+        jacobianB: [
+          view.getFloat32(off + 32, true),
+          view.getFloat32(off + 36, true),
+          view.getFloat32(off + 40, true),
+        ],
+        hessianDiagA: [
+          view.getFloat32(off + 48, true),
+          view.getFloat32(off + 52, true),
+          view.getFloat32(off + 56, true),
+        ],
+        hessianDiagB: [
+          view.getFloat32(off + 64, true),
+          view.getFloat32(off + 68, true),
+          view.getFloat32(off + 72, true),
+        ],
+        c: view.getFloat32(off + 80, true),
+        c0: view.getFloat32(off + 84, true),
+        alpha: 0,
+        lambda: view.getFloat32(off + 88, true),
+        penalty: view.getFloat32(off + 92, true),
+        stiffness: view.getFloat32(off + 96, true),
+        fmin: view.getFloat32(off + 100, true),
+        fmax: view.getFloat32(off + 104, true),
+        fractureThreshold: 0,
+        active: view.getUint32(off + 108, true) !== 0,
+        broken: false,
+      });
+    }
+
+    staging.unmap();
+    return rows;
+  }
+
   /** Build per-body constraint index lists for indirection on GPU */
   private buildConstraintIndirection(numBodies: number, numConstraints: number): {
     bodyRanges: Uint32Array;
@@ -772,11 +892,15 @@ export class GPUSolver2D {
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
       this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
       this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer,
-      this._bodyStagingBuffer, this._crStagingBuffer, this._velRecoveryStagingBuffer]) {
+      this._bodyStagingBuffer, this._crStagingBuffer, this._velRecoveryStagingBuffer,
+      this._collisionConstraintStaging]) {
       if (buf) buf.destroy();
     }
     this._bodyStagingBuffer = null;
     this._crStagingBuffer = null;
     this._velRecoveryStagingBuffer = null;
+    this._collisionConstraintStaging = null;
+    this.collisionPipeline?.destroy();
+    this.collisionPipeline = null;
   }
 }
