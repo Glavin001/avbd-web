@@ -94,6 +94,9 @@ export class GPUSolver3D {
   colorGroups: ColorGroup[] = [];
   lastTimings: StepTimings | null = null;
 
+  /** Guard against concurrent step() calls (async game loops can overlap) */
+  private _stepping = false;
+
   /** Contact cache for warmstarting between frames (body pair key → cached lambdas/penalties) */
   private contactCache: Map<number, { normalLambda: number; normalPenalty: number; fric1Lambda: number; fric1Penalty: number; fric2Lambda: number; fric2Penalty: number; age: number }> = new Map();
 
@@ -240,6 +243,19 @@ export class GPUSolver3D {
    * Run one physics timestep on the GPU.
    */
   async step(): Promise<void> {
+    // Prevent concurrent step() calls — async game loops (rAF at top + await step)
+    // can overlap, causing staging buffer race conditions (mapped vs unmapped).
+    if (this._stepping) return;
+    this._stepping = true;
+
+    try {
+      await this._stepImpl();
+    } finally {
+      this._stepping = false;
+    }
+  }
+
+  private async _stepImpl(): Promise<void> {
     if (!this.initialized) this.init();
 
     const t0 = performance.now();
