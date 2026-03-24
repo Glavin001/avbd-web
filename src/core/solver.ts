@@ -12,7 +12,7 @@
  * 5. Velocity recovery (BDF1)
  */
 
-import type { Vec2, SolverConfig, ContactManifold2D } from './types.js';
+import type { Vec2, SolverConfig, ContactManifold2D, StepTimings } from './types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_2D } from './types.js';
 import { ForceType } from './types.js';
 import type { Body2D } from './rigid-body.js';
@@ -36,41 +36,83 @@ export interface IgnoreCollisionPair {
   bodyB: number;
 }
 
+/**
+ * Spatial hash grid broadphase: returns candidate pairs (i, j) that pass AABB overlap.
+ * O(n) average-case instead of O(n²).
+ */
 function broadphase2D(
   bodyStore: BodyStore2D,
   ignorePairs: Set<string>,
-): ContactManifold2D[] {
-  const manifolds: ContactManifold2D[] = [];
+): [number, number][] {
   const bodies = bodyStore.bodies;
   const n = bodies.length;
+  if (n === 0) return [];
+
+  // Compute all AABBs once
+  const aabbs = new Array(n);
+  for (let i = 0; i < n; i++) {
+    aabbs[i] = bodyStore.getAABB(bodies[i]);
+  }
+
+  // Cell size: ~2x average body extent
+  let totalExtent = 0;
+  let dynamicCount = 0;
+  for (let i = 0; i < n; i++) {
+    if (bodies[i].type === RigidBodyType.Dynamic) {
+      totalExtent += (aabbs[i].maxX - aabbs[i].minX) + (aabbs[i].maxY - aabbs[i].minY);
+      dynamicCount++;
+    }
+  }
+  const cellSize = Math.max(dynamicCount > 0 ? totalExtent / (dynamicCount * 2) * 2 : 1, 0.5);
+  const invCell = 1 / cellSize;
+
+  // Insert bodies into spatial hash
+  const grid = new Map<number, number[]>();
 
   for (let i = 0; i < n; i++) {
-    const a = bodies[i];
-    const aabbA = bodyStore.getAABB(a);
+    const aabb = aabbs[i];
+    const minCX = Math.floor(aabb.minX * invCell);
+    const minCY = Math.floor(aabb.minY * invCell);
+    const maxCX = Math.floor(aabb.maxX * invCell);
+    const maxCY = Math.floor(aabb.maxY * invCell);
 
-    for (let j = i + 1; j < n; j++) {
-      const b = bodies[j];
-
-      // Skip pairs where neither body is dynamic
-      if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
-
-      // Check ignore list
-      const key = i < j ? `${i}-${j}` : `${j}-${i}`;
-      if (ignorePairs.has(key)) continue;
-
-      // AABB overlap test
-      const aabbB = bodyStore.getAABB(b);
-      if (!aabb2DOverlap(aabbA, aabbB)) continue;
-
-      // Narrowphase
-      const manifold = collide2D(a, b);
-      if (manifold) {
-        manifolds.push(manifold);
+    for (let cx = minCX; cx <= maxCX; cx++) {
+      for (let cy = minCY; cy <= maxCY; cy++) {
+        const key = (cx + 0x8000) * 0x10000 + (cy + 0x8000);
+        let cell = grid.get(key);
+        if (!cell) { cell = []; grid.set(key, cell); }
+        cell.push(i);
       }
     }
   }
 
-  return manifolds;
+  // Collect candidate pairs
+  const pairs: [number, number][] = [];
+  const tested = new Set<number>();
+
+  for (const cell of grid.values()) {
+    for (let ci = 0; ci < cell.length; ci++) {
+      const i = cell[ci];
+      for (let cj = ci + 1; cj < cell.length; cj++) {
+        const j = cell[cj];
+        const pairKey = i < j ? i * n + j : j * n + i;
+        if (tested.has(pairKey)) continue;
+        tested.add(pairKey);
+
+        const a = bodies[i], b = bodies[j];
+        if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
+
+        const strKey = i < j ? `${i}-${j}` : `${j}-${i}`;
+        if (ignorePairs.has(strKey)) continue;
+
+        if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
+
+        pairs.push([i, j]);
+      }
+    }
+  }
+
+  return pairs;
 }
 
 // ─── AVBD Solver ────────────────────────────────────────────────────────────
@@ -86,6 +128,9 @@ export class AVBDSolver2D {
 
   /** Graph coloring for parallel dispatch (updated each step) */
   colorGroups: ColorGroup[] = [];
+
+  /** Last step's performance breakdown */
+  lastTimings: StepTimings | null = null;
 
   constructor(config: Partial<SolverConfig> = {}) {
     this.config = { ...DEFAULT_SOLVER_CONFIG_2D, ...config };
@@ -105,25 +150,28 @@ export class AVBDSolver2D {
 
     if (bodies.length === 0) return;
 
+    const t0 = performance.now();
+
     // ─── 1. Broadphase & Narrowphase ──────────────────────────────
-    // Clear contact constraints (keep joints)
     constraintStore.clearContacts();
 
-    const manifolds = broadphase2D(bodyStore, this.ignorePairs);
+    const tBP = performance.now();
+    const candidatePairs = broadphase2D(bodyStore, this.ignorePairs);
+    const tNP = performance.now();
 
-    // Create contact constraint rows
-    for (const manifold of manifolds) {
-      const bodyA = bodies[manifold.bodyA];
-      const bodyB = bodies[manifold.bodyB];
-      const rows = createContactConstraintRows(
-        manifold, bodyA, bodyB,
-        config.penaltyMin, Infinity,
-      );
-      constraintStore.addRows(rows);
+    // Narrowphase: SAT collision detection on candidate pairs
+    for (const [i, j] of candidatePairs) {
+      const manifold = collide2D(bodies[i], bodies[j]);
+      if (manifold) {
+        const rows = createContactConstraintRows(
+          manifold, bodies[i], bodies[j],
+          config.penaltyMin, Infinity, config.dt,
+        );
+        constraintStore.addRows(rows);
+      }
     }
-
-    // Apply cached warmstart values to new contacts
     constraintStore.warmstartContacts();
+    const tNPEnd = performance.now();
 
     // ─── 2. Initialize & Warmstart Constraints ────────────────────
     for (const row of constraintStore.rows) {
@@ -155,6 +203,8 @@ export class AVBDSolver2D {
       bodies.length, constraintPairs, fixedBodies,
     );
 
+    const tWS = performance.now();
+
     // ─── 3. Initialize Bodies ─────────────────────────────────────
     const MAX_ANGULAR_VELOCITY = 50; // Reference clamps to [-50, 50]
     const gravMag = vec2Length(gravity);
@@ -162,7 +212,14 @@ export class AVBDSolver2D {
     for (const body of bodies) {
       if (body.type !== RigidBodyType.Dynamic) continue;
 
-      // Clamp angular velocity (reference: clamp(omega, -50, 50))
+      // Clamp velocities at step start to prevent explosive inertial predictions
+      const MAX_LINEAR_VELOCITY_INIT = 100;
+      const vMagInit = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+      if (vMagInit > MAX_LINEAR_VELOCITY_INIT) {
+        const scale = MAX_LINEAR_VELOCITY_INIT / vMagInit;
+        body.velocity.x *= scale;
+        body.velocity.y *= scale;
+      }
       body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
         Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
 
@@ -170,24 +227,29 @@ export class AVBDSolver2D {
       body.prevPosition = { ...body.position };
       body.prevAngle = body.angle;
 
-      // Adaptive gravity weighting (from reference solver.cpp)
-      // Bodies under support get less gravity in the inertial estimate
-      // accelWeight = clamp(accel_along_gravity / |gravity|, 0, 1)
+      // Adaptive gravity weighting: only reduce gravity for slow-moving (supported)
+      // bodies. Fast-moving bodies need full gravity to avoid artificial bounce.
       let gravWeight = 1;
       if (gravMag > 0) {
-        const dvx = body.velocity.x - body.prevVelocity.x;
-        const dvy = body.velocity.y - body.prevVelocity.y;
-        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
-        // Only apply adaptive weighting when there's meaningful velocity change
-        if (dvMag > 0.01) {
-          const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
-          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
-          // sign(gravity) * accel — positive when accelerating with gravity
-          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        const speed = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+        if (speed < 0.5) {
+          const dvx = body.velocity.x - body.prevVelocity.x;
+          const dvy = body.velocity.y - body.prevVelocity.y;
+          const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
+          if (dvMag > 0.01) {
+            const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
+            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
+            gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+          }
         }
       }
 
-      // Apply velocity damping
+      // Apply velocity damping.
+      // A small implicit angular damping (0.05) provides numerical dissipation
+      // that prevents contact-induced angular velocity feedback loops in stacking
+      // scenarios (pyramids, multi-body piles). This doesn't affect the physics
+      // meaningfully but prevents solver artifacts from amplifying.
+      const IMPLICIT_ANGULAR_DAMPING = 0.05;
       let vx = body.velocity.x;
       let vy = body.velocity.y;
       let omega = body.angularVelocity;
@@ -197,8 +259,9 @@ export class AVBDSolver2D {
         vx *= dampFactor;
         vy *= dampFactor;
       }
-      if (body.angularDamping > 0) {
-        const dampFactor = 1 / (1 + body.angularDamping * dt);
+      {
+        const totalAngDamp = body.angularDamping + IMPLICIT_ANGULAR_DAMPING;
+        const dampFactor = 1 / (1 + totalAngDamp * dt);
         omega *= dampFactor;
       }
 
@@ -212,6 +275,8 @@ export class AVBDSolver2D {
       // Save velocity for next frame's adaptive gravity
       body.prevVelocity = { ...body.velocity };
     }
+
+    const tBI = performance.now();
 
     // ─── 4. Main Solver Loop ──────────────────────────────────────
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
@@ -246,10 +311,37 @@ export class AVBDSolver2D {
             x: (body.position.x - body.prevPosition.x) / dt,
             y: (body.position.y - body.prevPosition.y) / dt,
           };
+
+          // Clamp recovered linear velocity
+          const MAX_LINEAR_VELOCITY = 100;
+          const vMag = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+          if (vMag > MAX_LINEAR_VELOCITY) {
+            const scale = MAX_LINEAR_VELOCITY / vMag;
+            body.velocity.x *= scale;
+            body.velocity.y *= scale;
+          }
+
           body.angularVelocity = (body.angle - body.prevAngle) / dt;
+
+          // Clamp recovered angular velocity to prevent explosive inertial predictions
+          body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
+            Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
         }
       }
     }
+
+    const tEnd = performance.now();
+    this.lastTimings = {
+      total: tEnd - t0,
+      broadphase: tNP - tBP,
+      narrowphase: tNPEnd - tNP,
+      warmstart: tWS - tNPEnd,
+      bodyInit: tBI - tWS,
+      solverIters: tEnd - tBI,
+      velocityRecover: 0,
+      numBodies: bodies.length,
+      numConstraints: constraintStore.rows.length,
+    };
   }
 
   /**
@@ -386,19 +478,25 @@ export class AVBDSolver2D {
       return;
     }
 
-    // Conditional penalty ramping: only ramp when constraint is interior (not at bounds)
-    // Reference: "if (lambda > fmin && lambda < fmax) penalty += beta * |C|"
-    if (row.lambda > row.fmin && row.lambda < row.fmax) {
-      row.penalty += this.config.beta * Math.abs(cEval);
+    // Conditional penalty ramping: only ramp when constraint is interior (not at bounds).
+    // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
+    // should stay low to avoid creating stiff angular springs that cause spinning instability.
+    // Normal contact rows have fmin=-Infinity; friction rows have finite Coulomb bounds.
+    const isFrictionRow = row.type === ForceType.Contact && isFinite(row.fmin);
+    if (!isFrictionRow && row.lambda > row.fmin && row.lambda < row.fmax) {
+      const increment = this.config.beta * Math.abs(cEval);
+      const maxIncrement = row.penalty * 0.5;
+      row.penalty += Math.min(increment, maxIncrement);
     }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) {
       row.penalty = row.stiffness;
     }
 
-    // Update friction bounds for contact pairs (normal row updates friction row)
-    if (row.type === ForceType.Contact && rowIndex % 2 === 0) {
-      // This is a normal row; update the next row (friction row)
+    // Update friction bounds for contact pairs (normal row updates friction row).
+    // Normal rows are unilateral: fmin=-Infinity, fmax=0. Friction rows have finite bounds.
+    // We identify normal rows by their infinite fmin (never modified by friction coupling).
+    if (row.type === ForceType.Contact && !isFinite(row.fmin)) {
       if (rowIndex + 1 < this.constraintStore.rows.length) {
         const frictionRow = this.constraintStore.rows[rowIndex + 1];
         if (frictionRow.active && frictionRow.type === ForceType.Contact) {

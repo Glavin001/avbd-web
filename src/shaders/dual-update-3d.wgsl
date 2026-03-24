@@ -29,6 +29,8 @@ struct ConstraintRow3D {
   jacobian_a_ang: vec4<f32>,
   jacobian_b_lin: vec4<f32>,
   jacobian_b_ang: vec4<f32>,
+  hessian_diag_a_ang: vec4<f32>,
+  hessian_diag_b_ang: vec4<f32>,
   c: f32,
   c0: f32,
   lambda: f32,
@@ -109,9 +111,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   new_lambda = clamp(new_lambda, cr.fmin, cr.fmax);
   cr.lambda = new_lambda;
 
-  // Conditional penalty ramp: only when constraint is interior
-  if (cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
-    cr.penalty += params.beta * abs(c_eval);
+  // Conditional penalty ramp: only when constraint is interior.
+  // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
+  // should stay low to avoid stiff angular springs that cause spinning instability.
+  // Normal contact rows have fmin=-inf; friction rows have finite Coulomb bounds.
+  let is_friction = cr.force_type == 0u && cr.fmin > -1e30;
+  if (!is_friction && cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
+    // Cap per-iteration penalty increase to prevent explosive forces in many-body scenes
+    let increment = params.beta * abs(c_eval);
+    let max_increment = cr.penalty * 0.5;
+    cr.penalty += min(increment, max_increment);
   }
   cr.penalty = clamp(cr.penalty, params.penalty_min, params.penalty_max);
   if (cr.penalty > cr.stiffness) {

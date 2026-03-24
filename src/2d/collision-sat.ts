@@ -172,12 +172,15 @@ function findContactPoints(
   const contacts: ContactPoint2D[] = [];
   for (const p of clipped) {
     const sep = vec2Dot(refFaceNormal, p) - refFaceOffset;
-    if (sep <= 0.01) { // Small tolerance
-      const contactDepth = -sep;
+    if (sep <= depth + 0.01) { // Tolerance: include points near the reference face boundary
+      // Points behind the reference face (sep < 0) have depth = -sep.
+      // Points near/on the boundary use the SAT depth, which is more accurate for
+      // face-face contacts where clipped points land on the reference face edge.
+      const contactDepth = sep < -1e-6 ? -sep : depth;
       contacts.push({
         position: p,
         normal: flip ? vec2Neg(normal) : normal,
-        depth: Math.max(0, contactDepth),
+        depth: contactDepth,
       });
     }
   }

@@ -108,13 +108,13 @@ describe('Friction', () => {
 
     const lowFriction = slideDistance(0.01);
     const highFriction = slideDistance(2.0);
-    // Both should have moved to the right
+    // Low friction body should have moved to the right
     expect(lowFriction).toBeGreaterThan(0);
-    expect(highFriction).toBeGreaterThan(0);
-    // Friction differences are subtle in AVBD's augmented Lagrangian formulation
-    // Just verify both produce finite results
+    // Both should produce finite results
     expect(isFinite(lowFriction)).toBe(true);
     expect(isFinite(highFriction)).toBe(true);
+    // Low friction should slide farther than high friction
+    expect(lowFriction).toBeGreaterThan(highFriction);
   });
 
   it('should prevent sliding on steep slope with high friction', () => {

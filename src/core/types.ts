@@ -119,7 +119,7 @@ export const DEFAULT_SOLVER_CONFIG_2D: SolverConfig = {
   alpha: 0.99,
   gamma: 0.99,
   postStabilize: true,
-  penaltyMin: 1,
+  penaltyMin: 100,
   penaltyMax: 1e9,
   gravity: { x: 0, y: -9.81 },
 };
@@ -131,12 +131,32 @@ export const DEFAULT_SOLVER_CONFIG_3D: SolverConfig = {
   alpha: 0.99,
   gamma: 0.99,
   postStabilize: true,
-  penaltyMin: 1,
+  penaltyMin: 100,
   penaltyMax: 1e9,
   gravity: { x: 0, y: -9.81, z: 0 },
 };
 
 // ─── Graph Coloring ─────────────────────────────────────────────────────────
+
+/** Per-step performance breakdown in milliseconds. */
+export interface StepTimings {
+  total: number;
+  broadphase: number;
+  narrowphase: number;
+  warmstart: number;
+  bodyInit: number;
+  solverIters: number;
+  velocityRecover: number;
+  /** GPU-only: CPU→GPU buffer upload */
+  bufferUpload?: number;
+  /** GPU-only: GPU compute dispatch */
+  gpuDispatch?: number;
+  /** GPU-only: GPU→CPU readback */
+  readback?: number;
+  /** Diagnostic counts */
+  numBodies: number;
+  numConstraints: number;
+}
 
 export interface ColorGroup {
   /** Color index */

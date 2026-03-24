@@ -123,6 +123,12 @@
       <option value="friction">Friction</option>
       <option value="fracture">Fracture</option>
       <option value="jointGrid">Joint Grid</option>
+      <option value="boxRain200">Box Rain (200)</option>
+      <option value="largePyramid">Large Pyramid (120)</option>
+      <option value="ballPit300">Ball Pit (300)</option>
+      <option value="ballPit1000">Ball Pit (1,000)</option>
+      <option value="ballPit2000">Ball Pit (2,000)</option>
+      <option value="ballPit10000">Ball Pit (10,000)</option>
     </select>
     <button id="btnReset">Reset</button>
     <button id="btnPause">Pause</button>
@@ -521,17 +527,129 @@
     }
 
     // ====================================================================
+    // Scene: Box Rain (200 bodies raining down)
+    // ====================================================================
+
+    function sceneBoxRain200() {
+      const numBodies = 200;
+      const cols = 15;
+      for (let i = 0; i < numBodies; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const x = (col - cols / 2) * 0.75 + (Math.random() - 0.5) * 0.1;
+        const y = 1.5 + row * 0.75;
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+        );
+        const size = 0.2 + Math.random() * 0.15;
+        world.createCollider(
+          AVBD.ColliderDesc.cuboid(size, size)
+            .setDensity(1).setFriction(0.4).setRestitution(0.05),
+          body
+        );
+        bodies.push({ body, type: 'box', hw: size, hh: size, color: colorAt(i) });
+      }
+    }
+
+    // ====================================================================
+    // Scene: Large Pyramid (120 boxes, 15 rows)
+    // ====================================================================
+
+    function sceneLargePyramid() {
+      const rows = 15;
+      let idx = 0;
+      for (let row = 0; row < rows; row++) {
+        const count = rows - row;
+        const offset = -(count - 1) * 0.52;
+        for (let col = 0; col < count; col++) {
+          const x = offset + col * 1.04;
+          const y = 0.8 + row * 1.02;
+          const body = world.createRigidBody(
+            AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+          );
+          world.createCollider(
+            AVBD.ColliderDesc.cuboid(0.48, 0.48)
+              .setDensity(1).setFriction(0.5).setRestitution(0.02),
+            body
+          );
+          bodies.push({ body, type: 'box', hw: 0.48, hh: 0.48, color: colorAt(idx++) });
+        }
+      }
+    }
+
+    // ====================================================================
+    // Scene: Ball Pit (300 balls in a container)
+    // ====================================================================
+
+    function sceneBallPit300() {
+      for (let i = 0; i < 300; i++) {
+        const x = (Math.random() - 0.5) * 8;
+        const y = 1.5 + i * 0.15;
+        const body = world.createRigidBody(
+          AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+        );
+        const r = 0.12 + Math.random() * 0.08;
+        world.createCollider(
+          AVBD.ColliderDesc.ball(r)
+            .setDensity(1).setFriction(0.3).setRestitution(0.15),
+          body
+        );
+        bodies.push({ body, type: 'ball', radius: r, color: colorAt(i) });
+      }
+    }
+
+    // ====================================================================
+    // Scene: Ball Pit (generic — scales to any count)
+    // ====================================================================
+
+    function sceneBallPitN(count) {
+      // Container is ~16 m wide (walls at ±8.2)
+      // Scale radius and spacing based on count so they fit
+      const rBase  = count <= 1000 ? 0.10 : count <= 2000 ? 0.08 : 0.04;
+      const rVar   = rBase * 0.6;
+      const spacing = rBase * 3.8;
+      const cols = Math.floor(15 / spacing);       // fill width
+      const startX = -(cols - 1) * spacing / 2;
+      let idx = 0;
+
+      for (let row = 0; idx < count; row++) {
+        const y = 0.8 + row * spacing;
+        const xOff = (row % 2) * spacing * 0.5;    // hexagonal packing
+        for (let col = 0; col < cols && idx < count; col++) {
+          const x = startX + col * spacing + xOff;
+          const r = rBase + Math.random() * rVar;
+          const body = world.createRigidBody(
+            AVBD.RigidBodyDesc.dynamic().setTranslation(x, y)
+          );
+          world.createCollider(
+            AVBD.ColliderDesc.ball(r)
+              .setDensity(1).setFriction(0.2).setRestitution(0.1),
+            body
+          );
+          bodies.push({ body, type: 'ball', radius: r, color: colorAt(idx) });
+          idx++;
+        }
+      }
+    }
+
+    // ====================================================================
     // Scene registry
     // ====================================================================
 
     const SCENES = {
-      stack:     sceneStack,
-      pyramid:   scenePyramid,
-      rope:      sceneRope,
-      heavyRope: sceneHeavyRope,
-      friction:  sceneFriction,
-      fracture:  sceneFracture,
-      jointGrid: sceneJointGrid,
+      stack:        sceneStack,
+      pyramid:      scenePyramid,
+      rope:         sceneRope,
+      heavyRope:    sceneHeavyRope,
+      friction:     sceneFriction,
+      fracture:     sceneFracture,
+      jointGrid:    sceneJointGrid,
+      boxRain200:   sceneBoxRain200,
+      largePyramid: sceneLargePyramid,
+      ballPit300:   sceneBallPit300,
+      ballPit1000:  () => sceneBallPitN(1000),
+      ballPit2000:  () => sceneBallPitN(2000),
+      ballPit10000: () => sceneBallPitN(10000),
     };
 
     function loadScene(name) {
@@ -793,11 +911,33 @@
 
       // Stats overlay
       const dynamicCount = bodies.filter(b => !b.body.isFixed()).length;
+      const t = world?.lastTimings;
+      let breakdownHtml = '';
+      if (t) {
+        const init = (t.warmstart + t.bodyInit).toFixed(1);
+        if (t.gpuDispatch != null) {
+          breakdownHtml =
+            `<span class="lbl" style="margin-left:6px">Broad:</span> <span class="val">${t.broadphase.toFixed(1)}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Narrow:</span> <span class="val">${t.narrowphase.toFixed(1)}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Init:</span> <span class="val">${init}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Upload:</span> <span class="val">${t.bufferUpload.toFixed(1)}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">GPU:</span> <span class="val">${t.gpuDispatch.toFixed(1)}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Readback:</span> <span class="val">${t.readback.toFixed(1)}</span><br>`;
+        } else {
+          breakdownHtml =
+            `<span class="lbl" style="margin-left:6px">Broad:</span> <span class="val">${t.broadphase.toFixed(1)}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Narrow:</span> <span class="val">${t.narrowphase.toFixed(1)}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Init:</span> <span class="val">${init}</span><br>` +
+            `<span class="lbl" style="margin-left:6px">Solve:</span> <span class="val">${t.solverIters.toFixed(1)}</span><br>`;
+        }
+      }
       statsEl.innerHTML =
         `<span class="lbl">Mode:</span> <span class="${gpuMode ? 'gpu' : 'cpu'}">${gpuMode ? 'GPU' : 'CPU'}</span><br>` +
         `<span class="lbl">FPS:</span>  <span class="val">${fps}</span><br>` +
-        `<span class="lbl">Bodies:</span> <span class="val">${dynamicCount}</span><br>` +
-        `<span class="lbl">Step:</span> <span class="val">${stepTimeMs.toFixed(1)} ms</span>`;
+        `<span class="lbl">Bodies:</span> <span class="val">${dynamicCount}</span>` +
+        (t ? ` / <span class="val">${t.numConstraints}</span> constraints` : '') + `<br>` +
+        `<span class="lbl">Step:</span> <span class="val">${stepTimeMs.toFixed(1)} ms</span><br>` +
+        breakdownHtml;
 
       requestAnimationFrame(gameLoop);
     }

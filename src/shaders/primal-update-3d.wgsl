@@ -25,6 +25,8 @@ struct ConstraintRow3D {
   jacobian_a_ang: vec4<f32>,
   jacobian_b_lin: vec4<f32>,
   jacobian_b_ang: vec4<f32>,
+  hessian_diag_a_ang: vec4<f32>,
+  hessian_diag_b_ang: vec4<f32>,
   c: f32,
   c0: f32,
   lambda: f32,
@@ -127,6 +129,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let inertial_y = body_prev[prev_base + 8u];
   let inertial_z = body_prev[prev_base + 9u];
 
+  // Read inertial quaternion from body_prev
+  let iqw = body_prev[prev_base + 10u];
+  let iqx = body_prev[prev_base + 11u];
+  let iqy = body_prev[prev_base + 12u];
+  let iqz = body_prev[prev_base + 13u];
+
+  // Current quaternion
+  let cur_qw = body_state[base + 3u];
+  let cur_qx = body_state[base + 4u];
+  let cur_qy = body_state[base + 5u];
+  let cur_qz = body_state[base + 6u];
+
+  // Quaternion difference: dq = q * conj(q_inertial)
+  // Small angle approximation: dtheta ≈ 2 * vec3(dq.xyz)
+  let dqx_r = cur_qx * iqw - cur_qw * iqx + cur_qz * iqy - cur_qy * iqz;
+  let dqy_r = cur_qy * iqw - cur_qw * iqy + cur_qx * iqz - cur_qz * iqx;
+  let dqz_r = cur_qz * iqw - cur_qw * iqz + cur_qy * iqx - cur_qx * iqy;
+
   // Initialize 6x6 LHS diagonal
   var lhs: array<f32, 36>;
   for (var i = 0u; i < 36u; i++) { lhs[i] = 0.0; }
@@ -141,9 +161,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   rhs[0] = mass / dt2 * (x - inertial_x);
   rhs[1] = mass / dt2 * (y - inertial_y);
   rhs[2] = mass / dt2 * (z - inertial_z);
-  rhs[3] = 0.0;
-  rhs[4] = 0.0;
-  rhs[5] = 0.0;
+  rhs[3] = Ix / dt2 * 2.0 * dqx_r;
+  rhs[4] = Iy / dt2 * 2.0 * dqy_r;
+  rhs[5] = Iz / dt2 * 2.0 * dqz_r;
 
   // Accumulate constraint contributions
   let range_base = body_idx * 2u;
@@ -217,6 +237,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         lhs[j * 6u + i] += J[i] * J[j] * cr.penalty;
       }
     }
+
+    // Geometric stiffness (diagonal lumping) for angular DOFs
+    let abs_f = abs(f);
+    var H_ang: vec3<f32>;
+    if (cr.body_a == i32(body_idx)) {
+      H_ang = cr.hessian_diag_a_ang.xyz;
+    } else {
+      H_ang = cr.hessian_diag_b_ang.xyz;
+    }
+    lhs[3u * 6u + 3u] += abs(H_ang.x) * abs_f;
+    lhs[4u * 6u + 4u] += abs(H_ang.y) * abs_f;
+    lhs[5u * 6u + 5u] += abs(H_ang.z) * abs_f;
   }
 
   // Check diagonal validity

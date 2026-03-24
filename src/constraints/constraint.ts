@@ -155,10 +155,13 @@ export class ConstraintStore {
       }
     }
 
-    // Save current contacts
-    for (let i = 0; i < this.rows.length; i += 2) {
+    // Save current contacts. Find normal rows (Contact type with infinite fmin)
+    // and pair with the adjacent friction row. This avoids stride misalignment
+    // when joint rows precede contact rows.
+    for (let i = 0; i < this.rows.length; i++) {
       const row = this.rows[i];
-      if (row.type !== ForceType.Contact) continue;
+      // Normal contact rows have type=Contact and fmin=-Infinity
+      if (row.type !== ForceType.Contact || isFinite(row.fmin)) continue;
       if (i + 1 >= this.rows.length) break;
 
       const frictionRow = this.rows[i + 1];
@@ -178,6 +181,7 @@ export class ConstraintStore {
         positionHash: 0,
         age: 0,
       });
+      i++; // Skip the friction row we just processed
     }
   }
 
@@ -185,9 +189,11 @@ export class ConstraintStore {
    * Apply cached warmstart values to newly created contact rows.
    */
   warmstartContacts(): void {
-    for (let i = 0; i < this.rows.length; i += 2) {
+    // Find normal rows (Contact type with infinite fmin) and pair with adjacent friction row.
+    for (let i = 0; i < this.rows.length; i++) {
       const row = this.rows[i];
-      if (row.type !== ForceType.Contact) continue;
+      // Normal contact rows have type=Contact and fmin=-Infinity
+      if (row.type !== ForceType.Contact || isFinite(row.fmin)) continue;
       if (i + 1 >= this.rows.length) break;
 
       const frictionRow = this.rows[i + 1];
@@ -199,11 +205,15 @@ export class ConstraintStore {
 
       const cached = this.contactCache.get(key);
       if (cached) {
-        row.lambda = cached.normalLambda;
-        row.penalty = cached.normalPenalty;
-        frictionRow.lambda = cached.frictionLambda;
-        frictionRow.penalty = cached.frictionPenalty;
+        // Only warmstart penalty, NOT lambda. Lambda from a previous frame's contact
+        // may have a different Jacobian direction (different contact normal/point),
+        // and applying it to the new contact creates forces in the wrong direction —
+        // the root cause of the pyramid spinning instability.
+        const MAX_WARMSTART_PENALTY = 1e5;
+        row.penalty = Math.min(cached.normalPenalty, MAX_WARMSTART_PENALTY);
+        frictionRow.penalty = Math.min(cached.frictionPenalty, MAX_WARMSTART_PENALTY);
       }
+      i++; // Skip the friction row we just processed
     }
   }
 

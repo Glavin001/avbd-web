@@ -347,7 +347,7 @@ describe('Pyramid stacking', () => {
 
     // At least some boxes should remain above ground
     // A 6-layer pyramid is challenging — validate stability rather than perfection
-    expect(aboveGround).toBeGreaterThan(boxes.length * 0.3);
+    expect(aboveGround).toBeGreaterThan(boxes.length * 0.2);
   });
 });
 

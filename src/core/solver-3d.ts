@@ -7,7 +7,7 @@
  * 1. Broadphase → 2. Warmstart → 3. Primal update (6x6 LDL) → 4. Dual update
  */
 
-import type { Vec3, Quat, SolverConfig } from './types.js';
+import type { Vec3, Quat, SolverConfig, StepTimings } from './types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D } from './types.js';
 import { ForceType } from './types.js';
 import type { Body3D } from './rigid-body-3d.js';
@@ -17,6 +17,7 @@ import {
   vec3, vec3Add, vec3Sub, vec3Scale, vec3Cross, vec3Dot, vec3Length,
   quatIdentity, quatMul, quatNormalize, quatRotateVec3, quatFromAxisAngle,
 } from './math.js';
+import { COLLISION_MARGIN } from './types.js';
 
 // ─── 3D Constraint Row ─────────────────────────────────────────────────────
 
@@ -28,6 +29,10 @@ export interface ConstraintRow3D {
   jacobianA: number[];
   /** Jacobian for body B */
   jacobianB: number[];
+  /** Diagonal of the Hessian for geometric stiffness (body A, 6-DOF) */
+  hessianDiagA: number[];
+  /** Diagonal of the Hessian for geometric stiffness (body B, 6-DOF) */
+  hessianDiagB: number[];
   c: number;
   c0: number;
   lambda: number;
@@ -45,6 +50,8 @@ function createDefaultRow3D(): ConstraintRow3D {
     type: ForceType.Contact,
     jacobianA: [0, 0, 0, 0, 0, 0],
     jacobianB: [0, 0, 0, 0, 0, 0],
+    hessianDiagA: [0, 0, 0, 0, 0, 0],
+    hessianDiagB: [0, 0, 0, 0, 0, 0],
     c: 0, c0: 0,
     lambda: 0, penalty: 100,
     stiffness: Infinity,
@@ -83,7 +90,20 @@ function createContactRows3D(
     const torqueB = vec3Cross(rB, n);
     nRow.jacobianB = [-n.x, -n.y, -n.z, -torqueB.x, -torqueB.y, -torqueB.z];
 
-    nRow.c = -contact.depth;
+    // Geometric stiffness (Hessian diagonal) for angular DOFs:
+    // H[3+i] = -(r·n) + r[i]*n[i], the second derivative of constraint w.r.t. rotation
+    const rAdotN = vec3Dot(rA, n);
+    const rBdotN = vec3Dot(rB, n);
+    nRow.hessianDiagA = [0, 0, 0,
+      -(rAdotN - rA.x * n.x),
+      -(rAdotN - rA.y * n.y),
+      -(rAdotN - rA.z * n.z)];
+    nRow.hessianDiagB = [0, 0, 0,
+      -(rBdotN - rB.x * n.x),
+      -(rBdotN - rB.y * n.y),
+      -(rBdotN - rB.z * n.z)];
+
+    nRow.c = -contact.depth + COLLISION_MARGIN;
     nRow.c0 = nRow.c;
     nRow.fmin = -Infinity;
     nRow.fmax = 0;
@@ -106,6 +126,18 @@ function createContactRows3D(
 
       const tB = vec3Cross(rB, t);
       fRow.jacobianB = [-t.x, -t.y, -t.z, -tB.x, -tB.y, -tB.z];
+
+      // Geometric stiffness for friction tangent direction
+      const rAdotT = vec3Dot(rA, t);
+      const rBdotT = vec3Dot(rB, t);
+      fRow.hessianDiagA = [0, 0, 0,
+        -(rAdotT - rA.x * t.x),
+        -(rAdotT - rA.y * t.y),
+        -(rAdotT - rA.z * t.z)];
+      fRow.hessianDiagB = [0, 0, 0,
+        -(rBdotT - rB.x * t.x),
+        -(rBdotT - rB.y * t.y),
+        -(rBdotT - rB.z * t.z)];
 
       fRow.c = 0;
       fRow.c0 = 0;
@@ -180,6 +212,7 @@ export class AVBDSolver3D {
   constraintRows: ConstraintRow3D[] = [];
   ignorePairs: Set<string> = new Set();
   jointRows: ConstraintRow3D[] = [];
+  lastTimings: StepTimings | null = null;
 
   constructor(config: Partial<SolverConfig> = {}) {
     this.config = { ...DEFAULT_SOLVER_CONFIG_3D, ...config };
@@ -193,26 +226,82 @@ export class AVBDSolver3D {
     const bodies = bodyStore.bodies;
     if (bodies.length === 0) return;
 
+    const t0 = performance.now();
+
     // 1. Clear contact rows, keep joint rows
     this.constraintRows = [...this.jointRows];
 
-    // 2. Broadphase + narrowphase
-    for (let i = 0; i < bodies.length; i++) {
-      const a = bodies[i];
-      const aabbA = getAABB3D(a);
-      for (let j = i + 1; j < bodies.length; j++) {
-        const b = bodies[j];
-        if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
-        const key = `${i}-${j}`;
-        if (this.ignorePairs.has(key)) continue;
-        if (!aabb3DOverlap(aabbA, getAABB3D(b))) continue;
-        const manifold = collide3D(a, b);
-        if (manifold) {
-          const rows = createContactRows3D(manifold, a, b, config.penaltyMin);
-          this.constraintRows.push(...rows);
+    // 2. Broadphase (spatial hash) — find candidate pairs
+    const candidatePairs3D: [number, number][] = [];
+    {
+      const n = bodies.length;
+      const aabbs = new Array(n);
+      for (let i = 0; i < n; i++) aabbs[i] = getAABB3D(bodies[i]);
+
+      let totalExtent = 0, dynCount = 0;
+      for (let i = 0; i < n; i++) {
+        if (bodies[i].type !== RigidBodyType.Fixed) {
+          const a = aabbs[i];
+          totalExtent += (a.max.x - a.min.x) + (a.max.y - a.min.y) + (a.max.z - a.min.z);
+          dynCount++;
+        }
+      }
+      const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 3)) * 2 : 1, 0.5);
+      const invCell = 1 / cellSize;
+
+      const grid = new Map<number, number[]>();
+      function hashKey3D(cx: number, cy: number, cz: number): number {
+        return ((cx + 0x400) * 0x100000) + ((cy + 0x400) * 0x800) + (cz + 0x400);
+      }
+
+      for (let i = 0; i < n; i++) {
+        const a = aabbs[i];
+        const x0 = Math.floor(a.min.x * invCell), x1 = Math.floor(a.max.x * invCell);
+        const y0 = Math.floor(a.min.y * invCell), y1 = Math.floor(a.max.y * invCell);
+        const z0 = Math.floor(a.min.z * invCell), z1 = Math.floor(a.max.z * invCell);
+        for (let cx = x0; cx <= x1; cx++) {
+          for (let cy = y0; cy <= y1; cy++) {
+            for (let cz = z0; cz <= z1; cz++) {
+              const k = hashKey3D(cx, cy, cz);
+              let cell = grid.get(k);
+              if (!cell) { cell = []; grid.set(k, cell); }
+              cell.push(i);
+            }
+          }
+        }
+      }
+
+      const tested = new Set<number>();
+      for (const cell of grid.values()) {
+        for (let ci = 0; ci < cell.length; ci++) {
+          const i = cell[ci];
+          for (let cj = ci + 1; cj < cell.length; cj++) {
+            const j = cell[cj];
+            const pk = i < j ? i * n + j : j * n + i;
+            if (tested.has(pk)) continue;
+            tested.add(pk);
+            if (bodies[i].type === RigidBodyType.Fixed && bodies[j].type === RigidBodyType.Fixed) continue;
+            const key = `${i}-${j}`;
+            if (this.ignorePairs.has(key)) continue;
+            if (!aabb3DOverlap(aabbs[i], aabbs[j])) continue;
+            candidatePairs3D.push([i, j]);
+          }
         }
       }
     }
+
+    const tBP = performance.now();
+
+    // Narrowphase: GJK collision detection on candidate pairs
+    for (const [i, j] of candidatePairs3D) {
+      const manifold = collide3D(bodies[i], bodies[j]);
+      if (manifold) {
+        const rows = createContactRows3D(manifold, bodies[i], bodies[j], config.penaltyMin);
+        this.constraintRows.push(...rows);
+      }
+    }
+
+    const tNP = performance.now();
 
     // 3. Warmstart
     for (const row of this.constraintRows) {
@@ -222,15 +311,62 @@ export class AVBDSolver3D {
       if (row.penalty > row.stiffness) row.penalty = row.stiffness;
     }
 
+    const tWS = performance.now();
+
     // 4. Initialize bodies
+    const MAX_ANG_VEL = 50;
+    const MAX_LIN_VEL = 100;
+    const gravMag = vec3Length(gravity);
+
     for (const body of bodies) {
       if (body.type === RigidBodyType.Fixed) continue;
+
+      // Clamp velocities at step start to prevent explosive inertial predictions
+      const linSpeed = vec3Length(body.velocity);
+      if (linSpeed > MAX_LIN_VEL) {
+        body.velocity = vec3Scale(body.velocity, MAX_LIN_VEL / linSpeed);
+      }
+      const angSpeed = vec3Length(body.angularVelocity);
+      if (angSpeed > MAX_ANG_VEL) {
+        body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / angSpeed);
+      }
+
+      // Implicit angular damping: prevents contact-induced angular velocity
+      // feedback loops in stacking scenarios (pyramids, multi-body piles).
+      const IMPLICIT_ANGULAR_DAMPING = 0.05;
+      const angDampFactor = 1 / (1 + IMPLICIT_ANGULAR_DAMPING * dt);
+      body.angularVelocity = vec3Scale(body.angularVelocity, angDampFactor);
+
       body.prevPosition = { ...body.position };
       body.prevRotation = { ...body.rotation };
+
+      // Adaptive gravity weighting (from 2D reference solver):
+      // Bodies under support (nearly stationary) get less gravity in the inertial
+      // estimate, preventing artificial penetrations that cause explosive corrections.
+      // Only apply to slow-moving bodies to avoid creating artificial bounce on impact.
+      let gravWeight = 1;
+      if (gravMag > 0 && body.prevVelocity) {
+        const speed = vec3Length(body.velocity);
+        // Only reduce gravity for slow-moving bodies (supported/resting).
+        // Fast-moving bodies need full gravity to fall naturally.
+        if (speed < 0.5) {
+          const dvx = body.velocity.x - body.prevVelocity.x;
+          const dvy = body.velocity.y - body.prevVelocity.y;
+          const dvz = body.velocity.z - body.prevVelocity.z;
+          const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+          if (dvMag > 0.01) {
+            const gravDir = vec3Scale(gravity, 1 / gravMag);
+            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
+            gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+          }
+        }
+      }
+      body.prevVelocity = { ...body.velocity };
+
       body.inertialPosition = {
-        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * dt * dt,
-        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * dt * dt,
-        z: body.position.z + body.velocity.z * dt + gravity.z * body.gravityScale * dt * dt,
+        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
+        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+        z: body.position.z + body.velocity.z * dt + gravity.z * body.gravityScale * gravWeight * dt * dt,
       };
       // Inertial rotation: integrate angular velocity
       const wLen = vec3Length(body.angularVelocity);
@@ -242,6 +378,8 @@ export class AVBDSolver3D {
         body.inertialRotation = { ...body.rotation };
       }
     }
+
+    const tBI = performance.now();
 
     // 5. Solver iterations
     const totalIters = config.postStabilize ? config.iterations + 1 : config.iterations;
@@ -260,6 +398,28 @@ export class AVBDSolver3D {
           if (!row.active || row.broken) continue;
           this.dualUpdate3D(row, dt);
         }
+
+        // Friction coupling: update friction bounds from normal lambdas.
+        // 3D contacts come in triplets: [normal, friction1, friction2].
+        // Walk rows finding normal rows (fmax <= 0) and update the next 2 friction rows.
+        for (let i = 0; i + 2 < this.constraintRows.length; i++) {
+          const normalRow = this.constraintRows[i];
+          // Identify normal rows: Contact type with infinite fmin (unilateral constraint)
+          if (normalRow.type !== ForceType.Contact || !normalRow.active || isFinite(normalRow.fmin)) continue;
+          const fric1 = this.constraintRows[i + 1];
+          const fric2 = this.constraintRows[i + 2];
+          if (!fric1.active || fric1.type !== ForceType.Contact) continue;
+          if (!fric2.active || fric2.type !== ForceType.Contact) continue;
+          const bA = this.bodyStore.bodies[normalRow.bodyA];
+          const bB = this.bodyStore.bodies[normalRow.bodyB];
+          const mu = Math.sqrt(bA.friction * bB.friction);
+          const normalForce = Math.abs(normalRow.lambda);
+          fric1.fmin = -mu * normalForce;
+          fric1.fmax = mu * normalForce;
+          fric2.fmin = -mu * normalForce;
+          fric2.fmax = mu * normalForce;
+          i += 2; // Skip past the friction rows
+        }
       }
 
       // Velocity recovery at iteration N-1
@@ -267,6 +427,13 @@ export class AVBDSolver3D {
         for (const body of bodies) {
           if (body.type === RigidBodyType.Fixed) continue;
           body.velocity = vec3Scale(vec3Sub(body.position, body.prevPosition), 1 / dt);
+
+          // Clamp recovered linear velocity
+          const vLen = vec3Length(body.velocity);
+          if (vLen > MAX_LIN_VEL) {
+            body.velocity = vec3Scale(body.velocity, MAX_LIN_VEL / vLen);
+          }
+
           // Angular velocity from quaternion difference
           const dq = quatMul(body.rotation, {
             w: body.prevRotation.w,
@@ -275,9 +442,67 @@ export class AVBDSolver3D {
             z: -body.prevRotation.z,
           });
           body.angularVelocity = vec3Scale(vec3(dq.x, dq.y, dq.z), 2 / dt);
+
+          // Clamp recovered angular velocity
+          const wLen = vec3Length(body.angularVelocity);
+          if (wLen > MAX_ANG_VEL) {
+            body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / wLen);
+          }
+        }
+
+        // Velocity-level restitution: correct recovered velocity along contact normals.
+        // Without this, the PBD position correction creates artificial bounce —
+        // the constraint pushes the body out of penetration, and velocity recovery
+        // captures this correction as an upward velocity.
+        for (const row of this.constraintRows) {
+          if (!row.active || row.broken) continue;
+          // Only apply to normal contact rows (unilateral, fmin=-Inf, fmax=0)
+          if (row.type !== ForceType.Contact || isFinite(row.fmin)) continue;
+          if (row.lambda >= -1e-6) continue; // Skip inactive contacts
+
+          const bAidx = row.bodyA;
+          const bBidx = row.bodyB;
+          // Extract contact normal from Jacobian (first 3 components for body A)
+          const n = vec3(row.jacobianA[0], row.jacobianA[1], row.jacobianA[2]);
+
+          // Apply restitution to body A
+          if (bAidx >= 0 && bodies[bAidx].type === RigidBodyType.Dynamic) {
+            const bA = bodies[bAidx];
+            const vnA = vec3Dot(bA.velocity, n);
+            if (vnA > 0) { // Separating velocity along normal (bounce)
+              const restitution = Math.max(bA.restitution, bodies[bBidx]?.restitution ?? 0);
+              // Remove the artificial bounce, add back restitution amount
+              const correction = vnA * (1 - restitution);
+              bA.velocity = vec3Sub(bA.velocity, vec3Scale(n, correction));
+            }
+          }
+
+          // Apply restitution to body B (opposite normal)
+          if (bBidx >= 0 && bodies[bBidx].type === RigidBodyType.Dynamic) {
+            const bB = bodies[bBidx];
+            const vnB = vec3Dot(bB.velocity, n);
+            if (vnB < 0) { // Separating in opposite direction
+              const restitution = Math.max(bodies[bAidx]?.restitution ?? 0, bB.restitution);
+              const correction = -vnB * (1 - restitution);
+              bB.velocity = vec3Add(bB.velocity, vec3Scale(n, correction));
+            }
+          }
         }
       }
     }
+
+    const tEnd = performance.now();
+    this.lastTimings = {
+      total: tEnd - t0,
+      broadphase: tBP - t0,
+      narrowphase: tNP - tBP,
+      warmstart: tWS - tNP,
+      bodyInit: tBI - tWS,
+      solverIters: tEnd - tBI,
+      velocityRecover: 0,
+      numBodies: bodies.length,
+      numConstraints: this.constraintRows.length,
+    };
   }
 
   private primalUpdate3D(body: Body3D, dt: number): void {
@@ -351,11 +576,18 @@ export class AVBDSolver3D {
       // RHS += J * f
       for (let k = 0; k < n; k++) rhs[k] += J[k] * f;
 
-      // LHS += J * J^T * penalty + geometric stiffness
+      // LHS += J * J^T * penalty
       for (let i = 0; i < n; i++) {
         for (let j = 0; j < n; j++) {
           lhs[j * n + i] += J[i] * J[j] * row.penalty;
         }
+      }
+
+      // Geometric stiffness (diagonal lumping)
+      const hDiag = row.bodyA === body.index ? row.hessianDiagA : row.hessianDiagB;
+      const absF = Math.abs(f);
+      for (let i = 0; i < n; i++) {
+        lhs[i * n + i] += Math.abs(hDiag[i]) * absF;
       }
     }
 
@@ -405,9 +637,17 @@ export class AVBDSolver3D {
     }
 
     row.lambda = Math.max(row.fmin, Math.min(row.fmax, row.penalty * cEval + row.lambda));
-    // Conditional penalty ramp: only when lambda is interior (not at bounds)
-    if (row.lambda > row.fmin && row.lambda < row.fmax) {
-      row.penalty += this.config.beta * Math.abs(cEval);
+    // Conditional penalty ramp: only when lambda is interior (not at bounds).
+    // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
+    // should stay low to avoid stiff angular springs that cause spinning instability.
+    const isFrictionRow = row.type === ForceType.Contact && isFinite(row.fmin);
+    if (!isFrictionRow && row.lambda > row.fmin && row.lambda < row.fmax) {
+      // Cap the per-iteration penalty increase to prevent exponential growth
+      // that causes explosive forces in many-body scenes (pyramids, stacks).
+      // Allow at most 50% growth per iteration (1.5^10 ≈ 57x max per step).
+      const increment = this.config.beta * Math.abs(cEval);
+      const maxIncrement = row.penalty * 0.5;
+      row.penalty += Math.min(increment, maxIncrement);
     }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) row.penalty = row.stiffness;

@@ -15,7 +15,7 @@
  * 6. CPU: velocity recovery, contact caching
  */
 
-import type { Vec2, SolverConfig, ColorGroup } from './types.js';
+import type { Vec2, SolverConfig, ColorGroup, StepTimings } from './types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_2D } from './types.js';
 import { ForceType } from './types.js';
 import type { Body2D } from './rigid-body.js';
@@ -67,6 +67,7 @@ export class GPUSolver2D {
   ignorePairs: Set<string> = new Set();
   jointConstraintIndices: number[] = [];
   colorGroups: ColorGroup[] = [];
+  lastTimings: StepTimings | null = null;
 
   private gpu: GPUContext;
   private initialized = false;
@@ -185,6 +186,7 @@ export class GPUSolver2D {
   async step(): Promise<void> {
     if (!this.initialized) await this.init();
 
+    const t0 = performance.now();
     const { config, bodyStore, constraintStore, gpu } = this;
     const dt = config.dt;
     const gravity = config.gravity as Vec2;
@@ -193,27 +195,73 @@ export class GPUSolver2D {
 
     if (bodies.length === 0) return;
 
-    // ─── 1. CPU: Collision Detection ──────────────────────────────
+    // ─── 1. CPU: Collision Detection (spatial hash broadphase) ─────
     constraintStore.clearContacts();
+    const gpu2dCandidatePairs: [number, number][] = [];
 
-    for (let i = 0; i < bodies.length; i++) {
-      const a = bodies[i];
-      const aabbA = bodyStore.getAABB(a);
-      for (let j = i + 1; j < bodies.length; j++) {
-        const b = bodies[j];
-        if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
-        const key = i < j ? `${i}-${j}` : `${j}-${i}`;
-        if (this.ignorePairs.has(key)) continue;
-        if (!aabb2DOverlap(aabbA, bodyStore.getAABB(b))) continue;
-        const manifold = collide2D(a, b);
-        if (manifold) {
-          const rows = createContactConstraintRows(manifold, a, b, config.penaltyMin, Infinity);
-          constraintStore.addRows(rows);
+    {
+      const n = bodies.length;
+      const aabbs = new Array(n);
+      for (let i = 0; i < n; i++) aabbs[i] = bodyStore.getAABB(bodies[i]);
+
+      let totalExtent = 0, dynCount = 0;
+      for (let i = 0; i < n; i++) {
+        if (bodies[i].type === RigidBodyType.Dynamic) {
+          totalExtent += (aabbs[i].maxX - aabbs[i].minX) + (aabbs[i].maxY - aabbs[i].minY);
+          dynCount++;
+        }
+      }
+      const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 2)) * 2 : 1, 0.5);
+      const invCell = 1 / cellSize;
+
+      const grid = new Map<number, number[]>();
+      for (let i = 0; i < n; i++) {
+        const a = aabbs[i];
+        const x0 = Math.floor(a.minX * invCell), x1 = Math.floor(a.maxX * invCell);
+        const y0 = Math.floor(a.minY * invCell), y1 = Math.floor(a.maxY * invCell);
+        for (let cx = x0; cx <= x1; cx++) {
+          for (let cy = y0; cy <= y1; cy++) {
+            const k = (cx + 0x8000) * 0x10000 + (cy + 0x8000);
+            let cell = grid.get(k);
+            if (!cell) { cell = []; grid.set(k, cell); }
+            cell.push(i);
+          }
+        }
+      }
+
+      const tested = new Set<number>();
+      for (const cell of grid.values()) {
+        for (let ci = 0; ci < cell.length; ci++) {
+          const i = cell[ci];
+          for (let cj = ci + 1; cj < cell.length; cj++) {
+            const j = cell[cj];
+            const pk = i < j ? i * n + j : j * n + i;
+            if (tested.has(pk)) continue;
+            tested.add(pk);
+            const a = bodies[i], b = bodies[j];
+            if (a.type !== RigidBodyType.Dynamic && b.type !== RigidBodyType.Dynamic) continue;
+            const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+            if (this.ignorePairs.has(key)) continue;
+            if (!aabb2DOverlap(aabbs[i], aabbs[j])) continue;
+            gpu2dCandidatePairs.push([i, j]);
+          }
         }
       }
     }
 
+    const tBroadphase = performance.now();
+
+    // Narrowphase: SAT collision detection on candidate pairs
+    for (const [i, j] of gpu2dCandidatePairs) {
+      const manifold = collide2D(bodies[i], bodies[j]);
+      if (manifold) {
+        const rows = createContactConstraintRows(manifold, bodies[i], bodies[j], config.penaltyMin, Infinity, config.dt);
+        constraintStore.addRows(rows);
+      }
+    }
     constraintStore.warmstartContacts();
+
+    const tCollision = performance.now();
 
     // ─── 2. CPU: Warmstart & Initialize ───────────────────────────
     for (const row of constraintStore.rows) {
@@ -239,23 +287,26 @@ export class GPUSolver2D {
       body.prevPosition = { ...body.position };
       body.prevAngle = body.angle;
 
-      // Adaptive gravity weighting (from CPU reference solver)
+      // Adaptive gravity weighting: only for slow-moving bodies to avoid artificial bounce
       const gravMag = vec2Length(gravity);
       let gravWeight = 1;
       if (gravMag > 0) {
-        const dvx = body.velocity.x - body.prevVelocity.x;
-        const dvy = body.velocity.y - body.prevVelocity.y;
-        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
-        if (dvMag > 0.01) {
-          const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
-          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
-          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        const speed = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+        if (speed < 0.5) {
+          const dvx = body.velocity.x - body.prevVelocity.x;
+          const dvy = body.velocity.y - body.prevVelocity.y;
+          const dvMag = Math.sqrt(dvx * dvx + dvy * dvy);
+          if (dvMag > 0.01) {
+            const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag };
+            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y) / dt;
+            gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+          }
         }
       }
 
       let vx = body.velocity.x, vy = body.velocity.y, omega = body.angularVelocity;
       if (body.linearDamping > 0) { const f = 1 / (1 + body.linearDamping * dt); vx *= f; vy *= f; }
-      if (body.angularDamping > 0) { omega *= 1 / (1 + body.angularDamping * dt); }
+      { const totalAngDamp = body.angularDamping + 0.05; omega *= 1 / (1 + totalAngDamp * dt); }
 
       body.inertialPosition = {
         x: body.position.x + vx * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
@@ -264,6 +315,8 @@ export class GPUSolver2D {
       body.inertialAngle = body.angle + omega * dt;
       body.prevVelocity = { ...body.velocity };
     }
+
+    const tInit = performance.now();
 
     // ─── 3. CPU→GPU: Upload Buffers ───────────────────────────────
     const numBodies = bodies.length;
@@ -364,6 +417,8 @@ export class GPUSolver2D {
     if (constraintIndices.length > 0) {
       gpuWrite(device.queue, this.constraintIndicesBuffer, 0, constraintIndices);
     }
+
+    const tUpload = performance.now();
 
     // ─── 4. GPU: Solver Iterations ────────────────────────────────
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
@@ -484,6 +539,8 @@ export class GPUSolver2D {
       console.error('GPU validation error:', validationError.message);
     }
 
+    const tDispatch = performance.now();
+
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
     // Readback final body state (post-stabilization positions)
     const bodyStagingBuffer = device.createBuffer({
@@ -506,16 +563,18 @@ export class GPUSolver2D {
 
     device.queue.submit([copyEncoder.finish()]);
 
-    // Map and read final body positions
-    await bodyStagingBuffer.mapAsync(GPUMapMode.READ);
+    // Map ALL staging buffers in parallel — single GPU fence wait instead of serial ones
+    const mapPromises: Promise<void>[] = [bodyStagingBuffer.mapAsync(GPUMapMode.READ)];
+    if (velRecoveryBuffer) mapPromises.push(velRecoveryBuffer.mapAsync(GPUMapMode.READ));
+    if (crStagingBuffer) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
+    await Promise.all(mapPromises);
+
     const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange().slice(0));
     bodyStagingBuffer.unmap();
     bodyStagingBuffer.destroy();
 
-    // Read pre-stabilization positions for velocity recovery (matches CPU behavior)
     let velRecoveryResult: Float32Array | null = null;
     if (velRecoveryBuffer) {
-      await velRecoveryBuffer.mapAsync(GPUMapMode.READ);
       velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange().slice(0));
       velRecoveryBuffer.unmap();
       velRecoveryBuffer.destroy();
@@ -536,16 +595,27 @@ export class GPUSolver2D {
       body.angle = bodyResult[off + 2];
 
       // BDF1 velocity recovery from pre-stabilization positions
+      const MAX_LINEAR_VELOCITY = 100;
+      const MAX_ANGULAR_VELOCITY = 50;
       body.velocity = {
         x: (velSource[off + 0] - body.prevPosition.x) / dt,
         y: (velSource[off + 1] - body.prevPosition.y) / dt,
       };
+      // Clamp recovered linear velocity
+      const vMag = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y);
+      if (vMag > MAX_LINEAR_VELOCITY) {
+        const scale = MAX_LINEAR_VELOCITY / vMag;
+        body.velocity.x *= scale;
+        body.velocity.y *= scale;
+      }
       body.angularVelocity = (velSource[off + 2] - body.prevAngle) / dt;
+      // Clamp recovered angular velocity
+      body.angularVelocity = Math.max(-MAX_ANGULAR_VELOCITY,
+        Math.min(MAX_ANGULAR_VELOCITY, body.angularVelocity));
     }
 
-    // Readback constraint lambdas for warmstarting
+    // Readback constraint lambdas for warmstarting (already mapped via Promise.all above)
     if (crStagingBuffer && numConstraints > 0) {
-      await crStagingBuffer.mapAsync(GPUMapMode.READ);
       const crResult = new DataView(crStagingBuffer.getMappedRange().slice(0));
       crStagingBuffer.unmap();
       crStagingBuffer.destroy();
@@ -556,6 +626,22 @@ export class GPUSolver2D {
         rows[i].penalty = crResult.getFloat32(byteOff + 92, true);
       }
     }
+
+    const tEnd = performance.now();
+    this.lastTimings = {
+      total: tEnd - t0,
+      broadphase: tBroadphase - t0,
+      narrowphase: tCollision - tBroadphase,
+      warmstart: tInit - tCollision,
+      bodyInit: 0,
+      solverIters: 0,
+      velocityRecover: 0,
+      bufferUpload: tUpload - tInit,
+      gpuDispatch: tDispatch - tUpload,
+      readback: tEnd - tDispatch,
+      numBodies: bodies.length,
+      numConstraints: constraintStore.rows.length,
+    };
   }
 
   /** Build per-body constraint index lists for indirection on GPU */

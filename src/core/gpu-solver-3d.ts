@@ -16,17 +16,17 @@
  * 6. CPU: velocity/angular velocity recovery, contact caching
  */
 
-import type { Vec3, Quat, SolverConfig, ColorGroup } from './types.js';
-import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D } from './types.js';
+import type { Vec3, Quat, SolverConfig, ColorGroup, StepTimings } from './types.js';
+import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D, COLLISION_MARGIN } from './types.js';
 import { ForceType } from './types.js';
 import type { Body3D } from './rigid-body-3d.js';
 import { BodyStore3D } from './rigid-body-3d.js';
 import type { ConstraintRow3D } from './solver-3d.js';
 import { collide3D, getAABB3D, aabb3DOverlap } from '../3d/collision-gjk.js';
-import { vec3Sub, vec3Scale, vec3Cross, vec3Length, vec3, quatMul, quatNormalize, quatFromAxisAngle } from './math.js';
+import { vec3Sub, vec3Scale, vec3Cross, vec3Dot, vec3Length, vec3, quatMul, quatNormalize, quatFromAxisAngle } from './math.js';
 import { computeGraphColoring } from './graph-coloring.js';
 import { GPUContext } from './gpu-context.js';
-import { PRIMAL_UPDATE_3D_WGSL, DUAL_UPDATE_3D_WGSL } from '../shaders/embedded.js';
+import { PRIMAL_UPDATE_3D_WGSL, DUAL_UPDATE_3D_WGSL, FRICTION_COUPLING_3D_WGSL } from '../shaders/embedded.js';
 
 // ─── GPU Buffer Layout Constants ────────────────────────────────────────────
 
@@ -35,14 +35,15 @@ const BODY_STRIDE = 20;
 /** Body prev 3D: [px,py,pz, pqw,pqx,pqy,pqz, ix,iy,iz, iqw,iqx,iqy,iqz] = 14 floats */
 const BODY_PREV_STRIDE = 14;
 /**
- * ConstraintRow3D: matches WGSL struct exactly = 28 floats (112 bytes)
+ * ConstraintRow3D: matches WGSL struct exactly = 36 floats (144 bytes)
  * [body_a(i32), body_b(i32), force_type(u32), _pad(u32),  // 4 = 16 bytes
  *  jacobian_a_lin(vec4), jacobian_a_ang(vec4),              // 2 vec4 = 32 bytes
  *  jacobian_b_lin(vec4), jacobian_b_ang(vec4),              // 2 vec4 = 32 bytes
+ *  hessian_diag_a_ang(vec4), hessian_diag_b_ang(vec4),      // 2 vec4 = 32 bytes
  *  c, c0, lambda, penalty, stiffness, fmin, fmax, active]  // 8 = 32 bytes
- * Total: 112 bytes
+ * Total: 144 bytes
  */
-const CONSTRAINT_STRIDE = 28;
+const CONSTRAINT_STRIDE = 36;
 /**
  * SolverParams 3D: 11 fields = 44 bytes
  * [dt, gravity_x, gravity_y, gravity_z, penalty_min, penalty_max, beta,
@@ -65,6 +66,8 @@ function createDefaultRow3D(): ConstraintRow3D {
     type: ForceType.Contact,
     jacobianA: [0, 0, 0, 0, 0, 0],
     jacobianB: [0, 0, 0, 0, 0, 0],
+    hessianDiagA: [0, 0, 0, 0, 0, 0],
+    hessianDiagB: [0, 0, 0, 0, 0, 0],
     c: 0, c0: 0,
     lambda: 0, penalty: 100,
     stiffness: Infinity,
@@ -89,6 +92,7 @@ export class GPUSolver3D {
   ignorePairs: Set<string> = new Set();
   jointRows: ConstraintRow3D[] = [];
   colorGroups: ColorGroup[] = [];
+  lastTimings: StepTimings | null = null;
 
   /** Contact cache for warmstarting between frames (body pair key → cached lambdas/penalties) */
   private contactCache: Map<string, { normalLambda: number; normalPenalty: number; fric1Lambda: number; fric1Penalty: number; fric2Lambda: number; fric2Penalty: number; age: number }> = new Map();
@@ -107,8 +111,11 @@ export class GPUSolver3D {
 
   private primalPipeline!: GPUComputePipeline;
   private dualPipeline!: GPUComputePipeline;
+  private frictionPipeline!: GPUComputePipeline;
   private primalBindGroupLayout!: GPUBindGroupLayout;
   private dualBindGroupLayout!: GPUBindGroupLayout;
+  private frictionBindGroupLayout!: GPUBindGroupLayout;
+  private frictionParamsBuffer!: GPUBuffer;
 
   private maxBodies = 0;
   private maxConstraints = 0;
@@ -159,9 +166,29 @@ export class GPUSolver3D {
       compute: { module: dualModule, entryPoint: 'main' },
     });
 
+    // Friction coupling pipeline: 2 bindings (params uniform + constraints read_write)
+    this.frictionBindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+
+    const frictionModule = device.createShaderModule({ code: FRICTION_COUPLING_3D_WGSL });
+    this.frictionPipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.frictionBindGroupLayout] }),
+      compute: { module: frictionModule, entryPoint: 'main' },
+    });
+
     // Solver params uniform
     this.solverParamsBuffer = device.createBuffer({
       size: SOLVER_PARAMS_BYTES,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    // Friction params uniform (4 bytes for num_constraints)
+    this.frictionParamsBuffer = device.createBuffer({
+      size: 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -174,6 +201,7 @@ export class GPUSolver3D {
   async step(): Promise<void> {
     if (!this.initialized) this.init();
 
+    const t0 = performance.now();
     const { config, bodyStore, gpu } = this;
     const dt = config.dt;
     const gravity = config.gravity as Vec3;
@@ -187,22 +215,77 @@ export class GPUSolver3D {
     this.cacheContacts();
     this.constraintRows = [...this.jointRows];
 
-    for (let i = 0; i < bodies.length; i++) {
-      const a = bodies[i];
-      const aabbA = getAABB3D(a);
-      for (let j = i + 1; j < bodies.length; j++) {
-        const b = bodies[j];
-        if (a.type === RigidBodyType.Fixed && b.type === RigidBodyType.Fixed) continue;
-        const key = `${i}-${j}`;
-        if (this.ignorePairs.has(key)) continue;
-        if (!aabb3DOverlap(aabbA, getAABB3D(b))) continue;
-        const manifold = collide3D(a, b);
-        if (manifold) {
-          const rows = this.createContactRows3D(manifold, a, b);
-          this.constraintRows.push(...rows);
+    // Spatial hash broadphase: O(n) average instead of O(n²)
+    const gpuCandidatePairs: [number, number][] = [];
+    {
+      const n = bodies.length;
+      const aabbs = new Array(n);
+      for (let i = 0; i < n; i++) aabbs[i] = getAABB3D(bodies[i]);
+
+      let totalExtent = 0, dynCount = 0;
+      for (let i = 0; i < n; i++) {
+        if (bodies[i].type !== RigidBodyType.Fixed) {
+          const a = aabbs[i];
+          totalExtent += (a.max.x - a.min.x) + (a.max.y - a.min.y) + (a.max.z - a.min.z);
+          dynCount++;
+        }
+      }
+      const cellSize = Math.max(dynCount > 0 ? (totalExtent / (dynCount * 3)) * 2 : 1, 0.5);
+      const invCell = 1 / cellSize;
+
+      const grid = new Map<number, number[]>();
+      function hashKey3D(cx: number, cy: number, cz: number): number {
+        return ((cx + 0x400) * 0x100000) + ((cy + 0x400) * 0x800) + (cz + 0x400);
+      }
+
+      for (let i = 0; i < n; i++) {
+        const a = aabbs[i];
+        const x0 = Math.floor(a.min.x * invCell), x1 = Math.floor(a.max.x * invCell);
+        const y0 = Math.floor(a.min.y * invCell), y1 = Math.floor(a.max.y * invCell);
+        const z0 = Math.floor(a.min.z * invCell), z1 = Math.floor(a.max.z * invCell);
+        for (let cx = x0; cx <= x1; cx++) {
+          for (let cy = y0; cy <= y1; cy++) {
+            for (let cz = z0; cz <= z1; cz++) {
+              const k = hashKey3D(cx, cy, cz);
+              let cell = grid.get(k);
+              if (!cell) { cell = []; grid.set(k, cell); }
+              cell.push(i);
+            }
+          }
+        }
+      }
+
+      const tested = new Set<number>();
+      for (const cell of grid.values()) {
+        for (let ci = 0; ci < cell.length; ci++) {
+          const i = cell[ci];
+          for (let cj = ci + 1; cj < cell.length; cj++) {
+            const j = cell[cj];
+            const pk = i < j ? i * n + j : j * n + i;
+            if (tested.has(pk)) continue;
+            tested.add(pk);
+            if (bodies[i].type === RigidBodyType.Fixed && bodies[j].type === RigidBodyType.Fixed) continue;
+            const key = `${i}-${j}`;
+            if (this.ignorePairs.has(key)) continue;
+            if (!aabb3DOverlap(aabbs[i], aabbs[j])) continue;
+            gpuCandidatePairs.push([i, j]);
+          }
         }
       }
     }
+
+    const tBroadphase = performance.now();
+
+    // Narrowphase: GJK collision detection on candidate pairs
+    for (const [i, j] of gpuCandidatePairs) {
+      const manifold = collide3D(bodies[i], bodies[j]);
+      if (manifold) {
+        const rows = this.createContactRows3D(manifold, bodies[i], bodies[j]);
+        this.constraintRows.push(...rows);
+      }
+    }
+
+    const tCollision = performance.now();
 
     // ─── 2. CPU: Warmstart & Initialize ───────────────────────────
     // Apply cached warmstart values to new contact rows
@@ -235,19 +318,27 @@ export class GPUSolver3D {
       body.prevPosition = { ...body.position };
       body.prevRotation = { ...body.rotation };
 
-      // Adaptive gravity weighting (from CPU reference solver)
+      // Adaptive gravity weighting: only reduce gravity for slow-moving (supported)
+      // bodies. Fast-moving bodies need full gravity to avoid artificial bounce on impact.
       let gravWeight = 1;
       if (gravMag > 0) {
-        const dvx = body.velocity.x - body.prevVelocity.x;
-        const dvy = body.velocity.y - body.prevVelocity.y;
-        const dvz = body.velocity.z - body.prevVelocity.z;
-        const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
-        if (dvMag > 0.01) {
-          const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag, z: gravity.z / gravMag };
-          const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
-          gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+        const speed = vec3Length(body.velocity);
+        if (speed < 0.5) {
+          const dvx = body.velocity.x - body.prevVelocity.x;
+          const dvy = body.velocity.y - body.prevVelocity.y;
+          const dvz = body.velocity.z - body.prevVelocity.z;
+          const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+          if (dvMag > 0.01) {
+            const gravDir = { x: gravity.x / gravMag, y: gravity.y / gravMag, z: gravity.z / gravMag };
+            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
+            gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
+          }
         }
       }
+
+      // Implicit angular damping
+      const angDampFactor = 1 / (1 + 0.05 * dt);
+      body.angularVelocity = vec3Scale(body.angularVelocity, angDampFactor);
 
       body.inertialPosition = {
         x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
@@ -265,9 +356,17 @@ export class GPUSolver3D {
       body.prevVelocity = { ...body.velocity };
     }
 
+    const tInit = performance.now();
+
     // ─── 3. CPU→GPU: Upload Buffers ───────────────────────────────
     const numBodies = bodies.length;
     const numConstraints = this.constraintRows.length;
+
+    // Build per-body constraint indirection (indices into original constraint array)
+    const { bodyRanges, constraintIndices } = this.buildConstraintIndirection(numBodies, numConstraints);
+
+    // Ensure GPU buffers are allocated BEFORE uploading data
+    this.ensureBuffers(numBodies, Math.max(numConstraints, 1), constraintIndices.length);
 
     // Upload body state (20 floats per body)
     const bodyData = new Float32Array(numBodies * BODY_STRIDE);
@@ -317,11 +416,6 @@ export class GPUSolver3D {
     }
     gpuWrite(device.queue, this.bodyPrevBuffer, 0, prevData);
 
-    // Build per-body constraint indirection (indices into original constraint array)
-    const { bodyRanges, constraintIndices } = this.buildConstraintIndirection(numBodies, numConstraints);
-
-    this.ensureBuffers(numBodies, Math.max(numConstraints, 1), constraintIndices.length);
-
     // Upload constraints in original order (28 floats = 112 bytes per row)
     if (numConstraints > 0) {
       const crData = new ArrayBuffer(numConstraints * CONSTRAINT_STRIDE * 4);
@@ -360,15 +454,27 @@ export class GPUSolver3D {
           if (bA && bB) mu = Math.sqrt(bA.friction * bB.friction);
         }
         crView.setFloat32(byteOff + 76, mu, true);
+        // hessian_diag_a_ang (vec4): angular components only (linear is always 0)
+        const hA = row.hessianDiagA || [0, 0, 0, 0, 0, 0];
+        crView.setFloat32(byteOff + 80, hA[3] || 0, true);
+        crView.setFloat32(byteOff + 84, hA[4] || 0, true);
+        crView.setFloat32(byteOff + 88, hA[5] || 0, true);
+        crView.setFloat32(byteOff + 92, 0, true);
+        // hessian_diag_b_ang (vec4)
+        const hB = row.hessianDiagB || [0, 0, 0, 0, 0, 0];
+        crView.setFloat32(byteOff + 96, hB[3] || 0, true);
+        crView.setFloat32(byteOff + 100, hB[4] || 0, true);
+        crView.setFloat32(byteOff + 104, hB[5] || 0, true);
+        crView.setFloat32(byteOff + 108, 0, true);
         // scalar fields
-        crView.setFloat32(byteOff + 80, row.c, true);
-        crView.setFloat32(byteOff + 84, row.c0, true);
-        crView.setFloat32(byteOff + 88, row.lambda, true);
-        crView.setFloat32(byteOff + 92, row.penalty, true);
-        crView.setFloat32(byteOff + 96, isFinite(row.stiffness) ? row.stiffness : 1e30, true);
-        crView.setFloat32(byteOff + 100, isFinite(row.fmin) ? row.fmin : -1e30, true);
-        crView.setFloat32(byteOff + 104, isFinite(row.fmax) ? row.fmax : 1e30, true);
-        crView.setUint32(byteOff + 108, row.active ? 1 : 0, true);
+        crView.setFloat32(byteOff + 112, row.c, true);
+        crView.setFloat32(byteOff + 116, row.c0, true);
+        crView.setFloat32(byteOff + 120, row.lambda, true);
+        crView.setFloat32(byteOff + 124, row.penalty, true);
+        crView.setFloat32(byteOff + 128, isFinite(row.stiffness) ? row.stiffness : 1e30, true);
+        crView.setFloat32(byteOff + 132, isFinite(row.fmin) ? row.fmin : -1e30, true);
+        crView.setFloat32(byteOff + 136, isFinite(row.fmax) ? row.fmax : 1e30, true);
+        crView.setUint32(byteOff + 140, row.active ? 1 : 0, true);
       }
       gpuWrite(device.queue, this.constraintBuffer, 0, new Uint8Array(crData));
     }
@@ -383,6 +489,11 @@ export class GPUSolver3D {
     const totalIterations = config.postStabilize ? config.iterations + 1 : config.iterations;
     const velocityRecoveryIter = config.iterations - 1;
 
+    const tUpload = performance.now();
+
+    // Push error scope to catch GPU validation errors
+    device.pushErrorScope('validation');
+
     // Buffer to snapshot body state at velocity recovery iteration (before stabilization)
     const bodyReadbackSize = numBodies * BODY_STRIDE * 4;
     let velRecoveryBuffer: GPUBuffer | null = null;
@@ -393,12 +504,19 @@ export class GPUSolver3D {
       });
     }
 
+    // Pre-write friction params (constant across iterations)
+    if (numConstraints > 0) {
+      gpuWrite(device.queue, this.frictionParamsBuffer, 0, new Uint32Array([numConstraints]));
+    }
+
     for (let iter = 0; iter < totalIterations; iter++) {
       const isStabilization = config.postStabilize && iter === totalIterations - 1;
 
-      const encoder = device.createCommandEncoder();
-
       // ─── 4a. Primal update: dispatch per color group ──────────
+      // Each color group gets its own submit to ensure writeBuffer data
+      // (params, indices) is correct for that dispatch. WebGPU writeBuffer
+      // calls are resolved before the NEXT submit, so we must submit
+      // after each group to avoid overwrites.
       for (const colorGroup of this.colorGroups) {
         if (colorGroup.bodyIndices.length === 0) continue;
 
@@ -421,17 +539,22 @@ export class GPUSolver3D {
           ],
         });
 
+        const encoder = device.createCommandEncoder();
         const pass = encoder.beginComputePass();
         pass.setPipeline(this.primalPipeline);
         pass.setBindGroup(0, bindGroup);
         pass.dispatchWorkgroups(Math.ceil(colorGroup.bodyIndices.length / WORKGROUP_SIZE));
         pass.end();
+        device.queue.submit([encoder.finish()]);
       }
 
-      // ─── 4b. Dual update: all constraints ─────────────────────
+      // ─── 4b. Dual update + friction coupling ─────────────────
       if (!isStabilization && numConstraints > 0) {
         this.writeParams(dt, gravity, config, numBodies, numConstraints, 0, false);
 
+        const encoder = device.createCommandEncoder();
+
+        // Dual: update all constraint lambdas
         const dualBindGroup = device.createBindGroup({
           layout: this.dualBindGroupLayout,
           entries: [
@@ -442,20 +565,48 @@ export class GPUSolver3D {
           ],
         });
 
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(this.dualPipeline);
-        pass.setBindGroup(0, dualBindGroup);
-        pass.dispatchWorkgroups(Math.ceil(numConstraints / WORKGROUP_SIZE));
-        pass.end();
+        const dualPass = encoder.beginComputePass();
+        dualPass.setPipeline(this.dualPipeline);
+        dualPass.setBindGroup(0, dualBindGroup);
+        dualPass.dispatchWorkgroups(Math.ceil(numConstraints / WORKGROUP_SIZE));
+        dualPass.end();
+
+        // Friction coupling: separate pass after dual guarantees all
+        // normal lambdas are finalized before updating friction bounds.
+        // 3D contacts produce triplets: [normal, friction1, friction2].
+        const numContactTriplets = Math.ceil(numConstraints / 3);
+        const frictionBindGroup = device.createBindGroup({
+          layout: this.frictionBindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: this.frictionParamsBuffer } },
+            { binding: 1, resource: { buffer: this.constraintBuffer } },
+          ],
+        });
+
+        const fricPass = encoder.beginComputePass();
+        fricPass.setPipeline(this.frictionPipeline);
+        fricPass.setBindGroup(0, frictionBindGroup);
+        fricPass.dispatchWorkgroups(Math.ceil(numContactTriplets / WORKGROUP_SIZE));
+        fricPass.end();
+
+        device.queue.submit([encoder.finish()]);
       }
 
       // Snapshot body state at velocity recovery iteration (before stabilization)
       if (iter === velocityRecoveryIter && velRecoveryBuffer) {
-        encoder.copyBufferToBuffer(this.bodyStateBuffer, 0, velRecoveryBuffer, 0, bodyReadbackSize);
+        const snapEncoder = device.createCommandEncoder();
+        snapEncoder.copyBufferToBuffer(this.bodyStateBuffer, 0, velRecoveryBuffer, 0, bodyReadbackSize);
+        device.queue.submit([snapEncoder.finish()]);
       }
-
-      device.queue.submit([encoder.finish()]);
     }
+
+    // Check for GPU validation errors
+    const validationError = await device.popErrorScope();
+    if (validationError) {
+      console.error('GPU validation error:', validationError.message);
+    }
+
+    const tDispatch = performance.now();
 
     // ─── 5. GPU→CPU: Read Back Results ────────────────────────────
     const bodyStagingBuffer = device.createBuffer({
@@ -477,16 +628,18 @@ export class GPUSolver3D {
 
     device.queue.submit([copyEncoder.finish()]);
 
-    // Map and read final body positions
-    await bodyStagingBuffer.mapAsync(GPUMapMode.READ);
+    // Map ALL staging buffers in parallel — single GPU fence wait instead of 3 serial ones
+    const mapPromises: Promise<void>[] = [bodyStagingBuffer.mapAsync(GPUMapMode.READ)];
+    if (velRecoveryBuffer) mapPromises.push(velRecoveryBuffer.mapAsync(GPUMapMode.READ));
+    if (crStagingBuffer) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
+    await Promise.all(mapPromises);
+
     const bodyResult = new Float32Array(bodyStagingBuffer.getMappedRange().slice(0));
     bodyStagingBuffer.unmap();
     bodyStagingBuffer.destroy();
 
-    // Read pre-stabilization positions for velocity recovery (matches CPU behavior)
     let velRecoveryResult: Float32Array | null = null;
     if (velRecoveryBuffer) {
-      await velRecoveryBuffer.mapAsync(GPUMapMode.READ);
       velRecoveryResult = new Float32Array(velRecoveryBuffer.getMappedRange().slice(0));
       velRecoveryBuffer.unmap();
       velRecoveryBuffer.destroy();
@@ -511,12 +664,19 @@ export class GPUSolver3D {
       body.rotation.z = bodyResult[off + 6];
 
       // BDF1 velocity recovery from pre-stabilization positions
+      const MAX_LIN_VEL = 100;
+      const MAX_ANG_VEL = 50;
       const voff = i * BODY_STRIDE;
       body.velocity = {
         x: (velSource[voff + 0] - body.prevPosition.x) / dt,
         y: (velSource[voff + 1] - body.prevPosition.y) / dt,
         z: (velSource[voff + 2] - body.prevPosition.z) / dt,
       };
+      // Clamp recovered linear velocity
+      const vLen = vec3Length(body.velocity);
+      if (vLen > MAX_LIN_VEL) {
+        body.velocity = vec3Scale(body.velocity, MAX_LIN_VEL / vLen);
+      }
       // Angular velocity from quaternion difference (using pre-stabilization rotation)
       const vqw = velSource[voff + 3];
       const vqx = velSource[voff + 4];
@@ -532,21 +692,41 @@ export class GPUSolver3D {
         },
       );
       body.angularVelocity = vec3Scale(vec3(dq.x, dq.y, dq.z), 2 / dt);
+      // Clamp recovered angular velocity
+      const wLen = vec3Length(body.angularVelocity);
+      if (wLen > MAX_ANG_VEL) {
+        body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / wLen);
+      }
     }
 
-    // Readback constraint lambdas for warmstarting
+    // Readback constraint lambdas for warmstarting (already mapped via Promise.all above)
     if (crStagingBuffer && numConstraints > 0) {
-      await crStagingBuffer.mapAsync(GPUMapMode.READ);
       const crResult = new DataView(crStagingBuffer.getMappedRange().slice(0));
       crStagingBuffer.unmap();
       crStagingBuffer.destroy();
 
       for (let i = 0; i < numConstraints; i++) {
         const byteOff = i * CONSTRAINT_STRIDE * 4;
-        this.constraintRows[i].lambda = crResult.getFloat32(byteOff + 88, true);
-        this.constraintRows[i].penalty = crResult.getFloat32(byteOff + 92, true);
+        this.constraintRows[i].lambda = crResult.getFloat32(byteOff + 120, true);
+        this.constraintRows[i].penalty = crResult.getFloat32(byteOff + 124, true);
       }
     }
+
+    const tEnd = performance.now();
+    this.lastTimings = {
+      total: tEnd - t0,
+      broadphase: tBroadphase - t0,
+      narrowphase: tCollision - tBroadphase,
+      warmstart: tInit - tCollision,
+      bodyInit: 0,
+      solverIters: 0,
+      velocityRecover: 0,
+      bufferUpload: tUpload - tInit,
+      gpuDispatch: tDispatch - tUpload,
+      readback: tEnd - tDispatch,
+      numBodies: bodies.length,
+      numConstraints: this.constraintRows.length,
+    };
   }
 
   /** Create 3D contact constraint rows from a manifold */
@@ -573,7 +753,20 @@ export class GPUSolver3D {
       nRow.jacobianA = [n.x, n.y, n.z, torqueA.x, torqueA.y, torqueA.z];
       const torqueB = vec3Cross(rB, n);
       nRow.jacobianB = [-n.x, -n.y, -n.z, -torqueB.x, -torqueB.y, -torqueB.z];
-      nRow.c = -contact.depth;
+
+      // Geometric stiffness (Hessian diagonal) for angular DOFs
+      const rAdotN = vec3Dot(rA, n);
+      const rBdotN = vec3Dot(rB, n);
+      nRow.hessianDiagA = [0, 0, 0,
+        -(rAdotN - rA.x * n.x),
+        -(rAdotN - rA.y * n.y),
+        -(rAdotN - rA.z * n.z)];
+      nRow.hessianDiagB = [0, 0, 0,
+        -(rBdotN - rB.x * n.x),
+        -(rBdotN - rB.y * n.y),
+        -(rBdotN - rB.z * n.z)];
+
+      nRow.c = -contact.depth + COLLISION_MARGIN;
       nRow.c0 = nRow.c;
       nRow.fmin = -Infinity;
       nRow.fmax = 0;
@@ -595,6 +788,19 @@ export class GPUSolver3D {
         fRow.jacobianA = [t.x, t.y, t.z, tA.x, tA.y, tA.z];
         const tB = vec3Cross(rB, t);
         fRow.jacobianB = [-t.x, -t.y, -t.z, -tB.x, -tB.y, -tB.z];
+
+        // Geometric stiffness for friction tangent
+        const rAdotT = vec3Dot(rA, t);
+        const rBdotT = vec3Dot(rB, t);
+        fRow.hessianDiagA = [0, 0, 0,
+          -(rAdotT - rA.x * t.x),
+          -(rAdotT - rA.y * t.y),
+          -(rAdotT - rA.z * t.z)];
+        fRow.hessianDiagB = [0, 0, 0,
+          -(rBdotT - rB.x * t.x),
+          -(rBdotT - rB.y * t.y),
+          -(rBdotT - rB.z * t.z)];
+
         fRow.c = 0;
         fRow.c0 = 0;
         fRow.fmin = -mu * this.config.penaltyMin * contact.depth;
@@ -736,8 +942,8 @@ export class GPUSolver3D {
 
   destroy(): void {
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
-      this.solverParamsBuffer, this.colorIndicesBuffer, this.bodyConstraintRangesBuffer,
-      this.constraintIndicesBuffer]) {
+      this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
+      this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer]) {
       if (buf) buf.destroy();
     }
   }

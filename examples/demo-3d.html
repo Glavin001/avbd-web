@@ -102,6 +102,12 @@
         <option value="stack" selected>Stack</option>
         <option value="pyramid">Pyramid</option>
         <option value="friction">Friction</option>
+        <option value="boxRain200">Box Rain (200)</option>
+        <option value="largePyramid">Large Pyramid (120)</option>
+        <option value="spherePile100">Sphere Pile (100)</option>
+        <option value="ballPit1000">Ball Pit (1,000)</option>
+        <option value="ballPit2000">Ball Pit (2,000)</option>
+        <option value="ballPit10000">Ball Pit (10,000)</option>
       </select>
       <button id="btn-reset">Reset</button>
       <button id="btn-add-cube">Add Cube</button>
@@ -112,6 +118,14 @@
   <div id="stats">
     <span class="label">FPS:</span> <span class="value" id="stat-fps">--</span><br>
     <span class="label">Bodies:</span> <span class="value" id="stat-bodies">0</span><br>
+    <span class="label">Constraints:</span> <span class="value" id="stat-constraints">0</span><br>
+    <span class="label">Step:</span> <span class="value" id="stat-step">--</span><br>
+    <span class="label" style="margin-left:8px">Broad:</span> <span class="value" id="stat-broad">--</span><br>
+    <span class="label" style="margin-left:8px">Narrow:</span> <span class="value" id="stat-narrow">--</span><br>
+    <span class="label" style="margin-left:8px">Init:</span> <span class="value" id="stat-init">--</span><br>
+    <span class="label" style="margin-left:8px" id="stat-phase3-label">Solver:</span> <span class="value" id="stat-phase3">--</span><br>
+    <span class="label" style="margin-left:8px" id="stat-phase4-label"></span> <span class="value" id="stat-phase4"></span><br>
+    <span class="label" style="margin-left:8px" id="stat-phase5-label"></span> <span class="value" id="stat-phase5"></span><br>
     <span class="label">Solver:</span> <span class="value" id="stat-solver">CPU</span>
   </div>
 
@@ -297,18 +311,16 @@
       createWorld();
 
       switch (name) {
-        case 'ground':
-          sceneGround();
-          break;
-        case 'stack':
-          sceneStack();
-          break;
-        case 'pyramid':
-          scenePyramid();
-          break;
-        case 'friction':
-          sceneFriction();
-          break;
+        case 'ground':       sceneGround(); break;
+        case 'stack':        sceneStack(); break;
+        case 'pyramid':      scenePyramid(); break;
+        case 'friction':     sceneFriction(); break;
+        case 'boxRain200':   sceneBoxRain200(); break;
+        case 'largePyramid': sceneLargePyramid(); break;
+        case 'spherePile100': sceneSpherePile100(); break;
+        case 'ballPit1000':  sceneBallPitN(1000); break;
+        case 'ballPit2000':  sceneBallPitN(2000); break;
+        case 'ballPit10000': sceneBallPitN(10000); break;
       }
     }
 
@@ -352,9 +364,113 @@
         // Give each cube a lateral push to see friction differences
         body.setLinvel({ x: 3, y: 0, z: 0 });
       }
+    }
 
-      // Labels in the scene - small cubes as markers at ground level
-      // (visual indicator of friction values)
+    function sceneBoxRain200() {
+      const cols = 10;
+      const rows = 10;
+      const zLayers = 2;
+      let count = 0;
+      for (let layer = 0; layer < zLayers; layer++) {
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            if (count >= 200) break;
+            const x = (c - cols / 2) * 1.2 + (Math.random() - 0.5) * 0.1;
+            const z = (layer - 0.5) * 1.5 + (Math.random() - 0.5) * 0.1;
+            const y = 1.5 + r * 1.1 + layer * rows * 1.1;
+            addPhysicsCube(x, y, z, 0.4, 0.4, 0.4, 0.4);
+            count++;
+          }
+        }
+      }
+    }
+
+    function sceneLargePyramid() {
+      const hx = 0.45, hy = 0.45, hz = 0.45;
+      const layers = 10;
+      for (let row = 0; row < layers; row++) {
+        const count = layers - row;
+        const offsetX = -(count - 1) * hx;
+        for (let col = 0; col < count; col++) {
+          const x = offsetX + col * (hx * 2 + 0.05);
+          const y = 0.5 + hy + row * (hy * 2 + 0.05);
+          const color = CUBE_COLORS[(row * 7 + col) % CUBE_COLORS.length];
+          addPhysicsCube(x, y, 0, hx, hy, hz, 0.5, color);
+        }
+      }
+    }
+
+    function sceneSpherePile100() {
+      // Walls to contain spheres
+      const wallSpecs = [
+        { x: -3, y: 2, z: 0, hx: 0.2, hy: 2, hz: 3 },
+        { x: 3, y: 2, z: 0, hx: 0.2, hy: 2, hz: 3 },
+        { x: 0, y: 2, z: -3, hx: 3, hy: 2, hz: 0.2 },
+        { x: 0, y: 2, z: 3, hx: 3, hy: 2, hz: 0.2 },
+      ];
+      for (const w of wallSpecs) {
+        const wb = world.createRigidBody(
+          AVBD3D.RigidBodyDesc.fixed().setTranslation(w.x, w.y, w.z)
+        );
+        world.createCollider(AVBD3D.ColliderDesc.cuboid(w.hx, w.hy, w.hz), wb);
+        const mesh = createCubeMesh(w.hx, w.hy, w.hz, 0x333355);
+        mesh.position.set(w.x, w.y, w.z);
+        scene.add(mesh);
+        bodyMeshPairs.push({ body: wb, mesh, shape: 'cube', hx: w.hx, hy: w.hy, hz: w.hz });
+      }
+
+      for (let i = 0; i < 100; i++) {
+        const x = (Math.random() - 0.5) * 3;
+        const z = (Math.random() - 0.5) * 3;
+        const y = 1.5 + i * 0.35;
+        addPhysicsSphere(x, y, z, 0.2 + Math.random() * 0.1);
+      }
+    }
+
+    function sceneBallPitN(count) {
+      // Scale container and sphere sizes based on count
+      const rBase   = count <= 1000 ? 0.15 : count <= 2000 ? 0.12 : 0.07;
+      const rVar    = rBase * 0.5;
+      const spacing = rBase * 4;
+      // Cube root to get grid dimension, then size container to fit
+      const gridSize = Math.ceil(Math.cbrt(count));
+      const halfExt  = (gridSize * spacing) / 2 + 0.5;
+      const wallH    = Math.max(3, halfExt);
+
+      // Transparent container walls
+      const wallSpecs = [
+        { x: -halfExt, y: wallH, z: 0, hx: 0.2, hy: wallH, hz: halfExt },
+        { x:  halfExt, y: wallH, z: 0, hx: 0.2, hy: wallH, hz: halfExt },
+        { x: 0, y: wallH, z: -halfExt, hx: halfExt, hy: wallH, hz: 0.2 },
+        { x: 0, y: wallH, z:  halfExt, hx: halfExt, hy: wallH, hz: 0.2 },
+      ];
+      for (const w of wallSpecs) {
+        const wb = world.createRigidBody(
+          AVBD3D.RigidBodyDesc.fixed().setTranslation(w.x, w.y, w.z)
+        );
+        world.createCollider(AVBD3D.ColliderDesc.cuboid(w.hx, w.hy, w.hz), wb);
+        const mesh = createCubeMesh(w.hx, w.hy, w.hz, 0x333355);
+        mesh.position.set(w.x, w.y, w.z);
+        mesh.material.transparent = true;
+        mesh.material.opacity = 0.3;
+        scene.add(mesh);
+        bodyMeshPairs.push({ body: wb, mesh, shape: 'cube', hx: w.hx, hy: w.hy, hz: w.hz });
+      }
+
+      // Spawn spheres in a 3D grid with jitter
+      let idx = 0;
+      for (let ly = 0; ly < gridSize && idx < count; ly++) {
+        for (let lz = 0; lz < gridSize && idx < count; lz++) {
+          for (let lx = 0; lx < gridSize && idx < count; lx++) {
+            const x = (lx - gridSize / 2 + 0.5) * spacing + (Math.random() - 0.5) * 0.1;
+            const y = 1.0 + ly * spacing;
+            const z = (lz - gridSize / 2 + 0.5) * spacing + (Math.random() - 0.5) * 0.1;
+            const r = rBase + Math.random() * rVar;
+            addPhysicsSphere(x, y, z, r);
+            idx++;
+          }
+        }
+      }
     }
 
     // ── Shooting cubes ───────────────────────────────────────────────────────
@@ -439,15 +555,29 @@
 
     const statFps = document.getElementById('stat-fps');
     const statBodies = document.getElementById('stat-bodies');
+    const statConstraints = document.getElementById('stat-constraints');
+    const statStep = document.getElementById('stat-step');
+    const statBroad = document.getElementById('stat-broad');
+    const statNarrow = document.getElementById('stat-narrow');
+    const statInit = document.getElementById('stat-init');
+    const statPhase3 = document.getElementById('stat-phase3');
+    const statPhase3Label = document.getElementById('stat-phase3-label');
+    const statPhase4 = document.getElementById('stat-phase4');
+    const statPhase4Label = document.getElementById('stat-phase4-label');
+    const statPhase5 = document.getElementById('stat-phase5');
+    const statPhase5Label = document.getElementById('stat-phase5-label');
+    let stepTimeMs = 0;
 
     // ── Game loop ────────────────────────────────────────────────────────────
 
-    function loop() {
+    async function loop() {
       requestAnimationFrame(loop);
 
-      // Step physics
+      // Step physics (GPU solver returns a Promise)
       if (world) {
-        world.step();
+        const t0 = performance.now();
+        await world.step();
+        stepTimeMs = performance.now() - t0;
       }
 
       // Sync physics to meshes
@@ -468,6 +598,32 @@
         lastFpsTime = now;
         statFps.textContent = currentFps;
         statBodies.textContent = bodyMeshPairs.length;
+        statStep.textContent = stepTimeMs.toFixed(1) + ' ms';
+        // Show timing breakdown from solver
+        const t = world?.lastTimings;
+        if (t) {
+          statConstraints.textContent = t.numConstraints;
+          statBroad.textContent = t.broadphase.toFixed(1) + ' ms';
+          statNarrow.textContent = t.narrowphase.toFixed(1) + ' ms';
+          statInit.textContent = (t.warmstart + t.bodyInit).toFixed(1) + ' ms';
+          if (t.gpuDispatch != null) {
+            // GPU path
+            statPhase3Label.textContent = 'Upload:';
+            statPhase3.textContent = t.bufferUpload.toFixed(1) + ' ms';
+            statPhase4Label.textContent = 'GPU:';
+            statPhase4.textContent = t.gpuDispatch.toFixed(1) + ' ms';
+            statPhase5Label.textContent = 'Readback:';
+            statPhase5.textContent = t.readback.toFixed(1) + ' ms';
+          } else {
+            // CPU path
+            statPhase3Label.textContent = 'Solve:';
+            statPhase3.textContent = t.solverIters.toFixed(1) + ' ms';
+            statPhase4Label.textContent = '';
+            statPhase4.textContent = '';
+            statPhase5Label.textContent = '';
+            statPhase5.textContent = '';
+          }
+        }
       }
     }
 

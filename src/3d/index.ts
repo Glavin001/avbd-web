@@ -9,7 +9,7 @@
  *   await world.step();   // GPU compute dispatch
  */
 
-import type { Vec3, Quat, SolverConfig, RigidBodyHandle } from '../core/types.js';
+import type { Vec3, Quat, SolverConfig, RigidBodyHandle, StepTimings } from '../core/types.js';
 import { RigidBodyType, DEFAULT_SOLVER_CONFIG_3D } from '../core/types.js';
 import { GPUSolver3D } from '../core/gpu-solver-3d.js';
 import { AVBDSolver3D } from '../core/solver-3d.js';
@@ -106,6 +106,11 @@ export class World3D {
   /** Check if this world is using the GPU solver */
   get isGPU(): boolean {
     return this.gpuSolver !== null;
+  }
+
+  /** Per-step performance breakdown (ms) from the last step call */
+  get lastTimings(): StepTimings | null {
+    return this.gpuSolver?.lastTimings ?? this.cpuSolver?.lastTimings ?? null;
   }
 
   getBodyStates(): Float32Array {
@@ -220,3 +225,4 @@ const AVBD3D = {
 
 export default AVBD3D;
 export { RigidBodyDesc3D, ColliderDesc3D };
+export type { StepTimings };
