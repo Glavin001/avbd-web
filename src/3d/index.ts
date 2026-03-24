@@ -202,6 +202,9 @@ const AVBD3D = {
    * Must be called before creating a World3D.
    * Throws if WebGPU is not available.
    */
+  /** Optional error callback for GPU device loss and other async errors */
+  onError: null as ((message: string) => void) | null,
+
   async init(): Promise<void> {
     if (typeof navigator === 'undefined' || !navigator.gpu) {
       throw new Error(
@@ -210,6 +213,9 @@ const AVBD3D = {
       );
     }
     gpuContext = await GPUContext.create({ powerPreference: 'high-performance' });
+    gpuContext.onDeviceLost = (msg) => {
+      AVBD3D.onError?.('GPU device lost: ' + msg);
+    };
     gpuAvailable = true;
   },
 
