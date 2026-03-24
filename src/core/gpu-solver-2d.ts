@@ -49,7 +49,7 @@ const CONSTRAINT_STRIDE = 28;
  * [dt, gravity_x, gravity_y, penalty_min, penalty_max, beta,
  *  num_bodies(u32), num_constraints(u32), num_bodies_in_group(u32), is_stabilization(u32)]
  */
-const SOLVER_PARAMS_FLOATS = 10;
+const SOLVER_PARAMS_FLOATS = 12; // 6 floats + alpha + 4 uint32s + padding
 const SOLVER_PARAMS_BYTES = SOLVER_PARAMS_FLOATS * 4;
 const WORKGROUP_SIZE = 64;
 
@@ -332,11 +332,19 @@ export class GPUSolver2D {
       if (body.linearDamping > 0) { const f = 1 / (1 + body.linearDamping * dt); vx *= f; vy *= f; }
       { const totalAngDamp = body.angularDamping + 0.05; omega *= 1 / (1 + totalAngDamp * dt); }
 
+      // Inertial target uses FULL gravity (the optimization objective target).
       body.inertialPosition = {
-        x: body.position.x + vx * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
-        y: body.position.y + vy * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+        x: body.prevPosition.x + vx * dt + gravity.x * body.gravityScale * dt * dt,
+        y: body.prevPosition.y + vy * dt + gravity.y * body.gravityScale * dt * dt,
       };
-      body.inertialAngle = body.angle + omega * dt;
+      body.inertialAngle = body.prevAngle + omega * dt;
+
+      // Move body to predicted position (initial guess for solver).
+      body.position = {
+        x: body.prevPosition.x + vx * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
+        y: body.prevPosition.y + vy * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
+      };
+      body.angle = body.prevAngle + omega * dt;
       body.prevVelocity = { ...body.velocity };
     }
 
@@ -699,10 +707,14 @@ export class GPUSolver2D {
     fv[3] = config.penaltyMin;
     fv[4] = config.penaltyMax;
     fv[5] = config.beta;
-    uv[6] = numBodies;
-    uv[7] = numConstraints;
-    uv[8] = numBodiesInGroup;
-    uv[9] = isStabilization ? 1 : 0;
+    // Per-iteration alpha (reference: solver.cpp):
+    // Normal iterations: alpha=1.0 → C0*(1-1)=0, only J·dp (position changes)
+    // Stabilization: alpha=0.0 → C0*(1-0)=C0, full violation correction
+    fv[6] = isStabilization ? 0.0 : 1.0;
+    uv[7] = numBodies;
+    uv[8] = numConstraints;
+    uv[9] = numBodiesInGroup;
+    uv[10] = isStabilization ? 1 : 0;
     gpuWrite(this.gpu.device.queue, this.solverParamsBuffer, 0, new Uint8Array(data));
   }
 

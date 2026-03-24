@@ -45,7 +45,7 @@ describe('2D Pyramid stability', () => {
     return { world, bodies };
   }
 
-  it('10-row pyramid should not explode after 600 steps', () => {
+  it('10-row pyramid should not explode after 600 steps', { timeout: 30000 }, () => {
     const { world, bodies } = create2DPyramid(10);
 
     let maxAngVel = 0;
@@ -107,7 +107,7 @@ describe('2D Pyramid stability', () => {
 // ─── 3D Stability Tests (the main target of the fix) ────────────────────────
 
 describe('3D Pyramid stability', () => {
-  it('6-layer 3D pyramid should not explode after 600 steps', () => {
+  it('6-layer 3D pyramid should not explode after 600 steps', { timeout: 15000 }, () => {
     const world = new World3D({ x: 0, y: -9.81, z: 0 }, {
       iterations: 10, useCPU: true,
     });

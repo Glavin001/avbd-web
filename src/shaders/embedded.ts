@@ -16,6 +16,7 @@ struct SolverParams {
   penalty_min: f32,
   penalty_max: f32,
   beta: f32,
+  alpha: f32,
   num_bodies: u32,
   num_constraints: u32,
   num_bodies_in_group: u32,
@@ -56,8 +57,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var cr = constraints[idx];
   if (cr.is_active == 0u) { return; }
 
-  // Re-evaluate linearized constraint: C = C0 + J_A·dp_A + J_B·dp_B
-  var c_eval = cr.c0;
+  // Re-evaluate linearized constraint: C = C0*(1-alpha) + J_A·dp_A + J_B·dp_B
+  var c_eval = cr.c0 * (1.0 - params.alpha);
 
   if (cr.body_a >= 0) {
     let ba = u32(cr.body_a) * 20u;
@@ -113,12 +114,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   new_lambda = clamp(new_lambda, cr.fmin, cr.fmax);
   cr.lambda = new_lambda;
 
-  // Conditional penalty ramp: only when constraint is interior.
-  // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
-  // should stay low to avoid stiff angular springs that cause spinning instability.
-  // Normal contact rows have fmin=-inf; friction rows have finite Coulomb bounds.
-  let is_friction = cr.force_type == 0u && cr.fmin > -1e30;
-  if (!is_friction && cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
+  // Conditional penalty ramp: only when constraint is interior (not at bounds).
+  // For normal contacts: ramp when active. For friction: ramp when not sliding.
+  // Reference: manifold.cpp — penalty += beta * |C| when active/sticking
+  if (cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
     cr.penalty += params.beta * abs(c_eval);
   }
   cr.penalty = clamp(cr.penalty, params.penalty_min, params.penalty_max);
@@ -146,10 +145,12 @@ struct SolverParams {
   penalty_min: f32,
   penalty_max: f32,
   beta: f32,
+  alpha: f32,
   num_bodies: u32,
   num_constraints: u32,
   num_bodies_in_group: u32,
   is_stabilization: u32,
+  _pad: u32,
 }
 
 struct ConstraintRow {
@@ -184,8 +185,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var cr = constraints[idx];
   if (cr.is_active == 0u) { return; }
 
-  // Re-evaluate linearized constraint
-  var c_eval = cr.c0;
+  // Re-evaluate linearized constraint: C = C0*(1-alpha) + J*dp
+  var c_eval = cr.c0 * (1.0 - params.alpha);
   if (cr.body_a >= 0) {
     let ba_base = u32(cr.body_a) * 8u;
     c_eval += cr.jacobian_a.x * (body_state[ba_base + 0u] - body_prev[ba_base + 0u])
@@ -210,12 +211,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   new_lambda = clamp(new_lambda, cr.fmin, cr.fmax);
   cr.lambda = new_lambda;
 
-  // Conditional penalty ramp: only when constraint is interior.
-  // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
-  // should stay low to avoid stiff angular springs that cause spinning instability.
-  // Normal contact rows have fmin=-inf; friction rows have finite Coulomb bounds.
-  let is_friction = cr.force_type == 0u && cr.fmin > -1e30;
-  if (!is_friction && cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
+  // Conditional penalty ramp: only when constraint is interior (not at bounds).
+  // For normal contacts: ramp when active. For friction: ramp when not sliding.
+  // Reference: manifold.cpp — penalty += beta * |C| when active/sticking
+  if (cr.lambda > cr.fmin && cr.lambda < cr.fmax) {
     cr.penalty += params.beta * abs(c_eval);
   }
   cr.penalty = clamp(cr.penalty, params.penalty_min, params.penalty_max);
@@ -493,10 +492,12 @@ struct SolverParams {
   penalty_min: f32,
   penalty_max: f32,
   beta: f32,
+  alpha: f32,
   num_bodies: u32,
   num_constraints: u32,
   num_bodies_in_group: u32,
   is_stabilization: u32,
+  _pad: u32,
 }
 
 struct ConstraintRow {
@@ -611,8 +612,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       H_diag = cr.hessian_diag_b.xyz;
     }
 
-    // Evaluate linearized constraint: C = C0 + J_A·dp_A + J_B·dp_B
-    var c_eval = cr.c0;
+    // Evaluate linearized constraint: C = C0*(1-alpha) + J_A·dp_A + J_B·dp_B
+    var c_eval = cr.c0 * (1.0 - params.alpha);
     if (cr.body_a >= 0) {
       let ba_base = u32(cr.body_a) * 8u;
       c_eval += cr.jacobian_a.x * (body_state[ba_base + 0u] - body_prev[ba_base + 0u])
@@ -672,6 +673,7 @@ struct SolverParams {
   penalty_min: f32,
   penalty_max: f32,
   beta: f32,
+  alpha: f32,
   num_bodies: u32,
   num_constraints: u32,
   num_bodies_in_group: u32,
@@ -846,8 +848,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       J[3] = cr.jacobian_b_ang.x; J[4] = cr.jacobian_b_ang.y; J[5] = cr.jacobian_b_ang.z;
     }
 
-    // Full Taylor-series constraint evaluation: C = C0 + J_A·dp_A + J_B·dp_B
-    var c_eval = cr.c0;
+    // Full Taylor-series constraint evaluation: C = C0*(1-alpha) + J_A·dp_A + J_B·dp_B
+    var c_eval = cr.c0 * (1.0 - params.alpha);
     if (cr.body_a >= 0) {
       let ba = u32(cr.body_a) * 20u;
       let bap = u32(cr.body_a) * 14u;

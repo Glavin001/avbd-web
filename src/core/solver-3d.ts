@@ -378,11 +378,12 @@ export class AVBDSolver3D {
       body.prevVelocity.y = body.velocity.y;
       body.prevVelocity.z = body.velocity.z;
 
-      // Inertial position (in-place)
-      const gsFactor = body.gravityScale * gravWeight * dt2;
-      body.inertialPosition.x = body.position.x + body.velocity.x * dt + gravity.x * gsFactor;
-      body.inertialPosition.y = body.position.y + body.velocity.y * dt + gravity.y * gsFactor;
-      body.inertialPosition.z = body.position.z + body.velocity.z * dt + gravity.z * gsFactor;
+      // Inertial target uses FULL gravity (the optimization objective target).
+      // In-place mutation to avoid object allocation.
+      const gsFullDt2 = body.gravityScale * dt2;
+      body.inertialPosition.x = body.prevPosition.x + body.velocity.x * dt + gravity.x * gsFullDt2;
+      body.inertialPosition.y = body.prevPosition.y + body.velocity.y * dt + gravity.y * gsFullDt2;
+      body.inertialPosition.z = body.prevPosition.z + body.velocity.z * dt + gravity.z * gsFullDt2;
 
       // Inertial rotation: integrate angular velocity (inline to avoid allocations)
       const wax = body.angularVelocity.x, way = body.angularVelocity.y, waz = body.angularVelocity.z;
@@ -393,7 +394,8 @@ export class AVBDSolver3D {
         const s = Math.sin(halfAngle) * invWLen;
         const dqw = Math.cos(halfAngle);
         const dqx = wax * s, dqy = way * s, dqz = waz * s;
-        const rw = body.rotation.w, rx = body.rotation.x, ry = body.rotation.y, rz = body.rotation.z;
+        // Quaternion multiply dq * prevRotation (inline)
+        const rw = body.prevRotation.w, rx = body.prevRotation.x, ry = body.prevRotation.y, rz = body.prevRotation.z;
         const nw = dqw * rw - dqx * rx - dqy * ry - dqz * rz;
         const nx = dqw * rx + dqx * rw + dqy * rz - dqz * ry;
         const ny = dqw * ry - dqx * rz + dqy * rw + dqz * rx;
@@ -404,12 +406,26 @@ export class AVBDSolver3D {
         body.inertialRotation.x = nx * invQLen;
         body.inertialRotation.y = ny * invQLen;
         body.inertialRotation.z = nz * invQLen;
+        // Also set body rotation (initial guess uses same rotation integration)
+        body.rotation.w = nw * invQLen;
+        body.rotation.x = nx * invQLen;
+        body.rotation.y = ny * invQLen;
+        body.rotation.z = nz * invQLen;
       } else {
-        body.inertialRotation.w = body.rotation.w;
-        body.inertialRotation.x = body.rotation.x;
-        body.inertialRotation.y = body.rotation.y;
-        body.inertialRotation.z = body.rotation.z;
+        body.inertialRotation.w = body.prevRotation.w;
+        body.inertialRotation.x = body.prevRotation.x;
+        body.inertialRotation.y = body.prevRotation.y;
+        body.inertialRotation.z = body.prevRotation.z;
+        body.rotation.w = body.prevRotation.w;
+        body.rotation.x = body.prevRotation.x;
+        body.rotation.y = body.prevRotation.y;
+        body.rotation.z = body.prevRotation.z;
       }
+      // Move body to predicted position (initial guess, adaptive gravity weight)
+      const gsAdaptDt2 = body.gravityScale * gravWeight * dt2;
+      body.position.x = body.prevPosition.x + body.velocity.x * dt + gravity.x * gsAdaptDt2;
+      body.position.y = body.prevPosition.y + body.velocity.y * dt + gravity.y * gsAdaptDt2;
+      body.position.z = body.prevPosition.z + body.velocity.z * dt + gravity.z * gsAdaptDt2;
     }
 
     const tBI = performance.now();
@@ -422,7 +438,7 @@ export class AVBDSolver3D {
       // Primal update
       for (const body of bodies) {
         if (body.type === RigidBodyType.Fixed) continue;
-        this.primalUpdate3D(body, dt);
+        this.primalUpdate3D(body, dt, isStab);
       }
 
       // Dual update (skip on stabilization)
@@ -538,7 +554,7 @@ export class AVBDSolver3D {
     };
   }
 
-  private primalUpdate3D(body: Body3D, dt: number): void {
+  private primalUpdate3D(body: Body3D, dt: number, isStabilization = false): void {
     const dt2 = dt * dt;
     const n = 6;
 
@@ -583,8 +599,12 @@ export class AVBDSolver3D {
       else if (row.bodyB === body.index) J = row.jacobianB;
       else continue;
 
-      // Evaluate linearized constraint
-      let cEval = row.c0;
+      // Evaluate linearized constraint: C = C0*(1-alpha) + J*dp
+      // Per-iteration alpha (reference: solver.cpp):
+      //   Normal iterations: alpha=1.0 → C0 term vanishes, only J·dp
+      //   Stabilization: alpha=0.0 → full C0 correction
+      const iterAlpha = isStabilization ? 0.0 : 1.0;
+      let cEval = row.c0 * (1 - iterAlpha);
       if (row.bodyA >= 0) {
         const bA = this.bodyStore.bodies[row.bodyA];
         const dpA = vec3Sub(bA.position, bA.prevPosition);
@@ -606,7 +626,11 @@ export class AVBDSolver3D {
         for (let k = 0; k < 6; k++) cEval += row.jacobianB[k] * dthetaB[k];
       }
 
-      let f = row.penalty * cEval + row.lambda;
+      // For soft constraints (finite stiffness), zero lambda in primal update.
+      // Only hard constraints (infinite stiffness) use warmstarted lambda.
+      // Reference: solver.cpp "lambda = isinf(stiffness[i]) ? force->lambda[i] : 0.0f"
+      const lambdaForPrimal = isFinite(row.stiffness) ? 0 : row.lambda;
+      let f = row.penalty * cEval + lambdaForPrimal;
       f = Math.max(row.fmin, Math.min(row.fmax, f));
 
       // RHS += J * f
@@ -650,7 +674,8 @@ export class AVBDSolver3D {
   }
 
   private dualUpdate3D(row: ConstraintRow3D, dt: number): void {
-    let cEval = row.c0;
+    // Dual only runs on non-stabilization iterations, so alpha=1.0 → C0 term vanishes
+    let cEval = 0; // C0*(1-1.0) = 0
     if (row.bodyA >= 0) {
       const bA = this.bodyStore.bodies[row.bodyA];
       const dpA = vec3Sub(bA.position, bA.prevPosition);
@@ -674,16 +699,10 @@ export class AVBDSolver3D {
 
     row.lambda = Math.max(row.fmin, Math.min(row.fmax, row.penalty * cEval + row.lambda));
     // Conditional penalty ramp: only when lambda is interior (not at bounds).
-    // Skip ramping for friction rows (Contact type with finite fmin) — friction penalty
-    // should stay low to avoid stiff angular springs that cause spinning instability.
-    const isFrictionRow = row.type === ForceType.Contact && isFinite(row.fmin);
-    if (!isFrictionRow && row.lambda > row.fmin && row.lambda < row.fmax) {
-      // Cap the per-iteration penalty increase to prevent exponential growth
-      // that causes explosive forces in many-body scenes (pyramids, stacks).
-      // Allow at most 50% growth per iteration (1.5^10 ≈ 57x max per step).
-      const increment = this.config.beta * Math.abs(cEval);
-      const maxIncrement = row.penalty * 0.5;
-      row.penalty += Math.min(increment, maxIncrement);
+    // For normal contacts: ramp when active. For friction: ramp when not sliding.
+    // Reference: manifold.cpp — penalty += beta * |C| when active/sticking
+    if (row.lambda > row.fmin && row.lambda < row.fmax) {
+      row.penalty += this.config.beta * Math.abs(cEval);
     }
     row.penalty = Math.max(this.config.penaltyMin, Math.min(this.config.penaltyMax, row.penalty));
     if (row.penalty > row.stiffness) row.penalty = row.stiffness;

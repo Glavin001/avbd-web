@@ -45,11 +45,11 @@ const BODY_PREV_STRIDE = 14;
  */
 const CONSTRAINT_STRIDE = 36;
 /**
- * SolverParams 3D: 11 fields = 44 bytes
- * [dt, gravity_x, gravity_y, gravity_z, penalty_min, penalty_max, beta,
+ * SolverParams 3D: 12 fields = 48 bytes
+ * [dt, gravity_x, gravity_y, gravity_z, penalty_min, penalty_max, beta, alpha,
  *  num_bodies(u32), num_constraints(u32), num_bodies_in_group(u32), is_stabilization(u32)]
  */
-const SOLVER_PARAMS_FLOATS = 12; // 11 fields + 1 padding for alignment
+const SOLVER_PARAMS_FLOATS = 12;
 const SOLVER_PARAMS_BYTES = SOLVER_PARAMS_FLOATS * 4;
 const WORKGROUP_SIZE = 64;
 
@@ -505,13 +505,14 @@ export class GPUSolver3D {
       body.angularVelocity.y *= angDampFactor;
       body.angularVelocity.z *= angDampFactor;
 
-      // Inertial position (in-place)
-      const gsFactor = body.gravityScale * gravWeight * dt2;
-      body.inertialPosition.x = body.position.x + body.velocity.x * dt + gravity.x * gsFactor;
-      body.inertialPosition.y = body.position.y + body.velocity.y * dt + gravity.y * gsFactor;
-      body.inertialPosition.z = body.position.z + body.velocity.z * dt + gravity.z * gsFactor;
+      // Inertial target uses FULL gravity (the optimization objective target).
+      // In-place mutation to avoid object allocation.
+      const gsFullDt2 = body.gravityScale * dt2;
+      body.inertialPosition.x = body.prevPosition.x + body.velocity.x * dt + gravity.x * gsFullDt2;
+      body.inertialPosition.y = body.prevPosition.y + body.velocity.y * dt + gravity.y * gsFullDt2;
+      body.inertialPosition.z = body.prevPosition.z + body.velocity.z * dt + gravity.z * gsFullDt2;
 
-      // Angular integration
+      // Angular integration (inline to avoid allocations)
       const awx = body.angularVelocity.x, awy = body.angularVelocity.y, awz = body.angularVelocity.z;
       const wLen = Math.sqrt(awx * awx + awy * awy + awz * awz);
       if (wLen > 1e-10) {
@@ -520,8 +521,8 @@ export class GPUSolver3D {
         const s = Math.sin(halfAngle) * invWLen;
         const dqw = Math.cos(halfAngle);
         const dqx = awx * s, dqy = awy * s, dqz = awz * s;
-        // Quaternion multiply dq * rotation (inline)
-        const rw = body.rotation.w, rx = body.rotation.x, ry = body.rotation.y, rz = body.rotation.z;
+        // Quaternion multiply dq * prevRotation (inline)
+        const rw = body.prevRotation.w, rx = body.prevRotation.x, ry = body.prevRotation.y, rz = body.prevRotation.z;
         const nw = dqw * rw - dqx * rx - dqy * ry - dqz * rz;
         const nx = dqw * rx + dqx * rw + dqy * rz - dqz * ry;
         const ny = dqw * ry - dqx * rz + dqy * rw + dqz * rx;
@@ -533,12 +534,26 @@ export class GPUSolver3D {
         body.inertialRotation.x = nx * invQLen;
         body.inertialRotation.y = ny * invQLen;
         body.inertialRotation.z = nz * invQLen;
+        // Move body to predicted position (initial guess for solver, adaptive gravity)
+        body.rotation.w = nw * invQLen;
+        body.rotation.x = nx * invQLen;
+        body.rotation.y = ny * invQLen;
+        body.rotation.z = nz * invQLen;
       } else {
-        body.inertialRotation.w = body.rotation.w;
-        body.inertialRotation.x = body.rotation.x;
-        body.inertialRotation.y = body.rotation.y;
-        body.inertialRotation.z = body.rotation.z;
+        body.inertialRotation.w = body.prevRotation.w;
+        body.inertialRotation.x = body.prevRotation.x;
+        body.inertialRotation.y = body.prevRotation.y;
+        body.inertialRotation.z = body.prevRotation.z;
+        body.rotation.w = body.prevRotation.w;
+        body.rotation.x = body.prevRotation.x;
+        body.rotation.y = body.prevRotation.y;
+        body.rotation.z = body.prevRotation.z;
       }
+      // Move body to predicted position (initial guess, adaptive gravity weight)
+      const gsAdaptDt2 = body.gravityScale * gravWeight * dt2;
+      body.position.x = body.prevPosition.x + body.velocity.x * dt + gravity.x * gsAdaptDt2;
+      body.position.y = body.prevPosition.y + body.velocity.y * dt + gravity.y * gsAdaptDt2;
+      body.position.z = body.prevPosition.z + body.velocity.z * dt + gravity.z * gsAdaptDt2;
       // Save prev velocity in-place
       body.prevVelocity.x = body.velocity.x;
       body.prevVelocity.y = body.velocity.y;
@@ -1067,7 +1082,7 @@ export class GPUSolver3D {
     };
   }
 
-  /** Write solver params uniform (3D: 11 fields + padding) — reuses pre-allocated buffer */
+  /** Write solver params uniform (3D: 12 fields) — reuses pre-allocated buffer */
   private writeParams(
     dt: number, gravity: Vec3, config: SolverConfig,
     numBodies: number, numConstraints: number,
@@ -1082,10 +1097,14 @@ export class GPUSolver3D {
     fv[4] = config.penaltyMin;
     fv[5] = config.penaltyMax;
     fv[6] = config.beta;
-    uv[7] = numBodies;
-    uv[8] = numConstraints;
-    uv[9] = numBodiesInGroup;
-    uv[10] = isStabilization ? 1 : 0;
+    // Per-iteration alpha (reference: solver.cpp):
+    // Normal iterations: alpha=1.0 → C0*(1-1)=0, only J·dp (position changes)
+    // Stabilization: alpha=0.0 → C0*(1-0)=C0, full violation correction
+    fv[7] = isStabilization ? 0.0 : 1.0;
+    uv[8] = numBodies;
+    uv[9] = numConstraints;
+    uv[10] = numBodiesInGroup;
+    uv[11] = isStabilization ? 1 : 0;
     gpuWrite(this.gpu.device.queue, this.solverParamsBuffer, 0, this._paramsU8);
   }
 

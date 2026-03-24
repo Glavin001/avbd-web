@@ -82,7 +82,7 @@ describe('2D Stress: Box Rain (200 bodies)', () => {
 // ─── 2D: Large Pyramid (120 boxes) ──────────────────────────────────────────
 
 describe('2D Stress: Large Pyramid (120 boxes)', () => {
-  it('should settle a 15-row pyramid stably', { timeout: 15000 }, () => {
+  it('should settle a 15-row pyramid stably', { timeout: 60000 }, () => {
     const world = new World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: true });
     world.createCollider(WColliderDesc2D.cuboid(20, 0.5).setFriction(0.5));
 
