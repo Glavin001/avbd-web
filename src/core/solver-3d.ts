@@ -160,7 +160,7 @@ function computeTangent(n: Vec3): Vec3 {
 
 // ─── 6x6 LDL^T Solver ──────────────────────────────────────────────────────
 
-function solveLDL6(A: number[], b: number[]): number[] {
+function solveLDL6(A: ArrayLike<number>, b: ArrayLike<number>): number[] {
   const n = 6;
   const L: number[] = new Array(n * n).fill(0);
   const D: number[] = new Array(n).fill(0);
@@ -213,6 +213,10 @@ export class AVBDSolver3D {
   ignorePairs: Set<string> = new Set();
   jointRows: ConstraintRow3D[] = [];
   lastTimings: StepTimings | null = null;
+
+  // Pooled arrays for primalUpdate3D (avoid per-body per-iteration allocation)
+  private _lhs = new Float64Array(36);
+  private _rhs = new Float64Array(6);
 
   constructor(config: Partial<SolverConfig> = {}) {
     this.config = { ...DEFAULT_SOLVER_CONFIG_3D, ...config };
@@ -313,69 +317,98 @@ export class AVBDSolver3D {
 
     const tWS = performance.now();
 
-    // 4. Initialize bodies
+    // 4. Initialize bodies (in-place mutation to avoid object allocation)
     const MAX_ANG_VEL = 50;
     const MAX_LIN_VEL = 100;
     const gravMag = vec3Length(gravity);
+    const gravDirX = gravMag > 0 ? gravity.x / gravMag : 0;
+    const gravDirY = gravMag > 0 ? gravity.y / gravMag : 0;
+    const gravDirZ = gravMag > 0 ? gravity.z / gravMag : 0;
+    const angDampFactor = 1 / (1 + 0.05 * dt);
+    const dt2 = dt * dt;
 
     for (const body of bodies) {
       if (body.type === RigidBodyType.Fixed) continue;
 
-      // Clamp velocities at step start to prevent explosive inertial predictions
-      const linSpeed = vec3Length(body.velocity);
+      // Clamp velocities at step start
+      const vx = body.velocity.x, vy = body.velocity.y, vz = body.velocity.z;
+      const linSpeed = Math.sqrt(vx * vx + vy * vy + vz * vz);
       if (linSpeed > MAX_LIN_VEL) {
-        body.velocity = vec3Scale(body.velocity, MAX_LIN_VEL / linSpeed);
+        const s = MAX_LIN_VEL / linSpeed;
+        body.velocity.x *= s; body.velocity.y *= s; body.velocity.z *= s;
       }
-      const angSpeed = vec3Length(body.angularVelocity);
+      const awx = body.angularVelocity.x, awy = body.angularVelocity.y, awz = body.angularVelocity.z;
+      const angSpeed = Math.sqrt(awx * awx + awy * awy + awz * awz);
       if (angSpeed > MAX_ANG_VEL) {
-        body.angularVelocity = vec3Scale(body.angularVelocity, MAX_ANG_VEL / angSpeed);
+        const s = MAX_ANG_VEL / angSpeed;
+        body.angularVelocity.x *= s; body.angularVelocity.y *= s; body.angularVelocity.z *= s;
       }
 
-      // Implicit angular damping: prevents contact-induced angular velocity
-      // feedback loops in stacking scenarios (pyramids, multi-body piles).
-      const IMPLICIT_ANGULAR_DAMPING = 0.05;
-      const angDampFactor = 1 / (1 + IMPLICIT_ANGULAR_DAMPING * dt);
-      body.angularVelocity = vec3Scale(body.angularVelocity, angDampFactor);
+      // Implicit angular damping (in-place)
+      body.angularVelocity.x *= angDampFactor;
+      body.angularVelocity.y *= angDampFactor;
+      body.angularVelocity.z *= angDampFactor;
 
-      body.prevPosition = { ...body.position };
-      body.prevRotation = { ...body.rotation };
+      // Save prev state in-place
+      body.prevPosition.x = body.position.x;
+      body.prevPosition.y = body.position.y;
+      body.prevPosition.z = body.position.z;
+      body.prevRotation.w = body.rotation.w;
+      body.prevRotation.x = body.rotation.x;
+      body.prevRotation.y = body.rotation.y;
+      body.prevRotation.z = body.rotation.z;
 
-      // Adaptive gravity weighting (from 2D reference solver):
-      // Bodies under support (nearly stationary) get less gravity in the inertial
-      // estimate, preventing artificial penetrations that cause explosive corrections.
-      // Only apply to slow-moving bodies to avoid creating artificial bounce on impact.
+      // Adaptive gravity weighting
       let gravWeight = 1;
       if (gravMag > 0 && body.prevVelocity) {
-        const speed = vec3Length(body.velocity);
-        // Only reduce gravity for slow-moving bodies (supported/resting).
-        // Fast-moving bodies need full gravity to fall naturally.
+        const speed = Math.sqrt(body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y + body.velocity.z * body.velocity.z);
         if (speed < 0.5) {
           const dvx = body.velocity.x - body.prevVelocity.x;
           const dvy = body.velocity.y - body.prevVelocity.y;
           const dvz = body.velocity.z - body.prevVelocity.z;
           const dvMag = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
           if (dvMag > 0.01) {
-            const gravDir = vec3Scale(gravity, 1 / gravMag);
-            const accelInGravDir = (dvx * gravDir.x + dvy * gravDir.y + dvz * gravDir.z) / dt;
+            const accelInGravDir = (dvx * gravDirX + dvy * gravDirY + dvz * gravDirZ) / dt;
             gravWeight = Math.max(0, Math.min(1, accelInGravDir / gravMag));
           }
         }
       }
-      body.prevVelocity = { ...body.velocity };
+      // Save prev velocity in-place
+      body.prevVelocity.x = body.velocity.x;
+      body.prevVelocity.y = body.velocity.y;
+      body.prevVelocity.z = body.velocity.z;
 
-      body.inertialPosition = {
-        x: body.position.x + body.velocity.x * dt + gravity.x * body.gravityScale * gravWeight * dt * dt,
-        y: body.position.y + body.velocity.y * dt + gravity.y * body.gravityScale * gravWeight * dt * dt,
-        z: body.position.z + body.velocity.z * dt + gravity.z * body.gravityScale * gravWeight * dt * dt,
-      };
-      // Inertial rotation: integrate angular velocity
-      const wLen = vec3Length(body.angularVelocity);
+      // Inertial position (in-place)
+      const gsFactor = body.gravityScale * gravWeight * dt2;
+      body.inertialPosition.x = body.position.x + body.velocity.x * dt + gravity.x * gsFactor;
+      body.inertialPosition.y = body.position.y + body.velocity.y * dt + gravity.y * gsFactor;
+      body.inertialPosition.z = body.position.z + body.velocity.z * dt + gravity.z * gsFactor;
+
+      // Inertial rotation: integrate angular velocity (inline to avoid allocations)
+      const wax = body.angularVelocity.x, way = body.angularVelocity.y, waz = body.angularVelocity.z;
+      const wLen = Math.sqrt(wax * wax + way * way + waz * waz);
       if (wLen > 1e-10) {
-        const axis = vec3Scale(body.angularVelocity, 1 / wLen);
-        const dq = quatFromAxisAngle(axis, wLen * dt);
-        body.inertialRotation = quatNormalize(quatMul(dq, body.rotation));
+        const invWLen = 1 / wLen;
+        const halfAngle = wLen * dt * 0.5;
+        const s = Math.sin(halfAngle) * invWLen;
+        const dqw = Math.cos(halfAngle);
+        const dqx = wax * s, dqy = way * s, dqz = waz * s;
+        const rw = body.rotation.w, rx = body.rotation.x, ry = body.rotation.y, rz = body.rotation.z;
+        const nw = dqw * rw - dqx * rx - dqy * ry - dqz * rz;
+        const nx = dqw * rx + dqx * rw + dqy * rz - dqz * ry;
+        const ny = dqw * ry - dqx * rz + dqy * rw + dqz * rx;
+        const nz = dqw * rz + dqx * ry - dqy * rx + dqz * rw;
+        const qLen = Math.sqrt(nw * nw + nx * nx + ny * ny + nz * nz);
+        const invQLen = 1 / qLen;
+        body.inertialRotation.w = nw * invQLen;
+        body.inertialRotation.x = nx * invQLen;
+        body.inertialRotation.y = ny * invQLen;
+        body.inertialRotation.z = nz * invQLen;
       } else {
-        body.inertialRotation = { ...body.rotation };
+        body.inertialRotation.w = body.rotation.w;
+        body.inertialRotation.x = body.rotation.x;
+        body.inertialRotation.y = body.rotation.y;
+        body.inertialRotation.z = body.rotation.z;
       }
     }
 
@@ -509,8 +542,9 @@ export class AVBDSolver3D {
     const dt2 = dt * dt;
     const n = 6;
 
-    // LHS = M/dt^2 (6x6 diagonal mass matrix)
-    const lhs: number[] = new Array(n * n).fill(0);
+    // LHS = M/dt^2 (6x6 diagonal mass matrix) — reuse pooled array
+    const lhs = this._lhs;
+    lhs.fill(0);
     lhs[0 * n + 0] = body.mass / dt2;
     lhs[1 * n + 1] = body.mass / dt2;
     lhs[2 * n + 2] = body.mass / dt2;
@@ -518,25 +552,27 @@ export class AVBDSolver3D {
     lhs[4 * n + 4] = body.inertia.y / dt2;
     lhs[5 * n + 5] = body.inertia.z / dt2;
 
-    // Position error for RHS
-    const dp = vec3Sub(body.position, body.inertialPosition);
-    // Rotation error: small angle approximation
-    const dq = quatMul(body.rotation, {
-      w: body.inertialRotation.w,
-      x: -body.inertialRotation.x,
-      y: -body.inertialRotation.y,
-      z: -body.inertialRotation.z,
-    });
-    const dtheta: Vec3 = vec3Scale(vec3(dq.x, dq.y, dq.z), 2);
+    // Position error for RHS (inline to avoid vec3Sub allocation)
+    const dpx = body.position.x - body.inertialPosition.x;
+    const dpy = body.position.y - body.inertialPosition.y;
+    const dpz = body.position.z - body.inertialPosition.z;
+    // Rotation error: small angle approximation (inline quatMul)
+    const irw = body.inertialRotation.w, irx = -body.inertialRotation.x;
+    const iry = -body.inertialRotation.y, irz = -body.inertialRotation.z;
+    const rw = body.rotation.w, rx = body.rotation.x, ry = body.rotation.y, rz = body.rotation.z;
+    const dqx = rw * irx + rx * irw + ry * irz - rz * iry;
+    const dqy = rw * iry - rx * irz + ry * irw + rz * irx;
+    const dqz = rw * irz + rx * iry - ry * irx + rz * irw;
+    const dthetaX = 2 * dqx, dthetaY = 2 * dqy, dthetaZ = 2 * dqz;
 
-    const rhs: number[] = [
-      body.mass / dt2 * dp.x,
-      body.mass / dt2 * dp.y,
-      body.mass / dt2 * dp.z,
-      body.inertia.x / dt2 * dtheta.x,
-      body.inertia.y / dt2 * dtheta.y,
-      body.inertia.z / dt2 * dtheta.z,
-    ];
+    const mdt2 = body.mass / dt2;
+    const rhs = this._rhs;
+    rhs[0] = mdt2 * dpx;
+    rhs[1] = mdt2 * dpy;
+    rhs[2] = mdt2 * dpz;
+    rhs[3] = body.inertia.x / dt2 * dthetaX;
+    rhs[4] = body.inertia.y / dt2 * dthetaY;
+    rhs[5] = body.inertia.z / dt2 * dthetaZ;
 
     // Accumulate constraints
     for (const row of this.constraintRows) {
