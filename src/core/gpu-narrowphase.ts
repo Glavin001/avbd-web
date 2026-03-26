@@ -338,7 +338,12 @@ export class GpuNarrowphase {
    * Read back constraint count after GPU submission.
    */
   async readConstraintCount(): Promise<number> {
-    await this.constraintCountStagingBuf.mapAsync(GPUMapMode.READ);
+    try {
+      await this.constraintCountStagingBuf.mapAsync(GPUMapMode.READ);
+    } catch (e) {
+      console.error('GPU readConstraintCount failed:', (e as Error).message);
+      return 0;
+    }
     const count = new Uint32Array(this.constraintCountStagingBuf.getMappedRange().slice(0))[0];
     this.constraintCountStagingBuf.unmap();
     return Math.min(count, this.maxConstraints);

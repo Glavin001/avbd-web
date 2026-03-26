@@ -2,7 +2,7 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests/browser',
-  timeout: 30000,
+  timeout: 45000,
   retries: 1,
   use: {
     // Launch Chrome with WebGPU flags

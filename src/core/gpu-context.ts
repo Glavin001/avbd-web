@@ -91,7 +91,12 @@ export class GPUContext {
     encoder.copyBufferToBuffer(buffer, 0, stagingBuffer, 0, sizeBytes);
     this.device.queue.submit([encoder.finish()]);
 
-    await stagingBuffer.mapAsync(GPUMapMode.READ);
+    try {
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+    } catch (e) {
+      stagingBuffer.destroy();
+      throw new Error(`GPU readBuffer failed (device lost?): ${(e as Error).message}`);
+    }
     const result = stagingBuffer.getMappedRange().slice(0);
     stagingBuffer.unmap();
     stagingBuffer.destroy();

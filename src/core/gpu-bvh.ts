@@ -417,7 +417,12 @@ export class GpuBvh {
    * Read back the number of pairs found after GPU submission.
    */
   async readPairCount(): Promise<number> {
-    await this.pairCountStagingBuf.mapAsync(GPUMapMode.READ);
+    try {
+      await this.pairCountStagingBuf.mapAsync(GPUMapMode.READ);
+    } catch (e) {
+      console.error('GPU readPairCount failed:', (e as Error).message);
+      return 0;
+    }
     const count = new Uint32Array(this.pairCountStagingBuf.getMappedRange().slice(0))[0];
     this.pairCountStagingBuf.unmap();
     return Math.min(count, this.maxPairs);

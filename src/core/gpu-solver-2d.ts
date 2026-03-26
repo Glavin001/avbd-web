@@ -632,7 +632,11 @@ export class GPUSolver2D {
     const mapPromises: Promise<void>[] = [bodyStagingBuffer.mapAsync(GPUMapMode.READ)];
     if (velRecoveryBuffer) mapPromises.push(velRecoveryBuffer.mapAsync(GPUMapMode.READ));
     if (crStagingBuffer && numConstraints > 0) mapPromises.push(crStagingBuffer.mapAsync(GPUMapMode.READ));
-    await Promise.all(mapPromises);
+    try {
+      await Promise.all(mapPromises);
+    } catch (e) {
+      throw new Error(`GPU buffer mapping failed (device lost?): ${(e as Error).message}`);
+    }
     this._stagingMapped = true;
 
     // Read directly from mapped ranges (no .slice(0) copy — we read inline before unmap)
@@ -735,7 +739,11 @@ export class GPUSolver2D {
     enc.copyBufferToBuffer(constraintBuffer, 0, staging, 0, byteSize);
     device.queue.submit([enc.finish()]);
 
-    await staging.mapAsync(GPUMapMode.READ);
+    try {
+      await staging.mapAsync(GPUMapMode.READ);
+    } catch (e) {
+      throw new Error(`GPU constraint readback failed (device lost?): ${(e as Error).message}`);
+    }
     const mapped = staging.getMappedRange();
     const view = new DataView(mapped);
 
