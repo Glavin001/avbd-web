@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html><body>
+<div id="status">Loading...</div>
+<script type="module">
+  import AVBD from '../../src/2d/index.ts';
+  import AVBD3D from '../../src/3d/index.ts';
+  window.AVBD = AVBD;
+  window.AVBD3D = AVBD3D;
+  try {
+    await AVBD.init();
+    try { await AVBD3D.init(); } catch(e) { window.__3dError = e.message; }
+    window.__ready = true;
+    document.getElementById('status').textContent = 'Ready';
+  } catch(e) {
+    window.__error = e.message;
+    window.__ready = true;
+    document.getElementById('status').textContent = 'Error: ' + e.message;
+  }
+</script>
+</body></html>

@@ -87,6 +87,44 @@
       color: #777;
       z-index: 20;
     }
+
+    #error-overlay {
+      display: none;
+      position: fixed;
+      bottom: 60px;
+      left: 12px;
+      right: 12px;
+      max-height: 40vh;
+      overflow-y: auto;
+      background: rgba(140, 20, 20, 0.92);
+      color: #fdd;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-family: 'Courier New', monospace;
+      line-height: 1.5;
+      z-index: 100;
+      border: 1px solid #f44;
+      word-break: break-word;
+    }
+    #error-overlay .error-title {
+      color: #ff6b6b;
+      font-weight: bold;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+    #error-overlay .error-entry {
+      border-top: 1px solid rgba(255,100,100,0.3);
+      padding-top: 4px;
+      margin-top: 4px;
+    }
+    #error-overlay .error-dismiss {
+      float: right;
+      cursor: pointer;
+      color: #faa;
+      font-size: 14px;
+      padding: 0 6px;
+    }
   </style>
 </head>
 <body>
@@ -131,7 +169,33 @@
 
   <div id="hint">Click anywhere to shoot a cube | Scroll to zoom | Drag to orbit</div>
 
+  <div id="error-overlay">
+    <span class="error-dismiss" onclick="this.parentElement.style.display='none'">&times;</span>
+    <div class="error-title">Errors</div>
+    <div id="error-log"></div>
+  </div>
+
   <script type="module">
+    // ── Error display (visible without dev tools, mobile-friendly) ────────────
+    const _errorOverlay = document.getElementById('error-overlay');
+    const _errorLog = document.getElementById('error-log');
+    let _errorCount = 0;
+    const _MAX_ERRORS = 20;
+    function showError(msg) {
+      if (_errorCount >= _MAX_ERRORS) return;
+      _errorCount++;
+      _errorOverlay.style.display = 'block';
+      const div = document.createElement('div');
+      div.className = 'error-entry';
+      div.textContent = (_errorCount > 1 ? `[${_errorCount}] ` : '') + msg;
+      _errorLog.appendChild(div);
+      // Auto-scroll to bottom
+      _errorOverlay.scrollTop = _errorOverlay.scrollHeight;
+    }
+    // Catch unhandled errors and promise rejections
+    window.addEventListener('error', (e) => showError(e.message || String(e)));
+    window.addEventListener('unhandledrejection', (e) => showError(e.reason?.message || String(e.reason)));
+
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import AVBD3D from '../src/3d/index.ts';
@@ -206,11 +270,12 @@
     // ── Physics init ─────────────────────────────────────────────────────────
 
     let gpuMode = false;
+    AVBD3D.onError = (msg) => showError(msg);
     try {
       await AVBD3D.init();
       gpuMode = true;
     } catch (e) {
-      console.log('WebGPU not available, using CPU solver:', e.message);
+      showError('WebGPU init failed: ' + e.message + ' — using CPU solver');
     }
 
     document.getElementById('stat-solver').textContent = gpuMode ? 'GPU' : 'CPU';
@@ -570,14 +635,19 @@
 
     // ── Game loop ────────────────────────────────────────────────────────────
 
+    let _stepErrors = 0;
     async function loop() {
-      requestAnimationFrame(loop);
-
       // Step physics (GPU solver returns a Promise)
       if (world) {
-        const t0 = performance.now();
-        await world.step();
-        stepTimeMs = performance.now() - t0;
+        try {
+          const t0 = performance.now();
+          await world.step();
+          stepTimeMs = performance.now() - t0;
+        } catch (e) {
+          if (++_stepErrors <= 3) {
+            showError('Physics step failed: ' + e.message);
+          }
+        }
       }
 
       // Sync physics to meshes
@@ -625,6 +695,8 @@
           }
         }
       }
+
+      requestAnimationFrame(loop);
     }
 
     // ── Boot ─────────────────────────────────────────────────────────────────
