@@ -78,12 +78,11 @@ describe('Contact caching', () => {
     // Warm-start from cache
     store.warmstartContacts();
 
-    // Should have inherited cached penalty but NOT lambda.
-    // Lambda warmstarting was disabled because cached lambdas from contacts with
-    // different normals create forces in the wrong direction (pyramid instability).
-    expect(store.rows[0].lambda).toBe(0); // Not warmstarted
+    // Both lambda AND penalty are warmstarted per the AVBD paper algorithm.
+    // Stability is maintained by angular damping, velocity clamping, and post-stabilization.
+    expect(store.rows[0].lambda).toBe(-100); // Warmstarted from cache
     expect(store.rows[0].penalty).toBe(8000);
-    expect(store.rows[1].lambda).toBe(0); // Not warmstarted
+    expect(store.rows[1].lambda).toBe(25); // Warmstarted from cache
     expect(store.rows[1].penalty).toBe(3000);
   });
 

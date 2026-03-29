@@ -97,6 +97,7 @@ export class GPUSolver3D {
 
   /** Guard against concurrent step() calls (async game loops can overlap) */
   private _stepping = false;
+  private _destroyed = false;
 
   // GPU collision pipeline (LBVH broadphase + GPU narrowphase + constraint assembly)
   private collisionPipeline: GpuCollisionPipeline | null = null;
@@ -254,6 +255,7 @@ export class GPUSolver3D {
    * Run one physics timestep on the GPU.
    */
   async step(): Promise<void> {
+    if (this._destroyed) return;
     // Prevent concurrent step() calls — async game loops (rAF at top + await step)
     // can overlap, causing staging buffer race conditions (mapped vs unmapped).
     if (this._stepping) return;
@@ -275,6 +277,11 @@ export class GPUSolver3D {
   }
 
   private async _stepImpl(): Promise<void> {
+    if (this._destroyed) return;
+    if (this.gpu.deviceLost) {
+      throw new Error('Cannot step: GPU device has been lost');
+    }
+
     if (!this.initialized) this.init();
 
     const t0 = performance.now();
@@ -326,11 +333,13 @@ export class GPUSolver3D {
         bodies.length, this.bodyStateBuffer, sceneBounds,
         COLLISION_MARGIN, dt, config.penaltyMin, config.alpha,
       );
+      if (this._destroyed) return;
 
       if (collResult.numConstraints > 0) {
         const gpuRows = await this.readbackGpuConstraints3D(
           collResult.constraintBuffer, collResult.numConstraints,
         );
+        if (this._destroyed) return;
         this.constraintRows.push(...gpuRows);
       }
     } else {
@@ -841,6 +850,7 @@ export class GPUSolver3D {
 
     // Check for GPU validation errors — throw so callers can display them
     const validationError = await device.popErrorScope();
+    if (this._destroyed) return;
     if (validationError) {
       throw new Error('GPU validation error: ' + validationError.message);
     }
@@ -867,8 +877,10 @@ export class GPUSolver3D {
     try {
       await Promise.all(mapPromises);
     } catch (e) {
+      if (this._destroyed) return;
       throw new Error(`GPU buffer mapping failed (device lost?): ${(e as Error).message}`);
     }
+    if (this._destroyed) return;
     this._stagingMapped = true;
 
     // Read directly from mapped ranges (no .slice(0) copy needed — we read inline)
@@ -1045,8 +1057,8 @@ export class GPUSolver3D {
         lambda: view.getFloat32(off + 120, true),
         penalty: view.getFloat32(off + 124, true),
         stiffness: view.getFloat32(off + 128, true),
-        fmin: view.getFloat32(off + 132, true),
-        fmax: view.getFloat32(off + 136, true),
+        fmin: view.getFloat32(off + 132, true) <= -1e29 ? -Infinity : view.getFloat32(off + 132, true),
+        fmax: view.getFloat32(off + 136, true) >= 1e29 ? Infinity : view.getFloat32(off + 136, true),
         active: view.getUint32(off + 140, true) !== 0,
         broken: false,
       });
@@ -1257,9 +1269,15 @@ export class GPUSolver3D {
       // Persistent staging buffers for readback (body state + velocity recovery snapshot)
       const MAP_READ_DST = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
       const bodyStagingSize = this.maxBodies * BODY_STRIDE * 4;
-      if (this._bodyStagingBuffer) this._bodyStagingBuffer.destroy();
+      if (this._bodyStagingBuffer) {
+        try { this._bodyStagingBuffer.unmap(); } catch { /* already unmapped */ }
+        this._bodyStagingBuffer.destroy();
+      }
       this._bodyStagingBuffer = device.createBuffer({ size: bodyStagingSize, usage: MAP_READ_DST });
-      if (this._velRecoveryStagingBuffer) this._velRecoveryStagingBuffer.destroy();
+      if (this._velRecoveryStagingBuffer) {
+        try { this._velRecoveryStagingBuffer.unmap(); } catch { /* already unmapped */ }
+        this._velRecoveryStagingBuffer.destroy();
+      }
       this._velRecoveryStagingBuffer = device.createBuffer({ size: bodyStagingSize, usage: MAP_READ_DST });
 
       // Invalidate cached bind groups (buffers changed)
@@ -1278,7 +1296,10 @@ export class GPUSolver3D {
       this._crUploadView = new DataView(this._crUpload);
 
       // Persistent constraint staging buffer for readback
-      if (this._crStagingBuffer) this._crStagingBuffer.destroy();
+      if (this._crStagingBuffer) {
+        try { this._crStagingBuffer.unmap(); } catch { /* already unmapped */ }
+        this._crStagingBuffer.destroy();
+      }
       this._crStagingBuffer = device.createBuffer({
         size: this.maxConstraints * CONSTRAINT_STRIDE * 4,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -1349,6 +1370,7 @@ export class GPUSolver3D {
   }
 
   destroy(): void {
+    this._destroyed = true;
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
       this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
       this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer,

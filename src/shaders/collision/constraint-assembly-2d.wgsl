@@ -2,8 +2,8 @@
 // Converts contact points from narrow phase into solver constraint rows.
 // Each contact generates 2 rows: normal (non-penetration) + friction (tangent).
 //
-// Contact input format (8 u32s per contact):
-//   [bodyA, bodyB, featureId, _pad, normal_x, normal_y, depth, mu]
+// Contact input format (10 u32s per contact):
+//   [bodyA, bodyB, featureId, _pad, normal_x, normal_y, depth, mu, cpx, cpy]
 //
 // Constraint output format (28 floats per row, matching existing primal/dual):
 //   [bodyA(i32), bodyB(i32), forceType(u32), _pad(u32),
@@ -33,7 +33,7 @@ struct AssemblyParams {
 @group(0) @binding(8) var<storage, read_write> warmstart_age: array<u32>;
 
 const BODY_STRIDE: u32 = 8u;
-const CONTACT_STRIDE: u32 = 8u;
+const CONTACT_STRIDE: u32 = 10u;
 const CONSTRAINT_STRIDE: u32 = 28u;
 const FORCE_TYPE_CONTACT: u32 = 0u;
 
@@ -137,7 +137,7 @@ fn constraint_assembly_2d(
     return;
   }
 
-  // Check if this contact is valid (bodyA != 0xFFFFFFFF sentinel)
+  // Check if this contact is valid (bodyA == 0xFFFFFFFF sentinel for cleared slots)
   let bodyA_u32 = load_contact_u32(contact_idx, 0u);
   if (bodyA_u32 == 0xFFFFFFFFu) {
     return;
@@ -158,12 +158,9 @@ fn constraint_assembly_2d(
   let posB_x = body_state[u32(bodyB) * BODY_STRIDE + 0u];
   let posB_y = body_state[u32(bodyB) * BODY_STRIDE + 1u];
 
-  // Compute contact point (midpoint along normal at depth)
-  // Contact point approximation: posA + depth/2 * normal
-  // Actually, we use the body positions directly for the lever arm
-  // The contact point is between the bodies along the normal
-  let cpx = (posA_x + posB_x) * 0.5;
-  let cpy = (posA_y + posB_y) * 0.5;
+  // Read actual contact position from narrowphase output
+  let cpx = load_contact_f32(contact_idx, 8u);
+  let cpy = load_contact_f32(contact_idx, 9u);
 
   // Lever arms
   let rA_x = cpx - posA_x;

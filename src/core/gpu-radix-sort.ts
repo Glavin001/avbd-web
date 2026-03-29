@@ -29,7 +29,9 @@ export class GpuRadixSort {
   private valsA!: GPUBuffer;
   private valsB!: GPUBuffer;
   private histogramBuf!: GPUBuffer;
-  private paramsBuf!: GPUBuffer;
+  // One params buffer per digit pass — writeBuffer on queue timeline
+  // completes before submit, so a single shared buffer would be overwritten.
+  private paramsBufs!: GPUBuffer[];
   private capacity = 0;
   private maxWorkgroups = 0;
 
@@ -68,10 +70,13 @@ export class GpuRadixSort {
       compute: { module: shaderModule, entryPoint: 'radix_scatter' },
     });
 
-    this.paramsBuf = device.createBuffer({
-      size: 16, // 4 u32s
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+    this.paramsBufs = [];
+    for (let d = 0; d < NUM_DIGITS; d++) {
+      this.paramsBufs.push(device.createBuffer({
+        size: 16, // 4 u32s
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      }));
+    }
   }
 
   /**
@@ -136,10 +141,16 @@ export class GpuRadixSort {
     encoder.copyBufferToBuffer(keysBuffer, 0, this.keysA, 0, n * 4);
     encoder.copyBufferToBuffer(valsBuffer, 0, this.valsA, 0, n * 4);
 
-    // Params data (reusable typed array)
+    // Upload params for each digit pass BEFORE recording compute passes.
+    // Each digit needs its own buffer because all writeBuffer calls complete
+    // before the command buffer executes.
     const paramsData = new Uint32Array(4);
     paramsData[0] = n;
     paramsData[2] = numWG;
+    for (let d = 0; d < NUM_DIGITS; d++) {
+      paramsData[1] = d * 4; // digit_shift
+      (device.queue as any).writeBuffer(this.paramsBufs[d], 0, paramsData);
+    }
 
     let readKeys = this.keysA;
     let readVals = this.valsA;
@@ -147,13 +158,10 @@ export class GpuRadixSort {
     let writeVals = this.valsB;
 
     for (let digit = 0; digit < NUM_DIGITS; digit++) {
-      paramsData[1] = digit * 4; // digit_shift
-      (device.queue as any).writeBuffer(this.paramsBuf, 0, paramsData);
-
       const bindGroup = device.createBindGroup({
         layout: this.bindGroupLayout,
         entries: [
-          { binding: 0, resource: { buffer: this.paramsBuf } },
+          { binding: 0, resource: { buffer: this.paramsBufs[digit] } },
           { binding: 1, resource: { buffer: readKeys } },
           { binding: 2, resource: { buffer: readVals } },
           { binding: 3, resource: { buffer: writeKeys } },
@@ -244,6 +252,6 @@ export class GpuRadixSort {
     this.valsA?.destroy();
     this.valsB?.destroy();
     this.histogramBuf?.destroy();
-    this.paramsBuf?.destroy();
+    this.paramsBufs?.forEach(b => b.destroy());
   }
 }

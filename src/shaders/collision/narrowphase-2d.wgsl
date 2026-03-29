@@ -59,17 +59,18 @@ fn collider_friction(idx: u32) -> f32 {
 }
 
 // ─── Contact output helpers ─────────────────────────────────────────────────
-// Contact format: 8 u32s = [bodyA, bodyB, featureId, _pad, nx, ny, depth, mu]
+// Contact format: 10 u32s = [bodyA, bodyB, featureId, _pad, nx, ny, depth, mu, cpx, cpy]
 
 fn emit_contact(
   body_a: u32, body_b: u32, feature_id: u32,
   normal: vec2<f32>, depth: f32, mu: f32,
+  contact_pos: vec2<f32>,
 ) {
   let slot = atomicAdd(&contact_count[0], 1u);
   if (slot >= params.max_contacts) {
     return;
   }
-  let base = slot * 8u;
+  let base = slot * 10u;
   contact_buffer[base + 0u] = body_a;
   contact_buffer[base + 1u] = body_b;
   contact_buffer[base + 2u] = feature_id;
@@ -78,6 +79,8 @@ fn emit_contact(
   contact_buffer[base + 5u] = bitcast<u32>(normal.y);
   contact_buffer[base + 6u] = bitcast<u32>(depth);
   contact_buffer[base + 7u] = bitcast<u32>(mu);
+  contact_buffer[base + 8u] = bitcast<u32>(contact_pos.x);
+  contact_buffer[base + 9u] = bitcast<u32>(contact_pos.y);
 }
 
 // ─── 2D rotation helpers ────────────────────────────────────────────────────
@@ -299,7 +302,7 @@ fn collide_box_box(
     // Fallback: midpoint contact
     let mid = (pos_a + pos_b) * 0.5;
     let feature_id = (ref_box << 4u) | (best_axis_idx << 2u);
-    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu);
+    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu, mid);
     return;
   }
 
@@ -309,7 +312,7 @@ fn collide_box_box(
   if (clipped.count < 2u) {
     let mid = (pos_a + pos_b) * 0.5;
     let feature_id = (ref_box << 4u) | (best_axis_idx << 2u);
-    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu);
+    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu, mid);
     return;
   }
 
@@ -331,7 +334,7 @@ fn collide_box_box(
       let contact_normal = select(best_axis, -best_axis, flip);
       // Feature ID: (ref_box << 4) | (axis_index << 2) | clip_vertex_index
       let feature_id = (ref_box << 4u) | (best_axis_idx << 2u) | i;
-      emit_contact(idx_a, idx_b, feature_id, best_axis, contact_depth + COLLISION_MARGIN, mu);
+      emit_contact(idx_a, idx_b, feature_id, best_axis, contact_depth + COLLISION_MARGIN, mu, p);
       emitted += 1u;
     }
   }
@@ -340,7 +343,7 @@ fn collide_box_box(
   if (emitted == 0u) {
     let mid = (pos_a + pos_b) * 0.5;
     let feature_id = (ref_box << 4u) | (best_axis_idx << 2u);
-    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu);
+    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu, mid);
   }
 }
 
@@ -410,8 +413,14 @@ fn collide_box_circle(
     out_b = circle_idx;
   }
 
+  // Contact point: closest point on box surface to circle center (in world space)
+  let closest_world = box_pos + rotate2d(closest, ca, sa);
+  // Contact point is midpoint between closest point on box and closest point on circle surface
+  let circle_surface = circle_pos - outward * radius;
+  let cp = (closest_world + circle_surface) * 0.5;
+
   let feature_id = 0x100u; // box-circle marker
-  emit_contact(out_a, out_b, feature_id, manifold_normal, contact_depth + COLLISION_MARGIN, mu);
+  emit_contact(out_a, out_b, feature_id, manifold_normal, contact_depth + COLLISION_MARGIN, mu, cp);
 }
 
 // ─── Circle-Circle 2D ───────────────────────────────────────────────────────
@@ -440,8 +449,12 @@ fn collide_circle_circle(
   }
 
   let depth = combined - dist + COLLISION_MARGIN;
+  // Contact point: midpoint between the two circle surfaces along the center line
+  let cp_a = pos_a - normal * radius_a;
+  let cp_b = pos_b + normal * radius_b;
+  let cp = (cp_a + cp_b) * 0.5;
   let feature_id = 0x200u; // circle-circle marker
-  emit_contact(idx_a, idx_b, feature_id, normal, depth, mu);
+  emit_contact(idx_a, idx_b, feature_id, normal, depth, mu, cp);
 }
 
 // ─── Main entry point ───────────────────────────────────────────────────────

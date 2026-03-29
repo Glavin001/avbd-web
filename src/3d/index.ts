@@ -150,6 +150,13 @@ export class World3D {
   }
 
   get rawSolver(): GPUSolver3D | AVBDSolver3D { return this.activeSolver; }
+
+  /** Destroy the world and release all GPU resources. */
+  destroy(): void {
+    this.gpuSolver?.destroy();
+    this.gpuSolver = null;
+    this.cpuSolver = null;
+  }
 }
 
 export class RigidBody3D {

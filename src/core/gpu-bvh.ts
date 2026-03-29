@@ -71,6 +71,8 @@ export class GpuBvh {
   private capacity = 0;
   private maxPairs = 0;
   private aabbStride: number; // 4 for 2D, 6 for 3D
+  private _lastSortedVals: GPUBuffer | null = null;
+  private _lastSortedKeys: GPUBuffer | null = null;
 
   /** Pre-allocated typed arrays for params upload. */
   private mortonParamsData!: Float32Array;
@@ -221,8 +223,9 @@ export class GpuBvh {
     this.nodeAabbBuf = device.createBuffer({ size: totalNodes * stride * 4, usage: storage });
     this.visitCountBuf = device.createBuffer({ size: numInternal * 4, usage: storage });
 
-    // Pair buffer: estimate max 8 pairs per body
-    this.maxPairs = cap * 8;
+    // Pair buffer: dense scenes (pyramids, piles) can have many AABB overlaps per body.
+    // Use a generous estimate to avoid silent pair loss.
+    this.maxPairs = Math.max(cap * 32, 4096);
     this.pairBuf = device.createBuffer({ size: this.maxPairs * 2 * 4, usage: storage });
     this.pairCountBuf = device.createBuffer({ size: 4, usage: storage });
     this.pairCountStagingBuf = device.createBuffer({
@@ -311,6 +314,8 @@ export class GpuBvh {
 
     // ─── 2. Radix Sort ───
     const { sortedKeys, sortedVals } = this.radixSort.sort(encoder, n, this.mortonBuf, this.indexBuf);
+    this._lastSortedVals = sortedVals;
+    this._lastSortedKeys = sortedKeys;
 
     // ─── 3. BVH Build (Karras topology) ───
     if (numInternal > 0) {
@@ -428,11 +433,91 @@ export class GpuBvh {
     return Math.min(count, this.maxPairs);
   }
 
+  /** Read back actual pair buffer contents for diagnostics. */
+  async readPairBuffer(numPairs: number): Promise<Array<[number, number]>> {
+    const device = this.ctx.device;
+    const byteSize = numPairs * 2 * 4;
+    const staging = device.createBuffer({
+      size: byteSize,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.pairBuf, 0, staging, 0, byteSize);
+    device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const data = new Uint32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    const pairs: Array<[number, number]> = [];
+    for (let i = 0; i < numPairs; i++) {
+      pairs.push([data[i * 2], data[i * 2 + 1]]);
+    }
+    return pairs;
+  }
+
   /** Get the pair buffer for use in narrowphase. */
   getPairBuffer(): GPUBuffer { return this.pairBuf; }
 
   /** Get the AABB buffer. */
   getAabbBuffer(): GPUBuffer { return this.aabbBuf; }
+
+  /** Read back all BVH diagnostic data for debugging. */
+  async readDiagnostics(n: number): Promise<{
+    aabbs: Float32Array;
+    nodeAabbs: Float32Array;
+    sortedIndices: Uint32Array;
+    sortedKeys: Uint32Array;
+    mortonCodes: Uint32Array;
+    leftChildren: Int32Array;
+    rightChildren: Int32Array;
+    parents: Int32Array;
+    visitCounts: Uint32Array;
+  }> {
+    const device = this.ctx.device;
+    const stride = this.aabbStride;
+    const numInternal = n - 1;
+    const totalNodes = n + numInternal;
+
+    const readBuffer = async (src: GPUBuffer, size: number): Promise<ArrayBuffer> => {
+      const staging = device.createBuffer({
+        size,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(src, 0, staging, 0, size);
+      device.queue.submit([enc.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const data = staging.getMappedRange().slice(0);
+      staging.unmap();
+      staging.destroy();
+      return data;
+    };
+
+    const [aabbData, nodeAabbData, sortedData, sortedKeysData, mortonData, leftData, rightData, parentData, visitData] =
+      await Promise.all([
+        readBuffer(this.aabbBuf, n * stride * 4),
+        readBuffer(this.nodeAabbBuf, totalNodes * stride * 4),
+        readBuffer(this._lastSortedVals ?? this.indexBuf, n * 4),
+        readBuffer(this._lastSortedKeys ?? this.mortonBuf, n * 4),
+        readBuffer(this.mortonBuf, n * 4),
+        readBuffer(this.leftChildBuf, numInternal * 4),
+        readBuffer(this.rightChildBuf, numInternal * 4),
+        readBuffer(this.parentBuf, totalNodes * 4),
+        readBuffer(this.visitCountBuf, numInternal * 4),
+      ]);
+
+    return {
+      aabbs: new Float32Array(aabbData),
+      nodeAabbs: new Float32Array(nodeAabbData),
+      sortedIndices: new Uint32Array(sortedData),
+      sortedKeys: new Uint32Array(sortedKeysData),
+      mortonCodes: new Uint32Array(mortonData),
+      leftChildren: new Int32Array(leftData),
+      rightChildren: new Int32Array(rightData),
+      parents: new Int32Array(parentData),
+      visitCounts: new Uint32Array(visitData),
+    };
+  }
 
   destroy(): void {
     this.radixSort.destroy();

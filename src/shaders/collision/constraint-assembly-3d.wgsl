@@ -166,7 +166,7 @@ fn constraint_assembly_3d(
     return;
   }
 
-  // Check if this contact is valid
+  // Check if this contact is valid (bodyA == 0xFFFFFFFF sentinel for cleared slots)
   let bodyA_u32 = load_contact_u32(contact_idx, 0u);
   if (bodyA_u32 == 0xFFFFFFFFu) {
     return;

@@ -70,10 +70,15 @@ export class GPUSolver2D {
   jointConstraintIndices: number[] = [];
   colorGroups: ColorGroup[] = [];
   lastTimings: StepTimings | null = null;
+  private _lastNumPairs = 0;
+  private _lastPairBuffer: Array<[number, number]> | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private _lastBvhDiagnostics: any = null;
 
   private gpu: GPUContext;
   private initialized = false;
   private _stepping = false;
+  private _destroyed = false;
 
   // GPU collision pipeline (LBVH broadphase + GPU narrowphase + constraint assembly)
   private collisionPipeline: GpuCollisionPipeline | null = null;
@@ -203,6 +208,7 @@ export class GPUSolver2D {
    * Run one physics timestep on the GPU.
    */
   async step(): Promise<void> {
+    if (this._destroyed) return;
     if (!this.initialized) await this.init();
     // Prevent concurrent step() calls — with async GPU readback, rAF at top of loop
     // can overlap, causing staging buffer race conditions.
@@ -222,6 +228,11 @@ export class GPUSolver2D {
   }
 
   private async _stepImpl(): Promise<void> {
+    if (this._destroyed) return;
+    if (this.gpu.deviceLost) {
+      throw new Error('Cannot step: GPU device has been lost');
+    }
+
     const t0 = performance.now();
     const { config, bodyStore, constraintStore, gpu } = this;
     const dt = config.dt;
@@ -233,6 +244,7 @@ export class GPUSolver2D {
 
     // ─── 1. Collision Detection ─────────────────────────────────
     constraintStore.clearContacts();
+    let gpuNumPairs = 0;
 
     if (this.collisionPipeline) {
       // GPU collision path: LBVH broadphase + GPU narrowphase + constraint assembly
@@ -261,11 +273,20 @@ export class GPUSolver2D {
         bodies.length, this.bodyStateBuffer, sceneBounds,
         COLLISION_MARGIN, dt, config.penaltyMin, config.alpha,
       );
+      if (this._destroyed) return;
+      gpuNumPairs = collResult.numPairs;
+      this._lastNumPairs = collResult.numPairs;
+      // Store pair buffer and BVH diagnostics
+      if (collResult.numPairs >= 0 && collResult.numPairs < 500) {
+        this._lastPairBuffer = await this.collisionPipeline!.readPairBuffer(Math.max(collResult.numPairs, 0));
+        this._lastBvhDiagnostics = await this.collisionPipeline!.readBvhDiagnostics(bodies.length);
+      }
 
       if (collResult.numConstraints > 0) {
         const gpuRows = await this.readbackGpuConstraints2D(
           collResult.constraintBuffer, collResult.numConstraints,
         );
+        if (this._destroyed) return;
         constraintStore.addRows(gpuRows);
       }
     } else {
@@ -609,6 +630,7 @@ export class GPUSolver2D {
 
     // Check for GPU validation errors — throw so callers can display them
     const validationError = await device.popErrorScope();
+    if (this._destroyed) return;
     if (validationError) {
       throw new Error('GPU validation error: ' + validationError.message);
     }
@@ -635,8 +657,10 @@ export class GPUSolver2D {
     try {
       await Promise.all(mapPromises);
     } catch (e) {
+      if (this._destroyed) return;
       throw new Error(`GPU buffer mapping failed (device lost?): ${(e as Error).message}`);
     }
+    if (this._destroyed) return;
     this._stagingMapped = true;
 
     // Read directly from mapped ranges (no .slice(0) copy — we read inline before unmap)
@@ -713,6 +737,7 @@ export class GPUSolver2D {
       readback: tEnd - tDispatch,
       numBodies: bodies.length,
       numConstraints: constraintStore.rows.length,
+      numPairs: gpuNumPairs,
     };
   }
 
@@ -780,8 +805,8 @@ export class GPUSolver2D {
         lambda: view.getFloat32(off + 88, true),
         penalty: view.getFloat32(off + 92, true),
         stiffness: view.getFloat32(off + 96, true),
-        fmin: view.getFloat32(off + 100, true),
-        fmax: view.getFloat32(off + 104, true),
+        fmin: view.getFloat32(off + 100, true) <= -1e29 ? -Infinity : view.getFloat32(off + 100, true),
+        fmax: view.getFloat32(off + 104, true) >= 1e29 ? Infinity : view.getFloat32(off + 104, true),
         fractureThreshold: 0,
         active: view.getUint32(off + 108, true) !== 0,
         broken: false,
@@ -869,9 +894,15 @@ export class GPUSolver2D {
 
       // Persistent staging buffers for readback (body state + velocity recovery snapshot)
       const bodyStagingSize = this.maxBodies * BODY_STRIDE * 4;
-      if (this._bodyStagingBuffer) this._bodyStagingBuffer.destroy();
+      if (this._bodyStagingBuffer) {
+        try { this._bodyStagingBuffer.unmap(); } catch { /* already unmapped */ }
+        this._bodyStagingBuffer.destroy();
+      }
       this._bodyStagingBuffer = device.createBuffer({ size: bodyStagingSize, usage: MAP_READ_DST });
-      if (this._velRecoveryStagingBuffer) this._velRecoveryStagingBuffer.destroy();
+      if (this._velRecoveryStagingBuffer) {
+        try { this._velRecoveryStagingBuffer.unmap(); } catch { /* already unmapped */ }
+        this._velRecoveryStagingBuffer.destroy();
+      }
       this._velRecoveryStagingBuffer = device.createBuffer({ size: bodyStagingSize, usage: MAP_READ_DST });
     }
 
@@ -881,7 +912,10 @@ export class GPUSolver2D {
       this.constraintBuffer = device.createBuffer({ size: this.maxConstraints * CONSTRAINT_STRIDE * 4, usage: STORAGE });
 
       // Persistent constraint staging buffer for readback
-      if (this._crStagingBuffer) this._crStagingBuffer.destroy();
+      if (this._crStagingBuffer) {
+        try { this._crStagingBuffer.unmap(); } catch { /* already unmapped */ }
+        this._crStagingBuffer.destroy();
+      }
       this._crStagingBuffer = device.createBuffer({
         size: this.maxConstraints * CONSTRAINT_STRIDE * 4,
         usage: MAP_READ_DST,
@@ -897,6 +931,7 @@ export class GPUSolver2D {
   }
 
   destroy(): void {
+    this._destroyed = true;
     for (const buf of [this.bodyStateBuffer, this.bodyPrevBuffer, this.constraintBuffer,
       this.solverParamsBuffer, this.frictionParamsBuffer, this.colorIndicesBuffer,
       this.bodyConstraintRangesBuffer, this.constraintIndicesBuffer,

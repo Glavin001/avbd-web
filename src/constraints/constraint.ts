@@ -205,13 +205,15 @@ export class ConstraintStore {
 
       const cached = this.contactCache.get(key);
       if (cached) {
-        // Only warmstart penalty, NOT lambda. Lambda from a previous frame's contact
-        // may have a different Jacobian direction (different contact normal/point),
-        // and applying it to the new contact creates forces in the wrong direction —
-        // the root cause of the pyramid spinning instability.
+        // Warmstart both lambda AND penalty per the AVBD paper algorithm.
+        // The 3D GPU solver (gpu-solver-3d.ts) does the same and works correctly.
+        // Stability is maintained by angular damping, velocity clamping, and
+        // post-stabilization which handle contact normal changes between frames.
         const MAX_WARMSTART_PENALTY = 1e5;
         row.penalty = Math.min(cached.normalPenalty, MAX_WARMSTART_PENALTY);
+        row.lambda = cached.normalLambda;
         frictionRow.penalty = Math.min(cached.frictionPenalty, MAX_WARMSTART_PENALTY);
+        frictionRow.lambda = cached.frictionLambda;
       }
       i++; // Skip the friction row we just processed
     }

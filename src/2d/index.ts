@@ -220,6 +220,17 @@ export class World {
     return this.gpuSolver?.lastTimings ?? this.solver.lastTimings;
   }
 
+  /** Diagnostic: get the last BVH pair buffer contents */
+  get lastPairBuffer(): Array<[number, number]> | null {
+    return (this.gpuSolver as any)?._lastPairBuffer ?? null;
+  }
+
+  /** Diagnostic: get last BVH diagnostics */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  get lastBvhDiagnostics(): any {
+    return (this.gpuSolver as any)?._lastBvhDiagnostics ?? null;
+  }
+
   /** Get all body states as a flat Float32Array [x, y, angle, ...] */
   getBodyStates(): Float32Array {
     const bodies = this.solver.bodyStore.bodies;
@@ -262,6 +273,12 @@ export class World {
   /** Get the underlying solver (for advanced usage) */
   get rawSolver(): AVBDSolver2D {
     return this.solver;
+  }
+
+  /** Destroy the world and release all GPU resources. */
+  destroy(): void {
+    this.gpuSolver?.destroy();
+    this.gpuSolver = null;
   }
 
   private regenerateJointConstraints(): void {

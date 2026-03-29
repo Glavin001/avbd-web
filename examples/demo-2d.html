@@ -276,6 +276,7 @@
     let gpuMode = false;
     let paused  = false;
     let _stepErrors = 0;
+    let _sceneReady = false;
 
     // ── Test hooks (for E2E assertions via Playwright) ───────────────
     window.__avbd = {
@@ -290,7 +291,7 @@
       getBodyCount: () => bodies.length,
       getMode: () => gpuMode ? 'GPU' : 'CPU',
       getStepErrors: () => _stepErrors,
-      isWorldReady: () => world !== null,
+      isWorldReady: () => world !== null && _sceneReady,
     };
 
     // ====================================================================
@@ -298,7 +299,8 @@
     // ====================================================================
 
     function createWorld() {
-      world  = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: true });
+      if (world) { world.destroy(); world = null; }
+      world  = new AVBD.World({ x: 0, y: -9.81 }, { iterations: 10, postStabilize: true, useGPUCollision: true });
       bodies = [];
       joints = [];
       gpuMode = (gpuStatus === 'GPU');
@@ -733,8 +735,11 @@
     };
 
     function loadScene(name) {
+      _sceneReady = false;
+      _stepErrors = 0;
       createWorld();
       if (SCENES[name]) SCENES[name]();
+      _sceneReady = true;
     }
 
     // ====================================================================

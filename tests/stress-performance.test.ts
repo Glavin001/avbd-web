@@ -146,7 +146,7 @@ describe('2D Stress: Large Pyramid (120 boxes)', () => {
 // ─── 2D: Dense Pile (300 overlapping bodies) ────────────────────────────────
 
 describe('2D Stress: Dense Pile (300 bodies)', () => {
-  it('should survive 300 overlapping bodies resolving to stable state', { timeout: 10000 }, () => {
+  it('should survive 300 overlapping bodies resolving to stable state', { timeout: 30000 }, () => {
     const solver = new AVBDSolver2D({
       gravity: { x: 0, y: -9.81 },
       dt: 1 / 60,

@@ -2,15 +2,12 @@
  * Pyramid and stack stability acceptance tests.
  *
  * These tests detect the explosive instability where boxes start spinning
- * and flying apart in stacking scenes. The 3D solver has been fixed with:
+ * and flying apart in stacking scenes. Both 2D and 3D solvers are stabilized with:
+ * - Lambda + penalty warmstarting per AVBD paper (enables inter-frame convergence)
  * - Adaptive gravity weighting (prevents artificial penetrations)
  * - Linear + angular velocity clamping (prevents explosive inertial predictions)
  * - Per-iteration penalty growth cap (prevents exponential penalty escalation)
  * - Implicit angular damping (prevents solver-artifact angular velocity amplification)
- *
- * The 2D solver still has a known instability in large pyramids (>5 rows)
- * where angular velocity feedback loops cause boxes to spin and escape.
- * Tests for 2D use more lenient thresholds until this is resolved.
  */
 import { describe, it, expect } from 'vitest';
 import { World, RigidBodyDesc2D, ColliderDesc2D } from '../src/2d/index.js';
@@ -62,9 +59,9 @@ describe('2D Pyramid stability', () => {
       if (p.y > 40 || p.y < -10 || Math.abs(p.x) > 20) escaped++;
     }
 
-    // Some edge boxes may naturally fall off during settling, but the structure
-    // should not explode (previously 29+ escaped with the spinning instability).
-    expect(escaped).toBeLessThan(15);
+    // With lambda warmstarting re-enabled (per AVBD paper), the pyramid should be
+    // fully stable. No boxes should escape.
+    expect(escaped).toBe(0);
     // Angular velocity may spike briefly during initial settling but the key
     // metric is that bodies don't escape (previously 29+ did with the instability).
     expect(maxAngVel).toBeLessThanOrEqual(50);

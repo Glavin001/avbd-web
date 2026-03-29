@@ -158,6 +158,11 @@ export const BVH_REFIT_2D_WGSL = `// Bottom-up AABB refit for 2D BVH.
 // One thread per leaf. Each leaf writes its AABB, then walks up the parent
 // chain using atomic visit counts to ensure each internal node is processed
 // exactly once (by the second visitor).
+//
+// node_aabb uses atomic<u32> with bitcast<f32/u32> to ensure cross-thread
+// visibility of AABB writes within the same compute pass. This is required
+// for correctness on software GPU backends (SwiftShader) where non-atomic
+// storage writes may not be flushed before/after atomic counter operations.
 
 struct Params {
   num_leaves:   u32,
@@ -177,17 +182,26 @@ struct Params {
 
 @group(0) @binding(5) var<uniform> params: Params;
 
-// Output: node AABBs for all 2N-1 nodes, 4 floats each
+// Output: node AABBs for all 2N-1 nodes, 4 u32 (bitcast f32) each
 // Layout: [internal_0, internal_1, ..., internal_{N-2}, leaf_0, leaf_1, ..., leaf_{N-1}]
-@group(0) @binding(6) var<storage, read_write> node_aabb: array<f32>;
+// Uses atomic<u32> to ensure cross-thread visibility during bottom-up refit.
+@group(0) @binding(6) var<storage, read_write> node_aabb: array<atomic<u32>>;
 
 // Atomic visit counters for internal nodes (size N-1), initialised to 0
 @group(0) @binding(7) var<storage, read_write> visit_count: array<atomic<u32>>;
 
-fn load_node_aabb_min_x(node: u32) -> f32 { return node_aabb[node * 4u + 0u]; }
-fn load_node_aabb_min_y(node: u32) -> f32 { return node_aabb[node * 4u + 1u]; }
-fn load_node_aabb_max_x(node: u32) -> f32 { return node_aabb[node * 4u + 2u]; }
-fn load_node_aabb_max_y(node: u32) -> f32 { return node_aabb[node * 4u + 3u]; }
+fn store_aabb(node: u32, min_x: f32, min_y: f32, max_x: f32, max_y: f32) {
+  let base = node * 4u;
+  atomicStore(&node_aabb[base + 0u], bitcast<u32>(min_x));
+  atomicStore(&node_aabb[base + 1u], bitcast<u32>(min_y));
+  atomicStore(&node_aabb[base + 2u], bitcast<u32>(max_x));
+  atomicStore(&node_aabb[base + 3u], bitcast<u32>(max_y));
+}
+
+fn load_aabb_min_x(node: u32) -> f32 { return bitcast<f32>(atomicLoad(&node_aabb[node * 4u + 0u])); }
+fn load_aabb_min_y(node: u32) -> f32 { return bitcast<f32>(atomicLoad(&node_aabb[node * 4u + 1u])); }
+fn load_aabb_max_x(node: u32) -> f32 { return bitcast<f32>(atomicLoad(&node_aabb[node * 4u + 2u])); }
+fn load_aabb_max_y(node: u32) -> f32 { return bitcast<f32>(atomicLoad(&node_aabb[node * 4u + 3u])); }
 
 fn get_node_index_for_child(child: i32, num_internal: u32) -> u32 {
   // child >= 0 → internal node index = child
@@ -208,19 +222,18 @@ fn bvh_refit_2d(@builtin(global_invocation_id) gid: vec3u) {
 
   let ni = params.num_internal;
 
-  // Step 1: Write leaf AABB
+  // Step 1: Write leaf AABB using atomic stores
   let body_idx = sorted_indices[leaf_idx];
   let src_base = body_idx * 4u;
   let dst_node = ni + leaf_idx;
-  let dst_base = dst_node * 4u;
 
-  node_aabb[dst_base + 0u] = aabb_buffer[src_base + 0u];
-  node_aabb[dst_base + 1u] = aabb_buffer[src_base + 1u];
-  node_aabb[dst_base + 2u] = aabb_buffer[src_base + 2u];
-  node_aabb[dst_base + 3u] = aabb_buffer[src_base + 3u];
+  store_aabb(dst_node,
+    aabb_buffer[src_base + 0u],
+    aabb_buffer[src_base + 1u],
+    aabb_buffer[src_base + 2u],
+    aabb_buffer[src_base + 3u]);
 
   // Step 2: Walk up parent chain
-  // Parent index for this leaf: parent_buf[num_internal + leaf_idx]
   var p = parent_buf[ni + leaf_idx];
 
   while (p >= 0) {
@@ -240,16 +253,12 @@ fn bvh_refit_2d(@builtin(global_invocation_id) gid: vec3u) {
     let ln = get_node_index_for_child(lc, ni);
     let rn = get_node_index_for_child(rc, ni);
 
-    let union_min_x = min(load_node_aabb_min_x(ln), load_node_aabb_min_x(rn));
-    let union_min_y = min(load_node_aabb_min_y(ln), load_node_aabb_min_y(rn));
-    let union_max_x = max(load_node_aabb_max_x(ln), load_node_aabb_max_x(rn));
-    let union_max_y = max(load_node_aabb_max_y(ln), load_node_aabb_max_y(rn));
+    let union_min_x = min(load_aabb_min_x(ln), load_aabb_min_x(rn));
+    let union_min_y = min(load_aabb_min_y(ln), load_aabb_min_y(rn));
+    let union_max_x = max(load_aabb_max_x(ln), load_aabb_max_x(rn));
+    let union_max_y = max(load_aabb_max_y(ln), load_aabb_max_y(rn));
 
-    let out_base = pu * 4u;
-    node_aabb[out_base + 0u] = union_min_x;
-    node_aabb[out_base + 1u] = union_min_y;
-    node_aabb[out_base + 2u] = union_max_x;
-    node_aabb[out_base + 3u] = union_max_y;
+    store_aabb(pu, union_min_x, union_min_y, union_max_x, union_max_y);
 
     // Move to parent's parent
     p = parent_buf[pu];
@@ -278,17 +287,28 @@ struct Params {
 
 @group(0) @binding(5) var<uniform> params: Params;
 
-// Output: node AABBs for all 2N-1 nodes, 6 floats each
+// Output: node AABBs for all 2N-1 nodes, 6 u32 (bitcast f32) each
 // Layout: [internal_0, ..., internal_{N-2}, leaf_0, ..., leaf_{N-1}]
-@group(0) @binding(6) var<storage, read_write> node_aabb: array<f32>;
+// Uses atomic<u32> to ensure cross-thread visibility during bottom-up refit.
+@group(0) @binding(6) var<storage, read_write> node_aabb: array<atomic<u32>>;
 
 // Atomic visit counters for internal nodes (size N-1), initialised to 0
 @group(0) @binding(7) var<storage, read_write> visit_count: array<atomic<u32>>;
 
 const STRIDE: u32 = 6u;
 
+fn store_aabb(node: u32, v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32) {
+  let base = node * STRIDE;
+  atomicStore(&node_aabb[base + 0u], bitcast<u32>(v0));
+  atomicStore(&node_aabb[base + 1u], bitcast<u32>(v1));
+  atomicStore(&node_aabb[base + 2u], bitcast<u32>(v2));
+  atomicStore(&node_aabb[base + 3u], bitcast<u32>(v3));
+  atomicStore(&node_aabb[base + 4u], bitcast<u32>(v4));
+  atomicStore(&node_aabb[base + 5u], bitcast<u32>(v5));
+}
+
 fn load_node_aabb(node: u32, offset: u32) -> f32 {
-  return node_aabb[node * STRIDE + offset];
+  return bitcast<f32>(atomicLoad(&node_aabb[node * STRIDE + offset]));
 }
 
 fn get_node_index_for_child(child: i32, num_internal: u32) -> u32 {
@@ -308,18 +328,18 @@ fn bvh_refit_3d(@builtin(global_invocation_id) gid: vec3u) {
 
   let ni = params.num_internal;
 
-  // Step 1: Write leaf AABB
+  // Step 1: Write leaf AABB using atomic stores
   let body_idx = sorted_indices[leaf_idx];
   let src_base = body_idx * STRIDE;
   let dst_node = ni + leaf_idx;
-  let dst_base = dst_node * STRIDE;
 
-  node_aabb[dst_base + 0u] = aabb_buffer[src_base + 0u];
-  node_aabb[dst_base + 1u] = aabb_buffer[src_base + 1u];
-  node_aabb[dst_base + 2u] = aabb_buffer[src_base + 2u];
-  node_aabb[dst_base + 3u] = aabb_buffer[src_base + 3u];
-  node_aabb[dst_base + 4u] = aabb_buffer[src_base + 4u];
-  node_aabb[dst_base + 5u] = aabb_buffer[src_base + 5u];
+  store_aabb(dst_node,
+    aabb_buffer[src_base + 0u],
+    aabb_buffer[src_base + 1u],
+    aabb_buffer[src_base + 2u],
+    aabb_buffer[src_base + 3u],
+    aabb_buffer[src_base + 4u],
+    aabb_buffer[src_base + 5u]);
 
   // Step 2: Walk up parent chain
   var p = parent_buf[ni + leaf_idx];
@@ -327,13 +347,14 @@ fn bvh_refit_3d(@builtin(global_invocation_id) gid: vec3u) {
   while (p >= 0) {
     let pu = u32(p);
 
-    // Atomic increment — first visitor exits, second visitor continues
+    // Atomic increment — first visitor (result 0) exits, second visitor (result 1) continues
     let prev = atomicAdd(&visit_count[pu], 1u);
     if (prev == 0u) {
+      // First visitor: the other child hasn't written its AABB yet. Stop.
       return;
     }
 
-    // Second visitor: compute union of children AABBs
+    // Second visitor: both children are ready. Compute union AABB.
     let lc = left_child[pu];
     let rc = right_child[pu];
 
@@ -347,13 +368,7 @@ fn bvh_refit_3d(@builtin(global_invocation_id) gid: vec3u) {
     let union_max_y = max(load_node_aabb(ln, 4u), load_node_aabb(rn, 4u));
     let union_max_z = max(load_node_aabb(ln, 5u), load_node_aabb(rn, 5u));
 
-    let out_base = pu * STRIDE;
-    node_aabb[out_base + 0u] = union_min_x;
-    node_aabb[out_base + 1u] = union_min_y;
-    node_aabb[out_base + 2u] = union_min_z;
-    node_aabb[out_base + 3u] = union_max_x;
-    node_aabb[out_base + 4u] = union_max_y;
-    node_aabb[out_base + 5u] = union_max_z;
+    store_aabb(pu, union_min_x, union_min_y, union_min_z, union_max_x, union_max_y, union_max_z);
 
     // Move to parent's parent
     p = parent_buf[pu];
@@ -395,7 +410,7 @@ struct Params {
 @group(0) @binding(7) var<storage, read_write> pair_buffer: array<u32>;
 @group(0) @binding(8) var<storage, read_write> pair_count: array<atomic<u32>>;
 
-const MAX_STACK_DEPTH: u32 = 32u;
+const MAX_STACK_DEPTH: u32 = 64u;
 const AABB_STRIDE: u32 = 4u;
 
 fn aabb_overlap_2d(
@@ -425,7 +440,7 @@ fn bvh_traverse_2d(@builtin(global_invocation_id) gid: vec3u) {
   let type_i = body_types[body_i];
 
   // Stack-based traversal
-  var stack: array<i32, 32>;  // encoded the same as children: >=0 internal, <0 leaf
+  var stack: array<i32, 64>;  // encoded the same as children: >=0 internal, <0 leaf
   var stack_top: u32 = 0u;
 
   // Push root (internal node 0) — only if there are internal nodes
@@ -658,8 +673,8 @@ export const CONSTRAINT_ASSEMBLY_2D_WGSL = `// ─── 2D Constraint Assembly 
 // Converts contact points from narrow phase into solver constraint rows.
 // Each contact generates 2 rows: normal (non-penetration) + friction (tangent).
 //
-// Contact input format (8 u32s per contact):
-//   [bodyA, bodyB, featureId, _pad, normal_x, normal_y, depth, mu]
+// Contact input format (10 u32s per contact):
+//   [bodyA, bodyB, featureId, _pad, normal_x, normal_y, depth, mu, cpx, cpy]
 //
 // Constraint output format (28 floats per row, matching existing primal/dual):
 //   [bodyA(i32), bodyB(i32), forceType(u32), _pad(u32),
@@ -689,7 +704,7 @@ struct AssemblyParams {
 @group(0) @binding(8) var<storage, read_write> warmstart_age: array<u32>;
 
 const BODY_STRIDE: u32 = 8u;
-const CONTACT_STRIDE: u32 = 8u;
+const CONTACT_STRIDE: u32 = 10u;
 const CONSTRAINT_STRIDE: u32 = 28u;
 const FORCE_TYPE_CONTACT: u32 = 0u;
 
@@ -793,7 +808,7 @@ fn constraint_assembly_2d(
     return;
   }
 
-  // Check if this contact is valid (bodyA != 0xFFFFFFFF sentinel)
+  // Check if this contact is valid (bodyA == 0xFFFFFFFF sentinel for cleared slots)
   let bodyA_u32 = load_contact_u32(contact_idx, 0u);
   if (bodyA_u32 == 0xFFFFFFFFu) {
     return;
@@ -814,12 +829,9 @@ fn constraint_assembly_2d(
   let posB_x = body_state[u32(bodyB) * BODY_STRIDE + 0u];
   let posB_y = body_state[u32(bodyB) * BODY_STRIDE + 1u];
 
-  // Compute contact point (midpoint along normal at depth)
-  // Contact point approximation: posA + depth/2 * normal
-  // Actually, we use the body positions directly for the lever arm
-  // The contact point is between the bodies along the normal
-  let cpx = (posA_x + posB_x) * 0.5;
-  let cpy = (posA_y + posB_y) * 0.5;
+  // Read actual contact position from narrowphase output
+  let cpx = load_contact_f32(contact_idx, 8u);
+  let cpy = load_contact_f32(contact_idx, 9u);
 
   // Lever arms
   let rA_x = cpx - posA_x;
@@ -1065,7 +1077,7 @@ fn constraint_assembly_3d(
     return;
   }
 
-  // Check if this contact is valid
+  // Check if this contact is valid (bodyA == 0xFFFFFFFF sentinel for cleared slots)
   let bodyA_u32 = load_contact_u32(contact_idx, 0u);
   if (bodyA_u32 == 0xFFFFFFFFu) {
     return;
@@ -1521,17 +1533,18 @@ fn collider_friction(idx: u32) -> f32 {
 }
 
 // ─── Contact output helpers ─────────────────────────────────────────────────
-// Contact format: 8 u32s = [bodyA, bodyB, featureId, _pad, nx, ny, depth, mu]
+// Contact format: 10 u32s = [bodyA, bodyB, featureId, _pad, nx, ny, depth, mu, cpx, cpy]
 
 fn emit_contact(
   body_a: u32, body_b: u32, feature_id: u32,
   normal: vec2<f32>, depth: f32, mu: f32,
+  contact_pos: vec2<f32>,
 ) {
   let slot = atomicAdd(&contact_count[0], 1u);
   if (slot >= params.max_contacts) {
     return;
   }
-  let base = slot * 8u;
+  let base = slot * 10u;
   contact_buffer[base + 0u] = body_a;
   contact_buffer[base + 1u] = body_b;
   contact_buffer[base + 2u] = feature_id;
@@ -1540,6 +1553,8 @@ fn emit_contact(
   contact_buffer[base + 5u] = bitcast<u32>(normal.y);
   contact_buffer[base + 6u] = bitcast<u32>(depth);
   contact_buffer[base + 7u] = bitcast<u32>(mu);
+  contact_buffer[base + 8u] = bitcast<u32>(contact_pos.x);
+  contact_buffer[base + 9u] = bitcast<u32>(contact_pos.y);
 }
 
 // ─── 2D rotation helpers ────────────────────────────────────────────────────
@@ -1761,7 +1776,7 @@ fn collide_box_box(
     // Fallback: midpoint contact
     let mid = (pos_a + pos_b) * 0.5;
     let feature_id = (ref_box << 4u) | (best_axis_idx << 2u);
-    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu);
+    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu, mid);
     return;
   }
 
@@ -1771,7 +1786,7 @@ fn collide_box_box(
   if (clipped.count < 2u) {
     let mid = (pos_a + pos_b) * 0.5;
     let feature_id = (ref_box << 4u) | (best_axis_idx << 2u);
-    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu);
+    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu, mid);
     return;
   }
 
@@ -1793,7 +1808,7 @@ fn collide_box_box(
       let contact_normal = select(best_axis, -best_axis, flip);
       // Feature ID: (ref_box << 4) | (axis_index << 2) | clip_vertex_index
       let feature_id = (ref_box << 4u) | (best_axis_idx << 2u) | i;
-      emit_contact(idx_a, idx_b, feature_id, best_axis, contact_depth + COLLISION_MARGIN, mu);
+      emit_contact(idx_a, idx_b, feature_id, best_axis, contact_depth + COLLISION_MARGIN, mu, p);
       emitted += 1u;
     }
   }
@@ -1802,7 +1817,7 @@ fn collide_box_box(
   if (emitted == 0u) {
     let mid = (pos_a + pos_b) * 0.5;
     let feature_id = (ref_box << 4u) | (best_axis_idx << 2u);
-    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu);
+    emit_contact(idx_a, idx_b, feature_id, best_axis, min_overlap + COLLISION_MARGIN, mu, mid);
   }
 }
 
@@ -1872,8 +1887,14 @@ fn collide_box_circle(
     out_b = circle_idx;
   }
 
+  // Contact point: closest point on box surface to circle center (in world space)
+  let closest_world = box_pos + rotate2d(closest, ca, sa);
+  // Contact point is midpoint between closest point on box and closest point on circle surface
+  let circle_surface = circle_pos - outward * radius;
+  let cp = (closest_world + circle_surface) * 0.5;
+
   let feature_id = 0x100u; // box-circle marker
-  emit_contact(out_a, out_b, feature_id, manifold_normal, contact_depth + COLLISION_MARGIN, mu);
+  emit_contact(out_a, out_b, feature_id, manifold_normal, contact_depth + COLLISION_MARGIN, mu, cp);
 }
 
 // ─── Circle-Circle 2D ───────────────────────────────────────────────────────
@@ -1902,8 +1923,12 @@ fn collide_circle_circle(
   }
 
   let depth = combined - dist + COLLISION_MARGIN;
+  // Contact point: midpoint between the two circle surfaces along the center line
+  let cp_a = pos_a - normal * radius_a;
+  let cp_b = pos_b + normal * radius_b;
+  let cp = (cp_a + cp_b) * 0.5;
   let feature_id = 0x200u; // circle-circle marker
-  emit_contact(idx_a, idx_b, feature_id, normal, depth, mu);
+  emit_contact(idx_a, idx_b, feature_id, normal, depth, mu, cp);
 }
 
 // ─── Main entry point ───────────────────────────────────────────────────────
@@ -3626,9 +3651,13 @@ fn radix_prefix_sum(
   }
 }
 
-// ─── Pass 3: Scatter ────────────────────────────────────────────────────────
+// ─── Pass 3: Scatter (Stable) ───────────────────────────────────────────────
+// Preserves relative order within each digit group (required for LSD radix sort).
+// Each thread computes its rank within the workgroup by counting preceding
+// elements with the same digit, ensuring deterministic output order.
 
-var<workgroup> local_offsets: array<atomic<u32>, 16>;
+var<workgroup> wg_offsets: array<u32, 16>;  // global offsets per digit for this workgroup
+var<workgroup> wg_digits: array<u32, 256>;  // digit for each thread in the workgroup
 
 @compute @workgroup_size(256)
 fn radix_scatter(
@@ -3638,20 +3667,31 @@ fn radix_scatter(
 ) {
   // Load this workgroup's prefix sum offsets
   if (lid.x < RADIX) {
-    atomicStore(&local_offsets[lid.x], histogram[lid.x * params.num_workgroups + wid.x]);
+    wg_offsets[lid.x] = histogram[lid.x * params.num_workgroups + wid.x];
   }
+
+  // Each thread computes and stores its digit (use RADIX as sentinel for out-of-bounds)
+  let idx = gid.x;
+  var my_digit = RADIX; // sentinel: no element
+  if (idx < params.num_elements) {
+    my_digit = (keys_in[idx] >> params.digit_shift) & 0xFu;
+  }
+  wg_digits[lid.x] = my_digit;
   workgroupBarrier();
 
-  let idx = gid.x;
   if (idx < params.num_elements) {
-    let key = keys_in[idx];
-    let val = vals_in[idx];
-    let digit = (key >> params.digit_shift) & 0xFu;
+    // Count how many preceding threads in this workgroup have the same digit
+    // This ensures stable ordering within each digit group
+    var rank = 0u;
+    for (var i = 0u; i < lid.x; i++) {
+      if (wg_digits[i] == my_digit) {
+        rank++;
+      }
+    }
 
-    // Get destination index via atomic increment
-    let dest = atomicAdd(&local_offsets[digit], 1u);
-    keys_out[dest] = key;
-    vals_out[dest] = val;
+    let dest = wg_offsets[my_digit] + rank;
+    keys_out[dest] = keys_in[idx];
+    vals_out[dest] = vals_in[idx];
   }
 }
 `;

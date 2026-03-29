@@ -2,6 +2,11 @@
 // One thread per leaf. Each leaf writes its AABB, then walks up the parent
 // chain using atomic visit counts to ensure each internal node is processed
 // exactly once (by the second visitor).
+//
+// node_aabb uses atomic<u32> with bitcast<f32/u32> to ensure cross-thread
+// visibility of AABB writes within the same compute pass. This is required
+// for correctness on software GPU backends (SwiftShader) where non-atomic
+// storage writes may not be flushed before/after atomic counter operations.
 
 struct Params {
   num_leaves:   u32,
@@ -21,17 +26,26 @@ struct Params {
 
 @group(0) @binding(5) var<uniform> params: Params;
 
-// Output: node AABBs for all 2N-1 nodes, 4 floats each
+// Output: node AABBs for all 2N-1 nodes, 4 u32 (bitcast f32) each
 // Layout: [internal_0, internal_1, ..., internal_{N-2}, leaf_0, leaf_1, ..., leaf_{N-1}]
-@group(0) @binding(6) var<storage, read_write> node_aabb: array<f32>;
+// Uses atomic<u32> to ensure cross-thread visibility during bottom-up refit.
+@group(0) @binding(6) var<storage, read_write> node_aabb: array<atomic<u32>>;
 
 // Atomic visit counters for internal nodes (size N-1), initialised to 0
 @group(0) @binding(7) var<storage, read_write> visit_count: array<atomic<u32>>;
 
-fn load_node_aabb_min_x(node: u32) -> f32 { return node_aabb[node * 4u + 0u]; }
-fn load_node_aabb_min_y(node: u32) -> f32 { return node_aabb[node * 4u + 1u]; }
-fn load_node_aabb_max_x(node: u32) -> f32 { return node_aabb[node * 4u + 2u]; }
-fn load_node_aabb_max_y(node: u32) -> f32 { return node_aabb[node * 4u + 3u]; }
+fn store_aabb(node: u32, min_x: f32, min_y: f32, max_x: f32, max_y: f32) {
+  let base = node * 4u;
+  atomicStore(&node_aabb[base + 0u], bitcast<u32>(min_x));
+  atomicStore(&node_aabb[base + 1u], bitcast<u32>(min_y));
+  atomicStore(&node_aabb[base + 2u], bitcast<u32>(max_x));
+  atomicStore(&node_aabb[base + 3u], bitcast<u32>(max_y));
+}
+
+fn load_aabb_min_x(node: u32) -> f32 { return bitcast<f32>(atomicLoad(&node_aabb[node * 4u + 0u])); }
+fn load_aabb_min_y(node: u32) -> f32 { return bitcast<f32>(atomicLoad(&node_aabb[node * 4u + 1u])); }
+fn load_aabb_max_x(node: u32) -> f32 { return bitcast<f32>(atomicLoad(&node_aabb[node * 4u + 2u])); }
+fn load_aabb_max_y(node: u32) -> f32 { return bitcast<f32>(atomicLoad(&node_aabb[node * 4u + 3u])); }
 
 fn get_node_index_for_child(child: i32, num_internal: u32) -> u32 {
   // child >= 0 → internal node index = child
@@ -52,19 +66,18 @@ fn bvh_refit_2d(@builtin(global_invocation_id) gid: vec3u) {
 
   let ni = params.num_internal;
 
-  // Step 1: Write leaf AABB
+  // Step 1: Write leaf AABB using atomic stores
   let body_idx = sorted_indices[leaf_idx];
   let src_base = body_idx * 4u;
   let dst_node = ni + leaf_idx;
-  let dst_base = dst_node * 4u;
 
-  node_aabb[dst_base + 0u] = aabb_buffer[src_base + 0u];
-  node_aabb[dst_base + 1u] = aabb_buffer[src_base + 1u];
-  node_aabb[dst_base + 2u] = aabb_buffer[src_base + 2u];
-  node_aabb[dst_base + 3u] = aabb_buffer[src_base + 3u];
+  store_aabb(dst_node,
+    aabb_buffer[src_base + 0u],
+    aabb_buffer[src_base + 1u],
+    aabb_buffer[src_base + 2u],
+    aabb_buffer[src_base + 3u]);
 
   // Step 2: Walk up parent chain
-  // Parent index for this leaf: parent_buf[num_internal + leaf_idx]
   var p = parent_buf[ni + leaf_idx];
 
   while (p >= 0) {
@@ -84,16 +97,12 @@ fn bvh_refit_2d(@builtin(global_invocation_id) gid: vec3u) {
     let ln = get_node_index_for_child(lc, ni);
     let rn = get_node_index_for_child(rc, ni);
 
-    let union_min_x = min(load_node_aabb_min_x(ln), load_node_aabb_min_x(rn));
-    let union_min_y = min(load_node_aabb_min_y(ln), load_node_aabb_min_y(rn));
-    let union_max_x = max(load_node_aabb_max_x(ln), load_node_aabb_max_x(rn));
-    let union_max_y = max(load_node_aabb_max_y(ln), load_node_aabb_max_y(rn));
+    let union_min_x = min(load_aabb_min_x(ln), load_aabb_min_x(rn));
+    let union_min_y = min(load_aabb_min_y(ln), load_aabb_min_y(rn));
+    let union_max_x = max(load_aabb_max_x(ln), load_aabb_max_x(rn));
+    let union_max_y = max(load_aabb_max_y(ln), load_aabb_max_y(rn));
 
-    let out_base = pu * 4u;
-    node_aabb[out_base + 0u] = union_min_x;
-    node_aabb[out_base + 1u] = union_min_y;
-    node_aabb[out_base + 2u] = union_max_x;
-    node_aabb[out_base + 3u] = union_max_y;
+    store_aabb(pu, union_min_x, union_min_y, union_max_x, union_max_y);
 
     // Move to parent's parent
     p = parent_buf[pu];

@@ -243,6 +243,16 @@ export class GpuCollisionPipeline {
     };
   }
 
+  /** Read back pair buffer for diagnostics. */
+  async readPairBuffer(numPairs: number): Promise<Array<[number, number]>> {
+    return this.bvh.readPairBuffer(numPairs);
+  }
+
+  /** Read back BVH diagnostic data for debugging. */
+  async readBvhDiagnostics(n: number) {
+    return this.bvh.readDiagnostics(n);
+  }
+
   /** Get direct access to component modules for advanced usage. */
   getBvh(): GpuBvh { return this.bvh; }
   getNarrowphase(): GpuNarrowphase { return this.narrowphase; }

@@ -32,7 +32,7 @@ struct Params {
 @group(0) @binding(7) var<storage, read_write> pair_buffer: array<u32>;
 @group(0) @binding(8) var<storage, read_write> pair_count: array<atomic<u32>>;
 
-const MAX_STACK_DEPTH: u32 = 32u;
+const MAX_STACK_DEPTH: u32 = 64u;
 const AABB_STRIDE: u32 = 4u;
 
 fn aabb_overlap_2d(
@@ -62,7 +62,7 @@ fn bvh_traverse_2d(@builtin(global_invocation_id) gid: vec3u) {
   let type_i = body_types[body_i];
 
   // Stack-based traversal
-  var stack: array<i32, 32>;  // encoded the same as children: >=0 internal, <0 leaf
+  var stack: array<i32, 64>;  // encoded the same as children: >=0 internal, <0 leaf
   var stack_top: u32 = 0u;
 
   // Push root (internal node 0) — only if there are internal nodes

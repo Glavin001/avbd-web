@@ -21,8 +21,8 @@ import {
 
 const WG_SIZE = 256;
 
-/** 2D contact: 8 u32s (32 bytes). 3D contact: 12 u32s (48 bytes). */
-const CONTACT_STRIDE_2D = 8;
+/** 2D contact: 10 u32s (40 bytes). 3D contact: 12 u32s (48 bytes). */
+const CONTACT_STRIDE_2D = 10;
 const CONTACT_STRIDE_3D = 12;
 
 /** 2D constraint row: 28 floats. 3D: 36 floats. */
@@ -70,6 +70,7 @@ export class GpuNarrowphase {
   private maxConstraints = 0;
   private maxPairs = 0;
   private warmstartCacheSize = 0;
+  private _contactClearBuf: Uint32Array | null = null;
 
   private contactStride: number;
   private constraintStride: number;
@@ -254,6 +255,15 @@ export class GpuNarrowphase {
     {
       // Clear contact count
       (device.queue as any).writeBuffer(this.contactCountBuf, 0, new Uint32Array([0]));
+
+      // Clear contact buffer with sentinel values (0xFFFFFFFF) to prevent
+      // stale contacts from previous frames being processed by the assembly shader.
+      // The assembly shader checks bodyA == 0xFFFFFFFF to skip invalid slots.
+      if (!this._contactClearBuf || this._contactClearBuf.byteLength < this.maxContacts * this.contactStride * 4) {
+        this._contactClearBuf = new Uint32Array(this.maxContacts * this.contactStride);
+        this._contactClearBuf.fill(0xFFFFFFFF);
+      }
+      (device.queue as any).writeBuffer(this.contactBuf, 0, this._contactClearBuf);
 
       // Upload params
       const paramsData = new Float32Array(4);

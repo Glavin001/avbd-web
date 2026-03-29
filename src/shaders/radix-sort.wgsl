@@ -146,9 +146,13 @@ fn radix_prefix_sum(
   }
 }
 
-// ─── Pass 3: Scatter ────────────────────────────────────────────────────────
+// ─── Pass 3: Scatter (Stable) ───────────────────────────────────────────────
+// Preserves relative order within each digit group (required for LSD radix sort).
+// Each thread computes its rank within the workgroup by counting preceding
+// elements with the same digit, ensuring deterministic output order.
 
-var<workgroup> local_offsets: array<atomic<u32>, 16>;
+var<workgroup> wg_offsets: array<u32, 16>;  // global offsets per digit for this workgroup
+var<workgroup> wg_digits: array<u32, 256>;  // digit for each thread in the workgroup
 
 @compute @workgroup_size(256)
 fn radix_scatter(
@@ -158,19 +162,30 @@ fn radix_scatter(
 ) {
   // Load this workgroup's prefix sum offsets
   if (lid.x < RADIX) {
-    atomicStore(&local_offsets[lid.x], histogram[lid.x * params.num_workgroups + wid.x]);
+    wg_offsets[lid.x] = histogram[lid.x * params.num_workgroups + wid.x];
   }
+
+  // Each thread computes and stores its digit (use RADIX as sentinel for out-of-bounds)
+  let idx = gid.x;
+  var my_digit = RADIX; // sentinel: no element
+  if (idx < params.num_elements) {
+    my_digit = (keys_in[idx] >> params.digit_shift) & 0xFu;
+  }
+  wg_digits[lid.x] = my_digit;
   workgroupBarrier();
 
-  let idx = gid.x;
   if (idx < params.num_elements) {
-    let key = keys_in[idx];
-    let val = vals_in[idx];
-    let digit = (key >> params.digit_shift) & 0xFu;
+    // Count how many preceding threads in this workgroup have the same digit
+    // This ensures stable ordering within each digit group
+    var rank = 0u;
+    for (var i = 0u; i < lid.x; i++) {
+      if (wg_digits[i] == my_digit) {
+        rank++;
+      }
+    }
 
-    // Get destination index via atomic increment
-    let dest = atomicAdd(&local_offsets[digit], 1u);
-    keys_out[dest] = key;
-    vals_out[dest] = val;
+    let dest = wg_offsets[my_digit] + rank;
+    keys_out[dest] = keys_in[idx];
+    vals_out[dest] = vals_in[idx];
   }
 }

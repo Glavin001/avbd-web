@@ -159,6 +159,7 @@ export interface StepTimings {
   /** Diagnostic counts */
   numBodies: number;
   numConstraints: number;
+  numPairs?: number;
 }
 
 export interface ColorGroup {
