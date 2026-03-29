@@ -275,6 +275,23 @@
     let joints  = [];   // {bodyA, bodyB}
     let gpuMode = false;
     let paused  = false;
+    let _stepErrors = 0;
+
+    // ── Test hooks (for E2E assertions via Playwright) ───────────────
+    window.__avbd = {
+      getBodyPositions: () => bodies.map(b => {
+        const t = b.body.translation();
+        return { x: t.x, y: t.y };
+      }),
+      getBodyVelocities: () => bodies.map(b => {
+        const v = b.body.linvel();
+        return { x: v.x, y: v.y };
+      }),
+      getBodyCount: () => bodies.length,
+      getMode: () => gpuMode ? 'GPU' : 'CPU',
+      getStepErrors: () => _stepErrors,
+      isWorldReady: () => world !== null,
+    };
 
     // ====================================================================
     // World factory
@@ -949,6 +966,7 @@
       try {
         await world.step();
       } catch (e) {
+        _stepErrors++;
         showError('GPU step failed: ' + e.message + ' — falling back to CPU');
         world.stepCPU();
         gpuMode = false;

@@ -284,6 +284,23 @@
 
     let world = null;
     let bodyMeshPairs = []; // { body, mesh, shape, hx, hy, hz, radius }
+    let _stepErrors = 0;
+
+    // ── Test hooks (for E2E assertions via Playwright) ───────────────
+    window.__avbd = {
+      getBodyPositions: () => bodyMeshPairs.map(p => {
+        const t = p.body.translation();
+        return { x: t.x, y: t.y, z: t.z };
+      }),
+      getBodyVelocities: () => bodyMeshPairs.map(p => {
+        const v = p.body.linvel();
+        return { x: v.x, y: v.y, z: v.z };
+      }),
+      getBodyCount: () => bodyMeshPairs.length,
+      getMode: () => gpuMode ? 'GPU' : 'CPU',
+      getStepErrors: () => _stepErrors,
+      isWorldReady: () => world !== null,
+    };
 
     const CUBE_COLORS = [
       0xe94560, 0x4fc3f7, 0x66bb6a, 0xffa726, 0xab47bc,
@@ -635,7 +652,6 @@
 
     // ── Game loop ────────────────────────────────────────────────────────────
 
-    let _stepErrors = 0;
     async function loop() {
       // Step physics (GPU solver returns a Promise)
       if (world) {
