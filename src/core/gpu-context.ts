@@ -13,6 +13,10 @@ export interface GPUContextOptions {
 export class GPUContext {
   device!: GPUDevice;
   adapter!: GPUAdapter;
+  /** Callback invoked when the GPU device is lost. Set by consumers to handle device loss. */
+  onDeviceLost: ((message: string) => void) | null = null;
+  /** True after the GPU device has been lost. Checked by solvers to avoid cascading errors. */
+  deviceLost = false;
   private pipelines: Map<string, GPUComputePipeline> = new Map();
   private buffers: Map<string, GPUBuffer> = new Map();
   private bindGroups: Map<string, GPUBindGroup> = new Map();
@@ -45,6 +49,8 @@ export class GPUContext {
 
     device.lost.then((info) => {
       console.error('WebGPU device lost:', info.message);
+      ctx.deviceLost = true;
+      ctx.onDeviceLost?.(info.message);
     });
 
     return ctx;
@@ -88,7 +94,12 @@ export class GPUContext {
     encoder.copyBufferToBuffer(buffer, 0, stagingBuffer, 0, sizeBytes);
     this.device.queue.submit([encoder.finish()]);
 
-    await stagingBuffer.mapAsync(GPUMapMode.READ);
+    try {
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+    } catch (e) {
+      stagingBuffer.destroy();
+      throw new Error(`GPU readBuffer failed (device lost?): ${(e as Error).message}`);
+    }
     const result = stagingBuffer.getMappedRange().slice(0);
     stagingBuffer.unmap();
     stagingBuffer.destroy();

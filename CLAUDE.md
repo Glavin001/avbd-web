@@ -95,8 +95,6 @@ Both demos display this breakdown in their stats overlay.
 
 ## Known Issues & Design Decisions
 
-- **2D pyramids (>10 rows)**: Some edge boxes fall off during settling. The 2D angular DOF is inherently less stable than 3D's 3-angular-DOF system for large box piles.
-- **Warmstart lambda disabled for 2D contacts**: Only penalty is warmstarted between frames. Lambda warmstarting was disabled because cached lambdas from contacts with changing normals create forces in wrong directions.
 - **Restitution in 3D**: Property exists on bodies but only takes effect via velocity-level correction in the CPU 3D solver (not in the GPU 3D shader path).
 - **Adaptive gravity**: Only applied to slow-moving bodies (speed < 0.5 m/s) to avoid artificial bounce on impact.
 - **Implicit angular damping**: 0.05 applied in all solvers to prevent solver-artifact angular velocity amplification in stacking.

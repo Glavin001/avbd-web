@@ -36,3 +36,9 @@ export { AVBDSolver2D } from './core/solver.js';
 export { AVBDSolver3D } from './core/solver-3d.js';
 export { GPUContext } from './core/gpu-context.js';
 export { computeGraphColoring, validateColoring } from './core/graph-coloring.js';
+
+// GPU collision pipeline
+export { GpuCollisionPipeline } from './core/gpu-collision-pipeline.js';
+export { GpuBvh } from './core/gpu-bvh.js';
+export { GpuRadixSort } from './core/gpu-radix-sort.js';
+export { GpuNarrowphase } from './core/gpu-narrowphase.js';
